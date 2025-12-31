@@ -1,0 +1,22 @@
+node_modules/
+*.log
+.DS_Store
+.env
+*.torrent
+dist/
+
+# Temporary streaming files
+.temp/
+*.tmp
+stream-sandbox-*/
+
+# System temp directories (for reference)
+# /tmp/webtorrent (cleaned automatically)
+# /dev/shm/stream-sandbox-* (RAM-based, auto-cleaned)
+
+
+
+
+
+
+
