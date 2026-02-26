@@ -1724,17 +1724,89 @@ class StreamManager {
   
   findFFmpegBinary(binaryName = 'ffmpeg') {
     const { spawnSync } = require('child_process');
-    
-    // Try system PATH first
+    const fs = require('fs');
+    const path = require('path');
+
+    const lookupCommands = [];
+    if (process.platform === 'win32') {
+      lookupCommands.push(['where', [`${binaryName}.exe`]]);
+      lookupCommands.push(['where', [binaryName]]);
+    }
+    lookupCommands.push(['which', [binaryName]]);
+
+    for (const [cmd, args] of lookupCommands) {
+      try {
+        const result = spawnSync(cmd, args, { encoding: 'utf8' });
+        if (result.status === 0 && result.stdout) {
+          const firstMatch = result.stdout
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .find(Boolean);
+          if (firstMatch) {
+            return firstMatch;
+          }
+        }
+      } catch (e) {
+        // Ignore and try next lookup strategy
+      }
+    }
+
+    // Windows fallback: detect common install locations directly (winget/choco/scoop)
+    if (process.platform === 'win32') {
+      const exeName = `${binaryName}.exe`;
+      const candidates = [];
+
+      if (process.env.LOCALAPPDATA) {
+        const linksPath = path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links', exeName);
+        candidates.push(linksPath);
+
+        const wingetPackagesDir = path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Packages');
+        if (fs.existsSync(wingetPackagesDir)) {
+          try {
+            const packageDirs = fs.readdirSync(wingetPackagesDir, { withFileTypes: true })
+              .filter(d => d.isDirectory() && d.name.toLowerCase().startsWith('gyan.ffmpeg'))
+              .map(d => path.join(wingetPackagesDir, d.name));
+
+            for (const packageDir of packageDirs) {
+              try {
+                const builds = fs.readdirSync(packageDir, { withFileTypes: true })
+                  .filter(d => d.isDirectory())
+                  .map(d => path.join(packageDir, d.name, 'bin', exeName));
+                candidates.push(...builds);
+              } catch (e) {
+                // Ignore unreadable package variant
+              }
+            }
+          } catch (e) {
+            // Ignore unreadable winget package directory
+          }
+        }
+      }
+
+      if (process.env.ProgramData) {
+        candidates.push(path.join(process.env.ProgramData, 'chocolatey', 'bin', exeName));
+      }
+
+      if (process.env.USERPROFILE) {
+        candidates.push(path.join(process.env.USERPROFILE, 'scoop', 'apps', 'ffmpeg', 'current', 'bin', exeName));
+      }
+
+      const foundCandidate = candidates.find(candidate => fs.existsSync(candidate));
+      if (foundCandidate) {
+        return foundCandidate;
+      }
+    }
+
+    // Fallback: if executable name itself is callable in PATH
     try {
-      const result = spawnSync('which', [binaryName], { encoding: 'utf8' });
-      if (result.status === 0 && result.stdout.trim()) {
-        return result.stdout.trim();
+      const directRun = spawnSync(binaryName, ['-version'], { stdio: 'ignore' });
+      if (directRun.status === 0) {
+        return binaryName;
       }
     } catch (e) {
-      // Not in PATH
+      // Not callable
     }
-    
+
     return null;
   }
   
@@ -2195,6 +2267,9 @@ class StreamManager {
             }).catch(() => {
               // Ignore extraction errors
             });
+          } else {
+            console.log(chalk.yellow('\n⚠️  Embedded subtitle extraction unavailable: ffmpeg/ffprobe not found in PATH'));
+            console.log(chalk.yellow('   💡 Install ffmpeg (with ffprobe) to load subtitles from MultiSub torrents in browser'));
           }
           
           // Add external subtitle if provided
@@ -2336,154 +2411,58 @@ class StreamManager {
         return;
       }
       
-      // Serve subtitle files as WebVTT with streaming support
+      // Serve subtitle files as WebVTT
       const subtitleMatch = req.url.match(/^\/subtitle_(\d+)\.vtt(\?.*)?$/);
       if (subtitleMatch) {
         const subtitleIndex = parseInt(subtitleMatch[1]);
         if (subtitleIndex >= 0 && subtitleIndex < this.subtitlePaths.length) {
           const subPath = this.subtitlePaths[subtitleIndex].path;
-          
-          // If file doesn't exist yet (placeholder), return empty VTT header
-          if (!fs.existsSync(subPath)) {
-            res.writeHead(200, {
-              'Content-Type': 'text/vtt; charset=utf-8',
-              'Content-Length': '8',
-              'Accept-Ranges': 'bytes',
+          const emptyVtt = 'WEBVTT\n\n';
+
+          if (req.method === 'OPTIONS') {
+            res.writeHead(204, {
               'Access-Control-Allow-Origin': '*',
-              'Cache-Control': 'no-cache'
+              'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+              'Access-Control-Allow-Headers': 'Range',
+              'Access-Control-Max-Age': '86400'
             });
-            res.end('WEBVTT\n\n');
+            res.end();
             return;
           }
-          
-          const stats = fs.statSync(subPath);
-          const fileSize = stats.size;
-          
-          // Handle range requests
-          const range = req.headers.range;
-          
-          if (range) {
-            const positions = range.replace(/bytes=/, '').split('-');
-            const start = parseInt(positions[0], 10);
-            const end = positions[1] ? parseInt(positions[1], 10) : fileSize - 1;
-            const chunksize = (end - start) + 1;
-            
-            if (start >= fileSize || end >= fileSize || start > end) {
-              res.writeHead(416, {
-                'Content-Range': `bytes */${fileSize}`,
-                'Access-Control-Allow-Origin': '*'
-              });
-              res.end();
-              return;
-            }
-            
-            const fileStream = fs.createReadStream(subPath, { start, end, encoding: 'utf8' });
-            let subtitleChunk = '';
-            
-            fileStream.on('data', (chunk) => {
-              subtitleChunk += chunk;
-            });
-            
-            fileStream.on('end', () => {
-              const isSRT = subPath.toLowerCase().endsWith('.srt') || 
-                           (!subPath.toLowerCase().endsWith('.vtt') && 
-                            !subtitleChunk.trim().startsWith('WEBVTT'));
-              
-              let vttContent = subtitleChunk;
-              let vttFullSize = fileSize;
-              
-              if (isSRT) {
-                try {
-                  const fullContent = fs.readFileSync(subPath, 'utf8');
-                  const fullVTT = this.convertSRTtoVTT(fullContent);
-                  vttFullSize = Buffer.from(fullVTT, 'utf8').length;
-                  const vttBuffer = Buffer.from(fullVTT, 'utf8');
-                  const vttStart = Math.min(start, vttBuffer.length);
-                  const vttEnd = Math.min(end, vttBuffer.length - 1);
-                  
-                  if (vttStart <= vttEnd && vttStart < vttBuffer.length) {
-                    vttContent = vttBuffer.slice(vttStart, vttEnd + 1).toString('utf8');
-                  } else {
-                    vttContent = '';
-                  }
-                } catch (e) {
-                  if (start === 0) {
-                    vttContent = this.convertSRTtoVTT(subtitleChunk);
-                    vttFullSize = Buffer.from(vttContent, 'utf8').length;
-                  } else {
-                    vttContent = '';
-                  }
-                }
-              }
-              
-              const vttBuffer = Buffer.from(vttContent, 'utf8');
-              const actualChunkSize = vttBuffer.length;
-              const actualEnd = start + actualChunkSize - 1;
-              
-              res.writeHead(206, {
-                'Content-Range': `bytes ${start}-${actualEnd}/${vttFullSize}`,
-                'Accept-Ranges': 'bytes',
-                'Content-Length': actualChunkSize,
-                'Content-Type': 'text/vtt; charset=utf-8',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-                'Access-Control-Allow-Headers': 'Range',
-                'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
-                'Cache-Control': 'no-cache'
-              });
-              res.end(vttBuffer);
-            });
-            
-            fileStream.on('error', (err) => {
-              if (!res.headersSent) {
-                res.writeHead(500, {
-                  'Access-Control-Allow-Origin': '*',
-                  'Content-Type': 'text/plain'
-                });
-                res.end('Subtitle read error');
-              }
-            });
-            
-            return;
-          }
-          
-          // Full file request
-          let subtitleContent = '';
+
+          let subtitleContent = emptyVtt;
           try {
-            subtitleContent = fs.readFileSync(subPath, 'utf8');
+            if (fs.existsSync(subPath)) {
+              subtitleContent = fs.readFileSync(subPath, 'utf8');
+            }
           } catch (err) {
-            res.writeHead(200, {
-              'Content-Type': 'text/vtt; charset=utf-8',
-              'Content-Length': '8',
-              'Accept-Ranges': 'bytes',
-              'Access-Control-Allow-Origin': '*',
-              'Cache-Control': 'no-cache'
-            });
-            res.end('WEBVTT\n\n');
-            return;
+            subtitleContent = emptyVtt;
           }
-          
-          const isSRT = subPath.toLowerCase().endsWith('.srt') || 
-                       (!subPath.toLowerCase().endsWith('.vtt') && 
+
+          const isSRT = subPath.toLowerCase().endsWith('.srt') ||
+                       (!subPath.toLowerCase().endsWith('.vtt') &&
                         !subtitleContent.trim().startsWith('WEBVTT'));
-          
           if (isSRT) {
             subtitleContent = this.convertSRTtoVTT(subtitleContent);
           }
-          
+
           const vttBuffer = Buffer.from(subtitleContent, 'utf8');
-          
           res.writeHead(200, {
             'Content-Type': 'text/vtt; charset=utf-8',
             'Content-Length': vttBuffer.length,
-            'Accept-Ranges': 'bytes',
+            'Accept-Ranges': 'none',
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
             'Access-Control-Allow-Headers': 'Range',
-            'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
+            'Access-Control-Expose-Headers': 'Content-Length',
             'Cache-Control': 'no-cache'
           });
-          res.end(vttBuffer);
+
+          if (req.method === 'HEAD') {
+            res.end();
+          } else {
+            res.end(vttBuffer);
+          }
           return;
         }
         res.writeHead(404, {
@@ -2623,15 +2602,24 @@ class StreamManager {
       return this.getLightweightHTMLPlayer(videoUrl, htmlVideoType, videoName);
     }
     
+    const normalizeTrackLanguage = (language) => {
+      const lang = (language || '').toString().trim().toLowerCase();
+      if (!lang || lang === 'unknown' || lang === 'und' || lang === 'n/a' || lang === 'null') {
+        return 'en';
+      }
+      return lang;
+    };
+
     const tracks = this.subtitlePaths.length > 0 ? this.subtitlePaths.map((sub, index) => {
-      return `            <track kind="subtitles" src="/subtitle_${index}.vtt" srclang="${sub.language || 'en'}" label="${sub.label || `Subtitle ${index + 1}`}" data-source="${sub.source || 'unknown'}" ${index === 0 ? 'default' : ''} type="text/vtt">`;
+      const normalizedLanguage = normalizeTrackLanguage(sub.language);
+      return `            <track kind="subtitles" src="/subtitle_${index}.vtt" srclang="${normalizedLanguage}" label="${sub.label || `Subtitle ${index + 1}`}" data-source="${sub.source || 'unknown'}" ${index === 0 ? 'default' : ''} type="text/vtt">`;
     }).join('\n') : '            <!-- Subtitles will appear here as they are extracted during download -->';
     
     // Pass subtitle metadata to the player for smart refresh logic
     const subtitleMetadata = JSON.stringify(this.subtitlePaths.map((sub, index) => ({
       index: index,
       source: sub.source || 'unknown',
-      language: sub.language || 'en',
+      language: normalizeTrackLanguage(sub.language),
       label: sub.label || `Subtitle ${index + 1}`
     })));
     
@@ -3005,6 +2993,61 @@ ${tracks}
             }
         });
         
+        function getTrackElement(track) {
+            const videoElement = document.getElementById('videoPlayer');
+            if (!videoElement) {
+                return null;
+            }
+
+            const trackElements = videoElement.querySelectorAll('track');
+            for (const trackElement of trackElements) {
+                if (trackElement.track === track) {
+                    return trackElement;
+                }
+            }
+            return null;
+        }
+
+        function getTrackSource(track, trackIndex) {
+            const trackElement = getTrackElement(track);
+            if (trackElement && trackElement.dataset && trackElement.dataset.source) {
+                return trackElement.dataset.source;
+            }
+
+            const byIndex = subtitleMetadata.find(m => m.index === trackIndex);
+            if (byIndex && byIndex.source) {
+                return byIndex.source;
+            }
+
+            const byLabelOrLanguage = subtitleMetadata.find(m =>
+                (m.label && track.label && m.label === track.label) ||
+                (m.language && track.language && m.language === track.language)
+            );
+            return byLabelOrLanguage ? byLabelOrLanguage.source : 'unknown';
+        }
+
+        function ensureSubtitleVisible() {
+            const tracks = player.textTracks();
+            if (!tracks) {
+                return;
+            }
+
+            const subtitleTracks = Array.from(tracks).filter(t => t.kind === 'subtitles');
+            if (subtitleTracks.length === 0) {
+                return;
+            }
+
+            const hasShowingTrack = subtitleTracks.some(t => t.mode === 'showing');
+            if (hasShowingTrack) {
+                return;
+            }
+
+            const preferredTrack = subtitleTracks.find(t => t.cues && t.cues.length > 0) || subtitleTracks[0];
+            if (preferredTrack) {
+                preferredTrack.mode = 'showing';
+            }
+        }
+
         // Set up automatic subtitle detection - listens for cues as they load
         function setupAutoSubtitleDetection() {
             const tracks = player.textTracks();
@@ -3014,13 +3057,12 @@ ${tracks}
                 const monitorTracks = () => {
                     Array.from(tracks).forEach((track, trackIndex) => {
                         if (track.kind === 'subtitles' && !monitoredTracks.has(track)) {
-                            // Check if this track is from an embedded source (needs monitoring)
-                            const trackMeta = subtitleMetadata.find(m => m.index === trackIndex);
-                            const isEmbedded = trackMeta && trackMeta.source === 'embedded';
+                            const trackSource = getTrackSource(track, trackIndex);
+                            const isEmbedded = trackSource === 'embedded';
                             
                             // Only monitor embedded subtitles - external/downloaded ones are already complete
                             if (!isEmbedded) {
-                                console.log('Skipping refresh monitoring for', track.label, '- already downloaded and complete');
+                                console.log('Skipping refresh monitoring for', track.label, '(source:', trackSource + ')');
                                 return;
                             }
                             
@@ -3030,6 +3072,7 @@ ${tracks}
                             track.addEventListener('load', function() {
                                 const cueCount = track.cues ? track.cues.length : 0;
                                 console.log('Subtitle track loaded:', track.label, 'cues:', cueCount);
+                                ensureSubtitleVisible();
                                 if (popup && popup.classList.contains('active')) {
                                     loadSubtitles();
                                 }
@@ -3038,22 +3081,14 @@ ${tracks}
                             track.addEventListener('loadeddata', function() {
                                 const cueCount = track.cues ? track.cues.length : 0;
                                 console.log('Subtitle track data loaded:', track.label, 'cues:', cueCount);
+                                ensureSubtitleVisible();
                                 if (popup && popup.classList.contains('active')) {
                                     loadSubtitles();
                                 }
                             });
                             
                             // Periodically reload track to pick up new cues as file is being written
-                            const videoElement = document.getElementById('videoPlayer');
-                            let trackElement = null;
-                            if (videoElement) {
-                                const trackElements = videoElement.querySelectorAll('track');
-                                trackElements.forEach(te => {
-                                    if (te.track === track) {
-                                        trackElement = te;
-                                    }
-                                });
-                            }
+                            let trackElement = getTrackElement(track);
                             
                             let lastCueCount = 0;
                             let lastFileSize = 0;
@@ -3104,6 +3139,7 @@ ${tracks}
                                                         const parent = trackElement.parentNode;
                                                         const newTrack = trackElement.cloneNode(false);
                                                         newTrack.src = newSrc;
+                                                        newTrack.dataset.source = 'embedded';
                                                         
                                                         // DON'T set default - let restoration handle it
                                                         // This prevents browser from auto-selecting wrong language
@@ -3123,6 +3159,7 @@ ${tracks}
                                                                     // If no specific language selected, just keep this track showing
                                                                     newTrack.track.mode = 'showing';
                                                                 }
+                                                                ensureSubtitleVisible();
                                                             }
                                                         };
                                                         
@@ -3151,12 +3188,13 @@ ${tracks}
                                                 }
                                             }
                                         })
-                                        .catch(err => {});
+                                        .catch(() => {});
                                 }
                                 
                                 if (currentCueCount > lastCueCount) {
                                     console.log('New cues detected: ' + currentCueCount + ' (was ' + lastCueCount + ')');
                                     lastCueCount = currentCueCount;
+                                    ensureSubtitleVisible();
                                     if (popup && popup.classList.contains('active')) {
                                         loadSubtitles();
                                     }
@@ -3167,15 +3205,28 @@ ${tracks}
                 };
                 
                 monitorTracks();
-                
-                tracks.addEventListener('addtrack', function(event) {
-                    if (event.track.kind === 'subtitles') {
-                        monitorTracks();
-                        if (popup && popup.classList.contains('active')) {
-                            loadSubtitles();
+
+                if (typeof tracks.addEventListener === 'function') {
+                    tracks.addEventListener('addtrack', function(event) {
+                        if (event.track.kind === 'subtitles') {
+                            monitorTracks();
+                            ensureSubtitleVisible();
+                            if (popup && popup.classList.contains('active')) {
+                                loadSubtitles();
+                            }
                         }
-                    }
-                });
+                    });
+                } else {
+                    tracks.onaddtrack = function(event) {
+                        if (event.track.kind === 'subtitles') {
+                            monitorTracks();
+                            ensureSubtitleVisible();
+                            if (popup && popup.classList.contains('active')) {
+                                loadSubtitles();
+                            }
+                        }
+                    };
+                }
             }
         }
         
@@ -3252,6 +3303,8 @@ ${tracks}
         player.ready(() => {
             setupAutoSubtitleDetection();
             trackSubtitleSelection();
+            ensureSubtitleVisible();
+            setTimeout(ensureSubtitleVisible, 400);
             // Don't auto-load subtitles to save memory - only load when user opens popup
             // This prevents tab crashes on TV shows with large subtitle files
         });
@@ -3259,6 +3312,7 @@ ${tracks}
         player.on('loadedmetadata', () => {
             // Subtitles will load on-demand when popup is opened
             restoreSubtitleSelection();
+            ensureSubtitleVisible();
         });
     </script>
 </body>
