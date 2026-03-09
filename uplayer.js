@@ -2155,7 +2155,7 @@ class StreamManager {
         }
       }, 5000);
 
-      this.client.add(magnetLink, (torrent) => {
+      this.client.add(magnetLink, async (torrent) => {
         // Clear timeout and progress indicators
         clearTimeout(connectionTimeout);
         clearInterval(progressInterval);
@@ -2289,7 +2289,7 @@ class StreamManager {
         }
         
         // Start HTTP server for streaming (pass subtitle path and disable flag)
-        this.startStreamingServer(videoFile, (url) => {
+        await this.startStreamingServer(videoFile, (url) => {
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Streaming server started');
           }
@@ -2365,22 +2365,60 @@ class StreamManager {
     });
   }
 
-  startStreamingServer(videoFile, callback, subtitlePath = null, disableSubtitles = false) {
+  // Probe video codec from webtorrent file (HEVC/H.265 not supported in browsers - needs transcoding)
+  async probeVideoCodec(videoFile) {
+    const { spawn } = require('child_process');
+    if (!this.ffprobePath) return null;
+    const sampleSize = Math.min(10 * 1024 * 1024, videoFile.length);
+    const samplePath = path.join(this.tempDir, `probe_${Date.now()}.tmp`);
+    return new Promise((resolve) => {
+      const readStream = videoFile.createReadStream({ start: 0, end: sampleSize - 1 });
+      const writeStream = fs.createWriteStream(samplePath);
+      readStream.on('error', () => { try { fs.unlinkSync(samplePath); } catch (e) {} resolve(null); });
+      writeStream.on('error', () => { try { fs.unlinkSync(samplePath); } catch (e) {} resolve(null); });
+      readStream.pipe(writeStream);
+      writeStream.on('finish', () => {
+        const ffprobe = spawn(this.ffprobePath, [
+          '-v', 'error', '-select_streams', 'v:0',
+          '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1',
+          samplePath
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+        let out = '';
+        ffprobe.stdout.on('data', (d) => { out += d.toString(); });
+        ffprobe.on('close', (code) => {
+          try { fs.unlinkSync(samplePath); } catch (e) {}
+          resolve(code === 0 && out ? out.trim().toLowerCase() : null);
+        });
+        ffprobe.on('error', () => { try { fs.unlinkSync(samplePath); } catch (e) {} resolve(null); });
+      });
+    });
+  }
+
+  async startStreamingServer(videoFile, callback, subtitlePath = null, disableSubtitles = false) {
     const port = 8000;
-    const videoUrl = `/video${path.extname(videoFile.name)}`;
-    const videoName = videoFile.name;
     const videoExt = path.extname(videoFile.name).toLowerCase();
-    let htmlVideoType = 'type="video/mp4"';
-    if (videoExt === '.mkv') {
-      htmlVideoType = 'type="video/mp4"';
-    } else if (videoExt === '.webm') {
-      htmlVideoType = 'type="video/webm"';
-    } else if (videoExt === '.mp4') {
-      htmlVideoType = 'type="video/mp4"';
-    } else if (videoExt === '.mov') {
-      htmlVideoType = 'type="video/quicktime"';
+
+    // Probe codec - HEVC/H.265 not supported in browsers, transcode to H.264
+    let needsTranscode = false;
+    const codec = await this.probeVideoCodec(videoFile);
+    if (codec && (codec === 'hevc' || codec === 'h265')) {
+      needsTranscode = true;
+      if (this.ffmpegPath) {
+        console.log(chalk.cyan('\n🔄 HEVC detected - transcoding to H.264 for browser compatibility...'));
+      } else {
+        console.log(chalk.yellow('\n⚠️  HEVC video - browser may not play it. Install ffmpeg for auto-transcoding.'));
+      }
     }
-    
+
+    const videoUrl = needsTranscode && this.ffmpegPath ? '/video.mp4' : `/video${videoExt}`;
+    const videoName = videoFile.name;
+    const contentType = (needsTranscode && this.ffmpegPath) ? 'video/mp4' : (
+      { '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.webm': 'video/webm',
+        '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v' }[videoExt] || 'video/mp4'
+    );
+    const htmlVideoType = `type="${contentType}"`;
+    const serveTranscoded = needsTranscode && this.ffmpegPath;
+
     this.server = http.createServer((req, res) => {
       // Handle root request - serve HTML player page
       if (req.url === '/' || req.url === '/index.html') {
@@ -2472,20 +2510,25 @@ class StreamManager {
         res.end('');
         return;
       }
+
+      const videoPathMatch = req.url.match(/^\/video\.(\w+)(\?.*)?$/);
+      if (!videoPathMatch) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('');
+        return;
+      }
         
-        // Handle range requests for video streaming
+        // Handle range requests for video streaming (or transcoding for HEVC)
         const range = req.headers.range;
       
         let stream;
         
-        // ENHANCED: Helper function to safely destroy stream with cleanup
         const destroyStream = () => {
-          if (stream && !stream.destroyed) {
-            // Remove from active streams tracking
-            this.activeStreams.delete(stream);
-            stream.destroy();
-            stream = null; // Clear reference for GC
-          }
+          if (!stream) return;
+          this.activeStreams.delete(stream);
+          if (typeof stream.kill === 'function') stream.kill();
+          else if (!stream.destroyed) stream.destroy();
+          stream = null;
         };
         
         // ENHANCED: Handle client disconnect with stream cleanup
@@ -2506,18 +2549,43 @@ class StreamManager {
         // Handle response errors
         res.on('error', (err) => {
           destroyStream();
-          // Silently ignore client disconnect errors
           if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
             console.error('Response error:', err.message);
           }
         });
+
+        // HEVC transcoding path - no range support, chunked stream
+        if (serveTranscoded) {
+          const { spawn } = require('child_process');
+          res.writeHead(200, {
+            'Content-Type': 'video/mp4',
+            'Access-Control-Allow-Origin': '*',
+            'Transfer-Encoding': 'chunked'
+          });
+          const inputStream = videoFile.createReadStream();
+          const ffmpeg = spawn(this.ffmpegPath, [
+            '-i', 'pipe:0', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
+            '-f', 'mp4', 'pipe:1'
+          ], { stdio: ['pipe', 'pipe', 'pipe'] });
+          inputStream.pipe(ffmpeg.stdin);
+          ffmpeg.stdout.pipe(res);
+          stream = ffmpeg;
+          this.activeStreams.add(stream);
+          ffmpeg.stderr.on('data', () => {});
+          ffmpeg.on('close', () => { destroyStream(); });
+          inputStream.on('error', () => { ffmpeg.kill(); destroyStream(); });
+          res.on('close', () => { inputStream.destroy(); ffmpeg.kill(); });
+          return;
+        }
         
           if (!range) {
             res.writeHead(200, {
           'Content-Length': videoFile.length,
-          'Content-Type': 'video/mp4',
+          'Content-Type': contentType,
+          'Access-Control-Allow-Origin': '*'
         });
-        // CRITICAL: Create stream with priority on initial pieces
         stream = videoFile.createReadStream({ start: 0, end: Math.min(videoFile.length - 1, 10 * 1024 * 1024) });
         
         // Handle stream errors
@@ -2550,7 +2618,8 @@ class StreamManager {
             'Content-Range': `bytes ${start}-${end}/${videoFile.length}`,
             'Accept-Ranges': 'bytes',
             'Content-Length': chunksize,
-        'Content-Type': 'video/mp4',
+            'Content-Type': contentType,
+            'Access-Control-Allow-Origin': '*'
       });
 
       // ENHANCED: Create stream with large buffer for maximum speed
@@ -3635,10 +3704,31 @@ ${tracks}
 
 // Main CLI interface
 async function main() {
+  const sandboxModule = require('./sandbox.js');
+
   program
     .name('uplayer')
     .description('Uplayer - Simple torrent player. Search and play movies instantly')
-    .version('1.0.0')
+    .version('1.0.0');
+
+  // Clean command: remove cached torrent chunks and temp files (fixes dark screen / stale data)
+  program
+    .command('clean')
+    .description('Remove cached WebTorrent chunks and temp files (run when video shows dark screen or stale playback)')
+    .action(() => {
+      let count = sandboxModule.cleanAllStreamingTemp();
+      // Also clean project .temp folder (subtitle downloads)
+      const tempDir = path.join(__dirname, '.temp');
+      if (fs.existsSync(tempDir)) {
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+          count++;
+        } catch (e) { /* ignore */ }
+      }
+      console.log(chalk.green(`✅ Cleaned ${count} temp/cache location(s). Restart UPlayer and try again.`));
+    });
+
+  program
     .argument('[query]', 'Movie name to search and stream')
     .option('-m, --magnet <link>', 'Direct magnet link to stream')
     .option('-t, --torrent <file>', 'Torrent file path')

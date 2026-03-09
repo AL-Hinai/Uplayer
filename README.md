@@ -174,12 +174,17 @@ Uplayer now uses **strict sandbox isolation** for maximum security:
 ### Manual Cleanup
 
 ```bash
-# Clean all temp files
+# Using UPlayer (recommended - cross-platform)
+uplayer clean
+
+# Or manually (Linux/macOS)
 rm -rf /tmp/webtorrent /dev/shm/stream-sandbox-*
 
 # Check disk usage
 du -sh /dev/shm/stream-sandbox-* /tmp/webtorrent 2>/dev/null
 ```
+
+> **Tip:** Run `uplayer clean` when video shows a dark screen with audio/subtitles working—often caused by stale cache or wrong MIME type.
 
 ### Privacy
 
