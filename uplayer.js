@@ -10,6 +10,7 @@ const open = require('open');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const { EventEmitter } = require('events');
 const OpenSubtitles = require('opensubtitles.com');
 
 // Media searcher - searches TMDB using API only (like Elementum/Kodi approach)
@@ -1649,8 +1650,9 @@ class MemoryTracker {
 }
 
 // Stream manager
-class StreamManager {
+class StreamManager extends EventEmitter {
   constructor(lowMemoryMode = false, memoryTracker = null) {
+    super();
     // Create WebTorrent client with NO LIMITS for maximum speed
     // All artificial restrictions removed to allow full download speed
     
@@ -1697,6 +1699,9 @@ class StreamManager {
     this.subtitlePath = null;
     this.subtitlePaths = []; // Array of all available subtitles with metadata
     this.cleanupInterval = null; // Periodic cleanup timer
+    this._transcodedPath = null; // Path to background-transcoded temp MP4 file
+    this._transcodeProc = null;  // ffmpeg child process for background transcoding
+    this._bestEncoder = null;    // Cached best encoder result
     
     // ENHANCED: Start periodic memory cleanup in low-memory mode
     if (lowMemoryMode) {
@@ -1721,7 +1726,69 @@ class StreamManager {
     this.ffmpegPath = this.findFFmpegBinary('ffmpeg');
     this.ffprobePath = this.findFFmpegBinary('ffprobe');
   }
-  
+
+  // Emit a log line to EventEmitter listeners AND write to stdout (CLI behaviour preserved)
+  _log(text) {
+    if (this.listenerCount('line') > 0) {
+      // In server/in-process mode: emit structured event, suppress stdout
+      const lines = String(text).split('\n');
+      for (const line of lines) {
+        const trimmed = line.trimEnd();
+        if (trimmed) this.emit('line', { text: trimmed });
+      }
+    } else {
+      // In CLI mode: write directly to stdout as before
+      process.stdout.write(String(text));
+    }
+  }
+
+  // Gracefully destroy the WebTorrent client and close the HTTP server
+  async destroy() {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+
+    // Kill background transcoder if still running
+    if (this._transcodeProc) {
+      try { this._transcodeProc.kill(); } catch (e) { /* ignore */ }
+      this._transcodeProc = null;
+    }
+
+    // Remove temp transcoded file and raw dump
+    if (this._transcodedPath) {
+      try { if (fs.existsSync(this._transcodedPath)) fs.unlinkSync(this._transcodedPath); } catch (e) { /* ignore */ }
+      this._transcodedPath = null;
+    }
+    if (this._rawDumpPath) {
+      try { if (fs.existsSync(this._rawDumpPath)) fs.unlinkSync(this._rawDumpPath); } catch (e) { /* ignore */ }
+      this._rawDumpPath = null;
+    }
+
+    const closeServer = () => new Promise((resolve) => {
+      if (this.server) {
+        try { this.server.close(() => resolve()); } catch (e) { resolve(); }
+        this.server = null;
+      } else {
+        resolve();
+      }
+    });
+    const destroyClient = () => new Promise((resolve) => {
+      if (this.client) {
+        try {
+          this.client.destroy((err) => { resolve(); });
+        } catch (e) { resolve(); }
+        this.client = null;
+      } else {
+        resolve();
+      }
+    });
+    await Promise.all([closeServer(), destroyClient()]);
+    this.currentTorrent = null;
+    this.activeStreams.clear();
+    this.emit('exit', { code: 0 });
+  }
+
   findFFmpegBinary(binaryName = 'ffmpeg') {
     const { spawnSync } = require('child_process');
     const fs = require('fs');
@@ -2111,8 +2178,20 @@ class StreamManager {
   }
 
   async stream(magnetLink, options = {}) {
+    // Determine if we are running in server/in-process mode (EventEmitter listeners attached)
+    const serverMode = this.listenerCount('line') > 0 || this.listenerCount('progress') > 0;
+
+    const log = (text) => {
+      if (serverMode) {
+        const lines = String(text).split('\n');
+        for (const l of lines) { const t = l.trimEnd(); if (t) this.emit('line', { text: t }); }
+      } else {
+        process.stdout.write(String(text) + (String(text).endsWith('\n') ? '' : '\n'));
+      }
+    };
+
     return new Promise((resolve, reject) => {
-      console.log(chalk.blue('\n📥 Adding torrent...'));
+      log('📥 Adding torrent...');
       
       if (this.memoryTracker) {
         this.memoryTracker.logMemory('Before adding torrent');
@@ -2120,7 +2199,7 @@ class StreamManager {
 
       // Set up error handler BEFORE adding torrent
       const errorHandler = (err) => {
-        console.log(chalk.red(`\n❌ WebTorrent error: ${err.message}`));
+        log(`❌ WebTorrent error: ${err.message}`);
         reject(err);
       };
       this.client.once('error', errorHandler);
@@ -2128,30 +2207,30 @@ class StreamManager {
       // Add timeout for torrent connection (60 seconds)
       const connectionTimeout = setTimeout(() => {
         this.client.removeListener('error', errorHandler);
-        console.log(chalk.red('\n❌ Timeout: Could not connect to torrent after 60 seconds'));
-        console.log(chalk.yellow('💡 Try:'));
-        console.log(chalk.yellow('   1. Check your internet connection'));
-        console.log(chalk.yellow('   2. Try a different torrent'));
-        console.log(chalk.yellow('   3. Make sure no other torrent client is running'));
+        log('❌ Timeout: Could not connect to torrent after 60 seconds');
+        log('💡 Try:');
+        log('   1. Check your internet connection');
+        log('   2. Try a different torrent');
+        log('   3. Make sure no other torrent client is running');
         reject(new Error('Torrent connection timeout'));
       }, 60000);
 
       // Show connection progress
-      console.log(chalk.cyan('   💡 Connecting to DHT and trackers to find peers...'));
+      log('   💡 Connecting to DHT and trackers to find peers...');
       let connectionTimer = 0;
       const progressInterval = setInterval(() => {
         connectionTimer += 5;
         if (connectionTimer >= 15 && connectionTimer % 5 === 0) {
           if (connectionTimer === 15) {
-            console.log(chalk.yellow('\n⚠️  Taking longer than expected...'));
-            console.log(chalk.yellow('   This can happen if:'));
-            console.log(chalk.yellow('   - Torrent has few seeders'));
-            console.log(chalk.yellow('   - DHT/trackers are slow to respond'));
-            console.log(chalk.yellow('   - Network connection issues'));
-            console.log(chalk.yellow('\n   💡 Tip: Try using a different torrent source'));
-            console.log(chalk.yellow('   Please wait...'));
+            log('⚠️  Taking longer than expected...');
+            log('   This can happen if:');
+            log('   - Torrent has few seeders');
+            log('   - DHT/trackers are slow to respond');
+            log('   - Network connection issues');
+            log('   💡 Tip: Try using a different torrent source');
+            log('   Please wait...');
           }
-          console.log(chalk.cyan(`   ⏳ Still connecting... (${connectionTimer}s)`));
+          log(`   ⏳ Still connecting... (${connectionTimer}s)`);
         }
       }, 5000);
 
@@ -2166,9 +2245,9 @@ class StreamManager {
           this.memoryTracker.logMemory('After adding torrent');
         }
         
-        console.log(chalk.green(`\n✅ Torrent added: ${torrent.name}`));
-        console.log(chalk.cyan(`📊 Files: ${torrent.files.length}`));
-        console.log(chalk.cyan(`👥 Peers: ${torrent.numPeers}`));
+        log(`✅ Torrent added: ${torrent.name}`);
+        log(`📊 Files: ${torrent.files.length}`);
+        log(`👥 Peers: ${torrent.numPeers}`);
         
         // CRITICAL: Deselect all files first to prevent memory allocation
         // Analysis shows 138MB ArrayBuffer spike when torrent is added
@@ -2188,13 +2267,9 @@ class StreamManager {
         // CRITICAL: Select ONLY the video file to prevent unnecessary memory allocation
         videoFile.select();
         
-        // ENHANCED: Smart piece management for optimal streaming
-        // WebTorrent handles piece selection automatically for streaming
-        // We just need to ensure sequential downloading for the video file
-        
         // WebTorrent's file.select() already enables sequential downloading
         // and prioritizes pieces needed for streaming
-        console.log(chalk.cyan(`💡 Sequential streaming enabled (WebTorrent auto-prioritization)`));
+        log('💡 Sequential streaming enabled (WebTorrent auto-prioritization)');
         
         // OPTIONAL: In low-memory mode, implement piece cleanup to free memory
         let lastCleanupPiece = 0;
@@ -2241,9 +2316,9 @@ class StreamManager {
           clearInterval(pieceManagementInterval);
         });
         
-        console.log(chalk.green(`\n🎬 Video file: ${videoFile.name}`));
-        console.log(chalk.cyan(`📦 Size: ${(videoFile.length / 1024 / 1024 / 1024).toFixed(2)} GB`));
-        console.log(chalk.yellow(`💡 Other files deselected to save memory`));
+        log(`🎬 Video file: ${videoFile.name}`);
+        log(`📦 Size: ${(videoFile.length / 1024 / 1024 / 1024).toFixed(2)} GB`);
+        log('💡 Other files deselected to save memory');
         
         if (this.memoryTracker) {
           this.memoryTracker.logMemory('Video file found');
@@ -2251,13 +2326,13 @@ class StreamManager {
         
         // Skip subtitle processing if disabled (memory optimization)
         if (options.disableSubtitles) {
-          console.log(chalk.yellow('\n⚠️  Subtitles disabled (--no-subtitles flag) for better performance'));
-          console.log(chalk.green('   ✅ Skipping subtitle extraction (saves ~50MB memory)'));
+          log('⚠️  Subtitles disabled (--no-subtitles flag) for better performance');
+          log('   ✅ Skipping subtitle extraction (saves ~50MB memory)');
         } else {
           // Extract embedded subtitles as video downloads (streaming extraction)
           if (this.ffmpegPath && this.ffprobePath) {
-            console.log(chalk.cyan('\n🎬 Extracting embedded subtitles (may use extra memory)...'));
-            console.log(chalk.yellow('   💡 Use --no-subtitles flag to disable and save ~50MB'));
+            log('🎬 Extracting embedded subtitles (may use extra memory)...');
+            log('   💡 Use --no-subtitles flag to disable and save ~50MB');
             
             this.extractEmbeddedSubtitlesStreaming(videoFile, torrent).then(() => {
               // Subtitles extracted (or not found), continue with streaming setup
@@ -2268,8 +2343,8 @@ class StreamManager {
               // Ignore extraction errors
             });
           } else {
-            console.log(chalk.yellow('\n⚠️  Embedded subtitle extraction unavailable: ffmpeg/ffprobe not found in PATH'));
-            console.log(chalk.yellow('   💡 Install ffmpeg (with ffprobe) to load subtitles from MultiSub torrents in browser'));
+            log('⚠️  Embedded subtitle extraction unavailable: ffmpeg/ffprobe not found in PATH');
+            log('   💡 Install ffmpeg (with ffprobe) to load subtitles from MultiSub torrents in browser');
           }
           
           // Add external subtitle if provided
@@ -2296,22 +2371,27 @@ class StreamManager {
           
           // Show subtitle info if available
           if (!options.disableSubtitles && options.subtitlePath && fs.existsSync(options.subtitlePath)) {
-            console.log(chalk.green(`\n📝 Subtitle available: ${url}/subtitle.srt`));
-            console.log(chalk.cyan('   💡 Most players will auto-detect the subtitle file'));
+            log(`📝 Subtitle available: ${url}/subtitle.srt`);
+            log('   💡 Most players will auto-detect the subtitle file');
           }
-          console.log(chalk.green(`\n🚀 Streaming server started!`));
-          console.log(chalk.yellow(`\n📺 Stream URL: ${url}`));
+          log('🚀 Streaming server started!');
+          log(`📺 Stream URL: ${url}`);
           if (options.disableSubtitles) {
-            console.log(chalk.cyan('\n💡 Opening lightweight player (subtitles disabled)...'));
+            log('💡 Opening lightweight player (subtitles disabled)...');
           } else {
-            console.log(chalk.cyan('\n💡 Opening in default player...'));
+            log('💡 Opening in default player...');
           }
-          console.log(chalk.gray('   Press Ctrl+C to stop streaming\n'));
+          log('   Press Ctrl+C to stop streaming');
+
+          // Emit structured player_ready event for server mode
+          if (serverMode) {
+            this.emit('player_ready', { url });
+          }
 
           // Open in default player (force new tab for better memory management)
           if (options.openPlayer !== false) {
             open(url, { newInstance: true, wait: false }).catch(() => {
-              console.log(chalk.yellow('\n⚠️  Could not auto-open player. Copy the URL above and open it in VLC or your preferred player.'));
+              log('⚠️  Could not auto-open player. Copy the URL above and open it in VLC or your preferred player.');
             });
           }
 
@@ -2343,20 +2423,27 @@ class StreamManager {
           
           // Log memory every 500 download events (~every 500 MB typically)
           if (this.memoryTracker && downloadCount % 500 === 0) {
-            // Clear current line, move to new line for memory log
-            process.stdout.write('\r\x1b[K\n'); // Clear line and move to new line
+            if (!serverMode) process.stdout.write('\r\x1b[K\n');
             this.memoryTracker.logMemory(`Download progress: ${progress}%`);
-            // Don't add extra spacing - memory log already has newline
           }
           
-          // Always draw progress on same line (clearing previous content)
-          process.stdout.write(`\r\x1b[K${chalk.cyan(`⬇️  Progress: ${progress}% | Downloaded: ${downloaded} MB | Speed: ${speed} MB/s`)}`);
+          if (serverMode) {
+            // Emit structured progress event for the browser
+            this.emit('progress', {
+              percent: parseFloat(progress),
+              speed: `${speed} MB/s`,
+              downloaded: `${downloaded} MB`,
+            });
+          } else {
+            // Always draw progress on same line (clearing previous content)
+            process.stdout.write(`\r\x1b[K${chalk.cyan(`⬇️  Progress: ${progress}% | Downloaded: ${downloaded} MB | Speed: ${speed} MB/s`)}`);
+          }
         });
 
         torrent.on('done', () => {
           downloadComplete = true;
-          process.stdout.write('\r\x1b[K'); // Clear the progress line
-          console.log(chalk.green('\n✅ Download complete!'));
+          if (!serverMode) process.stdout.write('\r\x1b[K'); // Clear the progress line
+          log('✅ Download complete!');
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Download complete');
           }
@@ -2394,6 +2481,75 @@ class StreamManager {
     });
   }
 
+  // Detect the fastest available H.264 encoder by probing ffmpeg with a tiny null test.
+  // Priority: NVIDIA NVENC → Intel QSV → AMD AMF/VCE → Apple VideoToolbox → CPU ultrafast
+  async detectBestEncoder() {
+    if (this._bestEncoder) return this._bestEncoder;
+    if (!this.ffmpegPath) { this._bestEncoder = null; return null; }
+
+    const { spawnSync } = require('child_process');
+
+    // Bitrates tuned for Full HD (1080p): 10M target allows VBR headroom for complex scenes
+    const candidates = [
+      {
+        encoder: 'h264_nvenc',
+        extraArgs: ['-preset', 'p4', '-b:v', '10M', '-maxrate', '18M', '-bufsize', '18M'],
+        label: 'NVIDIA NVENC (GPU)',
+      },
+      {
+        encoder: 'h264_qsv',
+        extraArgs: ['-preset', 'veryfast', '-b:v', '10M'],
+        label: 'Intel QuickSync (GPU)',
+      },
+      {
+        encoder: 'h264_amf',
+        extraArgs: ['-quality', 'quality', '-b:v', '10M'],
+        label: 'AMD AMF (GPU)',
+      },
+      {
+        encoder: 'h264_videotoolbox',
+        extraArgs: ['-b:v', '10M'],
+        label: 'Apple VideoToolbox (GPU)',
+      },
+      {
+        encoder: 'libx264',
+        extraArgs: ['-preset', 'veryfast', '-crf', '20'],
+        label: 'CPU ultrafast (libx264)',
+      },
+    ];
+
+    for (const candidate of candidates) {
+      const result = spawnSync(this.ffmpegPath, [
+        '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
+        '-c:v', candidate.encoder,
+        ...candidate.extraArgs,
+        '-f', 'null', '-',
+      ], { stdio: 'pipe', timeout: 6000 });
+
+      if (result.status === 0) {
+        this._bestEncoder = candidate;
+        console.log(chalk.green(`\n⚡ GPU/HW encoder selected: ${candidate.label}`));
+        return candidate;
+      }
+    }
+
+    this._bestEncoder = null;
+    return null;
+  }
+
+  // Build ffmpeg video encoding args. Inserts -vf scale (even dimensions) and -pix_fmt yuv420p
+  // so GPU encoders (NVENC, QSV, AMF) don't fail with "Error while opening encoder".
+  _encoderArgs(enc) {
+    const scaleAndPix = [
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-pix_fmt', 'yuv420p',
+    ];
+    if (!enc) {
+      return [...scaleAndPix, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20'];
+    }
+    return [...scaleAndPix, '-c:v', enc.encoder, ...enc.extraArgs];
+  }
+
   async startStreamingServer(videoFile, callback, subtitlePath = null, disableSubtitles = false) {
     const port = 8000;
     const videoExt = path.extname(videoFile.name).toLowerCase();
@@ -2401,13 +2557,23 @@ class StreamManager {
     // Probe codec - HEVC/H.265 not supported in browsers, transcode to H.264
     let needsTranscode = false;
     const codec = await this.probeVideoCodec(videoFile);
+
+    // Detect best encoder BEFORE creating the server (must happen at async level)
+    let selectedEncoder = null;
     if (codec && (codec === 'hevc' || codec === 'h265')) {
       needsTranscode = true;
       if (this.ffmpegPath) {
-        console.log(chalk.cyan('\n🔄 HEVC detected - transcoding to H.264 for browser compatibility...'));
+        selectedEncoder = await this.detectBestEncoder();
+        this._log(`🔄 HEVC detected — will transcode live via ${selectedEncoder ? selectedEncoder.label : 'CPU ultrafast'}.`);
       } else {
         console.log(chalk.yellow('\n⚠️  HEVC video - browser may not play it. Install ffmpeg for auto-transcoding.'));
       }
+    }
+
+    const serveTranscoded = needsTranscode && this.ffmpegPath;
+
+    if (serveTranscoded) {
+      this._log('🔄 HEVC will be transcoded live on-the-fly when you open the player.');
     }
 
     const videoUrl = needsTranscode && this.ffmpegPath ? '/video.mp4' : `/video${videoExt}`;
@@ -2417,12 +2583,11 @@ class StreamManager {
         '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v' }[videoExt] || 'video/mp4'
     );
     const htmlVideoType = `type="${contentType}"`;
-    const serveTranscoded = needsTranscode && this.ffmpegPath;
 
     this.server = http.createServer((req, res) => {
       // Handle root request - serve HTML player page
       if (req.url === '/' || req.url === '/index.html') {
-        const html = this.getHTMLPlayer(videoUrl, htmlVideoType, videoName, disableSubtitles);
+        const html = this.getHTMLPlayer(videoUrl, htmlVideoType, videoName, disableSubtitles, serveTranscoded);
         res.writeHead(200, {
           'Content-Type': 'text/html; charset=utf-8',
           'Access-Control-Allow-Origin': '*'
@@ -2554,26 +2719,37 @@ class StreamManager {
           }
         });
 
-        // HEVC transcoding path - no range support, chunked stream
+        // HEVC live on-the-fly transcoding: pipe torrent stream → ffmpeg → HTTP (chunked)
         if (serveTranscoded) {
           const { spawn } = require('child_process');
+          const videoArgs = this._encoderArgs(selectedEncoder);
+          const inputStream = videoFile.createReadStream();
+
           res.writeHead(200, {
             'Content-Type': 'video/mp4',
             'Access-Control-Allow-Origin': '*',
-            'Transfer-Encoding': 'chunked'
+            'Transfer-Encoding': 'chunked',
           });
-          const inputStream = videoFile.createReadStream();
+
           const ffmpeg = spawn(this.ffmpegPath, [
-            '-i', 'pipe:0', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+            '-i', 'pipe:0',
+            ...videoArgs,
             '-c:a', 'aac', '-b:a', '192k',
             '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
-            '-f', 'mp4', 'pipe:1'
+            '-f', 'mp4', 'pipe:1',
           ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+          stream = ffmpeg;
+          this.activeStreams.add(ffmpeg);
           inputStream.pipe(ffmpeg.stdin);
           ffmpeg.stdout.pipe(res);
-          stream = ffmpeg;
-          this.activeStreams.add(stream);
-          ffmpeg.stderr.on('data', () => {});
+
+          ffmpeg.stderr.on('data', (d) => {
+            const line = d.toString().trim();
+            if (line.includes('fps=') || line.includes('speed=')) {
+              this._log(`🎬 Live transcode: ${line.replace(/\s+/g, ' ')}`);
+            }
+          });
           ffmpeg.on('close', () => { destroyStream(); });
           inputStream.on('error', () => { ffmpeg.kill(); destroyStream(); });
           res.on('close', () => { inputStream.destroy(); ffmpeg.kill(); });
@@ -2665,10 +2841,10 @@ class StreamManager {
     });
   }
   
-  getHTMLPlayer(videoUrl, htmlVideoType, videoName, disableSubtitles = false) {
+  getHTMLPlayer(videoUrl, htmlVideoType, videoName, disableSubtitles = false, transcoding = false) {
     // If subtitles are disabled, return a lightweight player with NO subtitle functionality
     if (disableSubtitles) {
-      return this.getLightweightHTMLPlayer(videoUrl, htmlVideoType, videoName);
+      return this.getLightweightHTMLPlayer(videoUrl, htmlVideoType, videoName, transcoding);
     }
     
     const normalizeTrackLanguage = (language) => {
@@ -2764,9 +2940,35 @@ class StreamManager {
             align-items: center; justify-content: center; font-size: 18px;
         }
         .close-btn:hover { background: rgba(255, 0, 0, 0.2); border-color: #f44336; color: #f44336; }
+        .video-error-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92);
+            z-index: 20000; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box;
+        }
+        .video-error-overlay.visible { display: flex; }
+        .video-error-box {
+            max-width: 480px; background: #1a1a1a; border: 1px solid #f44336; border-radius: 12px;
+            padding: 24px; color: #fff; font-family: Arial, sans-serif;
+        }
+        .video-error-box h2 { color: #f44336; font-size: 1.1rem; margin: 0 0 12px 0; }
+        .video-error-box p { margin: 0 0 16px 0; line-height: 1.5; color: #ccc; }
+        .video-error-box ul { margin: 0 0 16px 0; padding-left: 20px; color: #aaa; font-size: 0.9rem; }
+        .video-error-box a { color: #4CAF50; }
     </style>
 </head>
 <body>
+    <div id="videoErrorOverlay" class="video-error-overlay">
+        <div class="video-error-box">
+            <h2>Media could not be loaded</h2>
+            <p id="videoErrorDetail">The media could not be loaded, either because the server or network failed or because the format is not supported.</p>
+            <ul>
+                <li>If this is HEVC: transcoding may still be starting — wait 30s and refresh.</li>
+                <li>Try opening in <a href="${videoUrl}" target="_blank">VLC</a> or another player (File → Open Network).</li>
+                <li>Refresh the page and press play again.</li>
+                <li>Check that the stream is still running (terminal or web GUI).</li>
+            </ul>
+            <button type="button" id="videoErrorRetryBtn" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;">Retry</button>
+        </div>
+    </div>
     <div class="subtitle-adjust-btn" id="subtitleAdjustBtn" title="Adjust Subtitle Timing">⏱️</div>
     <div class="subtitle-adjust-popup" id="subtitleAdjustPopup">
         <div class="close-btn" id="closePopupBtn">×</div>
@@ -2794,7 +2996,10 @@ class StreamManager {
             <source src="${videoUrl}" ${htmlVideoType}>
 ${tracks}
         </video>
-        <div class="video-info"><p>${videoName}</p></div>
+        <div class="video-info">
+            <p>${videoName}</p>
+            ${transcoding ? `<p id="transcodeStatus" style="color:#ffa726;font-size:12px;margin-top:4px;">🔄 Transcoding HEVC → H.264 in progress… player will start automatically.</p>` : ''}
+        </div>
     </div>
     <script src="https://vjs.zencdn.net/8.6.1/video.min.js"></script>
     <script>
@@ -2805,7 +3010,42 @@ ${tracks}
             fluid: true, responsive: true,
             html5: { nativeTextTracks: true }
         });
-        
+
+        // Show on-page error when media could not be loaded (server/network/format)
+        player.on('error', () => {
+            const overlay = document.getElementById('videoErrorOverlay');
+            const detail = document.getElementById('videoErrorDetail');
+            const err = player.error();
+            const msg = err ? (err.message || 'The media could not be loaded, either because the server or network failed or because the format is not supported.') : 'The media could not be loaded, either because the server or network failed or because the format is not supported.';
+            if (detail) detail.textContent = msg;
+            if (overlay) overlay.classList.add('visible');
+        });
+        document.getElementById('videoErrorRetryBtn').addEventListener('click', () => {
+            document.getElementById('videoErrorOverlay').classList.remove('visible');
+            player.load();
+            player.play().catch(function() {});
+        });
+
+        // Auto-retry: if transcoding is in progress the file may not be ready yet.
+        // Poll the video URL until we get a non-error response, then reload.
+        let _autoRetryCount = 0;
+        player.on('error', () => {
+            if (_autoRetryCount < 12) { // up to ~60s of retries
+                _autoRetryCount++;
+                setTimeout(() => {
+                    fetch('/video.mp4', { method: 'HEAD' }).then((r) => {
+                        if (r.ok && parseInt(r.headers.get('content-length') || '0') > 1024 * 1024) {
+                            document.getElementById('videoErrorOverlay').classList.remove('visible');
+                            const ts = document.getElementById('transcodeStatus');
+                            if (ts) ts.textContent = '✅ Transcoding buffered — starting playback...';
+                            player.load();
+                            player.play().catch(function() {});
+                        }
+                    }).catch(function() {});
+                }, 5000);
+            }
+        });
+
         let subtitleOffset = 0;
         let allSubtitles = [];
         let selectedSubtitleLanguage = null; // Track user's selected subtitle language
@@ -3388,7 +3628,7 @@ ${tracks}
 </html>`;
   }
 
-  getLightweightHTMLPlayer(videoUrl, htmlVideoType, videoName) {
+  getLightweightHTMLPlayer(videoUrl, htmlVideoType, videoName, transcoding = false) {
     // Ultra-lightweight player with ZERO subtitle functionality
     // This eliminates ALL memory overhead from subtitle processing
     return `<!DOCTYPE html>
@@ -3461,9 +3701,64 @@ ${tracks}
             color: #f44336;
             font-weight: bold;
         }
+        .video-error-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.92);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            box-sizing: border-box;
+        }
+        .video-error-overlay.visible {
+            display: flex;
+        }
+        .video-error-box {
+            max-width: 480px;
+            background: #1a1a1a;
+            border: 1px solid #f44336;
+            border-radius: 12px;
+            padding: 24px;
+            color: #fff;
+            font-family: Arial, sans-serif;
+        }
+        .video-error-box h2 {
+            color: #f44336;
+            font-size: 1.1rem;
+            margin: 0 0 12px 0;
+        }
+        .video-error-box p {
+            margin: 0 0 16px 0;
+            line-height: 1.5;
+            color: #ccc;
+        }
+        .video-error-box ul {
+            margin: 0 0 16px 0;
+            padding-left: 20px;
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+        .video-error-box a {
+            color: #4CAF50;
+        }
     </style>
 </head>
 <body>
+    <div id="videoErrorOverlay" class="video-error-overlay">
+        <div class="video-error-box">
+            <h2>Media could not be loaded</h2>
+            <p id="videoErrorDetail">The media could not be loaded, either because the server or network failed or because the format is not supported.</p>
+            <ul>
+                <li>If this is HEVC: transcoding may still be starting — wait 30s and refresh.</li>
+                <li>Try opening in <a href="${videoUrl}" target="_blank">VLC</a> or another player (File → Open Network).</li>
+                <li>Refresh the page and press play again.</li>
+                <li>Check that the stream is still running (terminal or web GUI).</li>
+            </ul>
+            <button type="button" onclick="document.getElementById('videoErrorOverlay').classList.remove('visible'); document.getElementById('videoPlayer').load();" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;">Retry</button>
+        </div>
+    </div>
     <div class="lightweight-badge">⚡ Lightweight Mode - No Subtitles</div>
     <div class="memory-stats" id="memoryStats">
         <div>Memory: <span id="memUsed">--</span> MB</div>
@@ -3479,6 +3774,7 @@ ${tracks}
             <p style="color: #4CAF50; font-size: 12px; margin-top: 5px;">
                 🚀 Lightweight player for maximum performance
             </p>
+            ${transcoding ? `<p id="transcodeStatus" style="color:#ffa726;font-size:12px;margin-top:4px;">🔄 Transcoding HEVC → H.264 in progress… player will start automatically.</p>` : ''}
         </div>
     </div>
     <script>
@@ -3576,13 +3872,32 @@ ${tracks}
         // Start memory tracking
         trackMemory();
         
-        // Basic error handling
+        // Show on-page error when media could not be loaded (server/network/format)
+        let _autoRetryCount = 0;
         video.addEventListener('error', (e) => {
-            console.error('Video error:', e);
-            console.error('If video fails to play, try:');
-            console.error('1. Refresh the page');
-            console.error('2. Use --low-memory flag');
-            console.error('3. Use VLC instead: vlc http://localhost:8000/video.mp4');
+            const overlay = document.getElementById('videoErrorOverlay');
+            const detail = document.getElementById('videoErrorDetail');
+            const msg = video.error ? (video.error.message || 'The media could not be loaded, either because the server or network failed or because the format is not supported.') : 'The media could not be loaded, either because the server or network failed or because the format is not supported.';
+            if (detail) detail.textContent = msg;
+            console.error('Video error:', video.error ? video.error.code + ' ' + video.error.message : e);
+
+            // Auto-retry while transcoding is still building the temp file (up to ~60s)
+            if (_autoRetryCount < 12) {
+                _autoRetryCount++;
+                setTimeout(() => {
+                    fetch(video.currentSrc || video.src || '${videoUrl}', { method: 'HEAD' }).then((r) => {
+                        if (r.ok && parseInt(r.headers.get('content-length') || '0') > 1024 * 1024) {
+                            if (overlay) overlay.classList.remove('visible');
+                            const ts = document.getElementById('transcodeStatus');
+                            if (ts) ts.textContent = '✅ Transcoding buffered — starting playback...';
+                            video.load();
+                            video.play().catch(function() {});
+                        }
+                    }).catch(function() {});
+                }, 5000);
+            } else {
+                if (overlay) overlay.classList.add('visible');
+            }
         });
         
         // ENHANCED: Configure video for optimal memory usage

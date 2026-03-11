@@ -41,7 +41,7 @@ elif command -v node >/dev/null 2>&1; then
     echo -e "  ${G}✓${N} Node.js found"
     RUNTIME="node"
     INSTALL_CMD="npm install"
-    RUN_CMD="node --expose-gc"
+    RUN_CMD="node"
 else
     echo -e "  ${Y}!${N} No runtime found. Installing Bun (fastest)..."
     if [[ "$OS" == "linux" ]] || [[ "$OS" == "macos" ]]; then

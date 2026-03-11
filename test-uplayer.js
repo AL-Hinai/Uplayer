@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { StreamManager } = require('./stream.js');
+const { StreamManager } = require('./uplayer.js');
 const chalk = require('chalk');
 const http = require('http');
 const { URL } = require('url');

@@ -125,7 +125,7 @@ uplayer --debug-memory "Movie"
 **Garbage Collection**
 - Periodic cleanup every 2 minutes
 - On-demand after streams
-- Requires `--expose-gc` flag (auto-added by installer)
+- Optional: `--expose-gc` for low-memory mode (run: `node --expose-gc uplayer.js`)
 
 ---
 
@@ -481,6 +481,20 @@ uplayer --low-memory "Movie"
   cache=yes
   cache-secs=10
   ```
+
+### Compare CLI vs Web stream speed
+
+To measure the difference in time-to-stream-ready between running uplayer from the CLI and from the web UI:
+
+1. **Web test:** Start the server in one terminal: `npm run web`
+2. In another terminal run: `npm run test:stream-speed`
+
+The script times how long until the stream is ready (CLI: in-process `StreamManager`; Web: server spawns `uplayer.js`). Optional args:
+
+- `--magnet "magnet:?..."` — use a specific torrent (e.g. Mercy.2026)
+- `--cli-only` — run only the CLI benchmark
+- `--web-only` — run only the Web benchmark (server must be running)
+- `--server-url http://localhost:3000` — web server URL
 
 ---
 
