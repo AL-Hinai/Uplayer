@@ -444,7 +444,7 @@ function startMonitoring(streamUrl, streamManager) {
     
     try {
       // Check if subtitle endpoint is accessible
-      const subtitleUrl = `${baseUrl}/subtitle.srt`;
+      const subtitleUrl = `${baseUrl}/api/subtitles`;
       const response = await new Promise((resolve, reject) => {
         const req = http.get(subtitleUrl, (res) => {
           resolve(res);
@@ -493,4 +493,3 @@ function startMonitoring(streamUrl, streamManager) {
 }
 
 module.exports = { testStreaming, runAutomatedTests, startMonitoring };
-

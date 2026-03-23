@@ -10,6 +10,13 @@
     "start": "node uplayer.js",
     "start:bun": "bun run uplayer.js",
     "web": "node server.js",
+    "test": "npm run test:core && npm run test:recommendations && npm run test:lifecycle && npm run test:api-contract && npm run test:player-link && npm run test:player-html",
+    "test:core": "node tests/core-services.test.js",
+    "test:recommendations": "node tests/recommendation-engine.test.js",
+    "test:api-contract": "node tests/api-contract.test.js",
+    "test:lifecycle": "node tests/stream-lifecycle.test.js",
+    "test:player-link": "node tests/open-active-player.test.js",
+    "test:player-html": "node tests/native-player-html.test.js",
     "test:stream-speed": "node test-stream-speed.js",
     "build": "pkg . --out-path dist",
     "build:all": "pkg . --targets node18-linux-x64,node18-win-x64,node18-macos-x64 --out-path dist",
@@ -50,7 +57,8 @@
   "pkg": {
     "assets": [
       "node_modules/ffmpeg-static/ffmpeg*",
-      "node_modules/ffprobe-static/bin/**/*"
+      "node_modules/ffprobe-static/bin/**/*",
+      "public/player/**/*"
     ],
     "targets": [
       "node18-linux-x64",

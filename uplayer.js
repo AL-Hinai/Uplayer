@@ -12,40 +12,85 @@ const path = require('path');
 const fs = require('fs');
 const { EventEmitter } = require('events');
 const OpenSubtitles = require('opensubtitles.com');
+const { loadEnvFileOnce } = require('./core/config');
+const { createTmdbClient } = require('./core/tmdb-client');
+const { createSharedServices } = require('./core/shared-services');
+const { buildAccessibleUrls } = require('./core/network-address');
+
+loadEnvFileOnce();
+
+function hiddenChildProcessOptions(options = {}) {
+  return {
+    shell: false,
+    ...options,
+    ...(process.platform === 'win32' ? { windowsHide: true } : {}),
+  };
+}
+
+function waitForServerReady(server) {
+  if (server.listening) {
+    return Promise.resolve(server);
+  }
+  return new Promise((resolve, reject) => {
+    const onListening = () => {
+      server.off('error', onError);
+      resolve(server);
+    };
+    const onError = (error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    server.once('listening', onListening);
+    server.once('error', onError);
+  });
+}
+
+function probeExistingWebServer(port) {
+  return new Promise((resolve) => {
+    const req = http.get({
+      hostname: '127.0.0.1',
+      port,
+      path: '/api/stream/status',
+      timeout: 2000,
+    }, (res) => {
+      resolve(res.statusCode === 200);
+      res.resume();
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on('error', () => resolve(false));
+  });
+}
 
 // Media searcher - searches TMDB using API only (like Elementum/Kodi approach)
 class MediaSearcher {
-  constructor() {
+  constructor(options = {}) {
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
-    // Use provided API key or environment variable
-    this.apiKey = process.env.TMDB_API_KEY || 'aee3a88db6bb9228aec32784ef2dd1c1';
-    this.baseUrl = 'https://api.themoviedb.org/3';
+    // Use injected or system-config API key.
+    this.tmdb = options.tmdbClient || createTmdbClient(process.env.TMDB_API_KEY);
     
-    if (!this.apiKey) {
-      console.warn(chalk.yellow('⚠️  TMDB API key not set. Set TMDB_API_KEY environment variable for best results.'));
+    if (!this.tmdb.hasApiKey()) {
+      console.warn(chalk.yellow('TMDB API key not set. Configure TMDB_API_KEY in core/system-config.js.'));
     }
   }
   
   // TMDB API search for movies - clean and simple
   async searchMoviesAPI(query) {
-    if (!this.apiKey) {
-      throw new Error('TMDB API key is required. Please set TMDB_API_KEY environment variable.');
+    if (!this.tmdb.hasApiKey()) {
+      throw new Error('TMDB API key is required. Configure TMDB_API_KEY in core/system-config.js.');
     }
     
     try {
-      const url = `${this.baseUrl}/search/movie`;
-      const response = await axios.get(url, {
-        params: {
-          api_key: this.apiKey,
-          query: query,
-          language: 'en-US',
-          include_adult: false
-        },
-        timeout: 15000
+      const response = await this.tmdb.get('/search/movie', {
+        query: query,
+        language: 'en-US',
+        include_adult: false
       });
 
       const results = [];
-      for (const movie of (response.data.results || []).slice(0, 10)) {
+      for (const movie of (response.results || []).slice(0, 10)) {
         results.push({
           id: movie.id,
           title: movie.title,
@@ -58,33 +103,25 @@ class MediaSearcher {
       }
       return results;
     } catch (error) {
-      if (error.response) {
-        throw new Error(`TMDB API Error: ${error.response.status} - ${error.response.statusText}`);
-      }
       throw new Error(`Failed to search TMDB: ${error.message}`);
     }
   }
   
   // TMDB API search for TV shows - clean and simple
   async searchTVShowsAPI(query) {
-    if (!this.apiKey) {
-      throw new Error('TMDB API key is required. Please set TMDB_API_KEY environment variable.');
+    if (!this.tmdb.hasApiKey()) {
+      throw new Error('TMDB API key is required. Configure TMDB_API_KEY in core/system-config.js.');
     }
     
     try {
-      const url = `${this.baseUrl}/search/tv`;
-      const response = await axios.get(url, {
-        params: {
-          api_key: this.apiKey,
-          query: query,
-          language: 'en-US',
-          include_adult: false
-        },
-        timeout: 15000
+      const response = await this.tmdb.get('/search/tv', {
+        query: query,
+        language: 'en-US',
+        include_adult: false
       });
 
       const results = [];
-      for (const tv of (response.data.results || []).slice(0, 10)) {
+      for (const tv of (response.results || []).slice(0, 10)) {
         results.push({
           id: tv.id,
           title: tv.name,
@@ -97,31 +134,20 @@ class MediaSearcher {
       }
       return results;
     } catch (error) {
-      if (error.response) {
-        throw new Error(`TMDB API Error: ${error.response.status} - ${error.response.statusText}`);
-      }
       throw new Error(`Failed to search TMDB: ${error.message}`);
     }
   }
   
   // Get TV show details with seasons using TMDB API - clean and reliable
   async getTVShowDetailsAPI(tvShowId) {
-    if (!this.apiKey) {
+    if (!this.tmdb.hasApiKey()) {
       throw new Error('TMDB API key is required.');
     }
     
     try {
-      const url = `${this.baseUrl}/tv/${tvShowId}`;
-      const response = await axios.get(url, {
-        params: {
-          api_key: this.apiKey,
-          language: 'en-US'
-          // Note: seasons are included by default in the TV details endpoint
-        },
-        timeout: 15000
+      const tv = await this.tmdb.get(`/tv/${tvShowId}`, {
+        language: 'en-US'
       });
-
-      const tv = response.data;
       // The API returns all seasons in the seasons array - this is the most reliable method
       const allSeasons = tv.seasons || [];
       
@@ -137,30 +163,21 @@ class MediaSearcher {
         number_of_seasons: tv.number_of_seasons || allSeasons.length
       };
     } catch (error) {
-      if (error.response) {
-        throw new Error(`TMDB API Error: ${error.response.status} - ${error.response.statusText}`);
-      }
       throw new Error(`Failed to get TV show details: ${error.message}`);
     }
   }
   
   // Get season episodes using TMDB API - clean and reliable
   async getSeasonEpisodesAPI(tvShowId, seasonNumber) {
-    if (!this.apiKey) {
+    if (!this.tmdb.hasApiKey()) {
       throw new Error('TMDB API key is required.');
     }
     
     try {
-      const url = `${this.baseUrl}/tv/${tvShowId}/season/${seasonNumber}`;
-      const response = await axios.get(url, {
-        params: {
-          api_key: this.apiKey,
-          language: 'en-US'
-        },
-        timeout: 15000
+      const season = await this.tmdb.get(`/tv/${tvShowId}/season/${seasonNumber}`, {
+        language: 'en-US'
       });
 
-      const season = response.data;
       return (season.episodes || []).map(ep => ({
         episode_number: ep.episode_number || 0,
         name: ep.name || `Episode ${ep.episode_number || 0}`,
@@ -168,9 +185,6 @@ class MediaSearcher {
         overview: ep.overview || ''
       }));
     } catch (error) {
-      if (error.response) {
-        throw new Error(`TMDB API Error: ${error.response.status} - ${error.response.statusText}`);
-      }
       throw new Error(`Failed to get season episodes: ${error.message}`);
     }
   }
@@ -551,15 +565,18 @@ class MediaSearcher {
 
 // Subtitle Manager - searches and downloads subtitles from multiple sources
 // Supports OpenSubtitles.com and Addic7ed
-// API Key: Set OPENSUBTITLES_API_KEY env var or uses default key below
+// Credentials should be configured in core/system-config.js (env still supported as fallback).
 class SubtitleManager {
-  constructor() {
+  constructor(options = {}) {
+    const creds = options.openSubtitles || {};
+    this.apiKey = creds.apiKey || process.env.OPENSUBTITLES_API_KEY || '';
+    this.username = creds.username || process.env.OPENSUBTITLES_USERNAME || '';
+    this.password = creds.password || process.env.OPENSUBTITLES_PASSWORD || '';
+
     this.client = new OpenSubtitles({
-      apikey: process.env.OPENSUBTITLES_API_KEY || '4bzTWMHnRRVaW4RkftqVjuy9bYEOpsJA', // Default working API key
+      apikey: this.apiKey,
       useragent: 'TemporaryUserAgent'
     });
-    this.username = process.env.OPENSUBTITLES_USERNAME || 'msalim245';
-    this.password = process.env.OPENSUBTITLES_PASSWORD || 'al9hinai5';
     this.loggedIn = false;
     this.token = null;
     this.userAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -575,6 +592,11 @@ class SubtitleManager {
     if (this.loggedIn && this.token) {
       return true;
     }
+
+    if (!this.apiKey || !this.username || !this.password) {
+      console.error(chalk.yellow('OpenSubtitles credentials are missing. Configure credentials in core/system-config.js.'));
+      return false;
+    }
     
     try {
       await this.client.login({
@@ -584,7 +606,7 @@ class SubtitleManager {
       this.loggedIn = true;
       return true;
     } catch (error) {
-      console.error(chalk.yellow(`⚠️  OpenSubtitles login error: ${error.message}`));
+      console.error(chalk.yellow(`OpenSubtitles login error: ${error.message}`));
       return false;
     }
   }
@@ -606,10 +628,10 @@ class SubtitleManager {
       if (tmdbId && mediaType) {
         if (mediaType === 'movie') {
           searchParams.tmdb_id = parseInt(tmdbId);
-          console.log(`   🎯 Searching with TMDB Movie ID: ${tmdbId}`);
+          console.log(`   Searching with TMDB Movie ID: ${tmdbId}`);
         } else if (mediaType === 'tv') {
           searchParams.parent_tmdb_id = parseInt(tmdbId);
-          console.log(`   🎯 Searching with TMDB TV ID: ${tmdbId}`);
+          console.log(`   Searching with TMDB TV ID: ${tmdbId}`);
         }
       }
 
@@ -619,17 +641,17 @@ class SubtitleManager {
       // Priority 3: Add year for better filtering
       if (year) {
         searchParams.year = parseInt(year);
-        console.log(`   📅 Filtering by year: ${year}`);
+        console.log(`   Filtering by year: ${year}`);
       }
 
       // Priority 4: Add season/episode for TV shows
       if (season !== null) {
         searchParams.season_number = parseInt(season);
-        console.log(`   📺 Season: ${season}`);
+        console.log(`   Season: ${season}`);
       }
       if (episode !== null) {
         searchParams.episode_number = parseInt(episode);
-        console.log(`   📺 Episode: ${episode}`);
+        console.log(`   Episode: ${episode}`);
       }
 
       // Set media type for better filtering
@@ -639,7 +661,7 @@ class SubtitleManager {
         searchParams.type = 'episode';
       }
 
-      console.log(`   🔍 OpenSubtitles search params:`, JSON.stringify(searchParams, null, 2));
+      console.log(`   OpenSubtitles search params:`, JSON.stringify(searchParams, null, 2));
 
       // Try subtitles() method (the correct method for opensubtitles.com library)
       const results = await this.client.subtitles(searchParams);
@@ -658,7 +680,7 @@ class SubtitleManager {
         attributes: item.attributes
       }));
     } catch (error) {
-      console.error(`   ⚠️  OpenSubtitles error: ${error.message}`);
+      console.error(`   OpenSubtitles error: ${error.message}`);
       return [];
     }
   }
@@ -1027,7 +1049,7 @@ class TorrentScraper {
     // Remove duplicates
     queries = [...new Set(queries)];
     
-    console.log(chalk.cyan(`\n🔍 Searching ${queries.length} query variation(s) across all sources...`));
+    console.log(chalk.cyan(`\nSearching ${queries.length} query variation(s) across all sources...`));
     
     // Search all sources in parallel for each query (fast!)
     const allPromises = [];
@@ -1478,7 +1500,7 @@ class MemoryTracker {
     
     if (this.enabled) {
       this.startMemory = process.memoryUsage();
-      console.log(chalk.cyan('\n📊 Memory tracking enabled'));
+      console.log(chalk.cyan('\nMemory tracking enabled'));
       this.logMemory('Initial');
       
       // Start periodic monitoring
@@ -1515,7 +1537,7 @@ class MemoryTracker {
       this.snapshots.shift();
     }
     
-    console.log(chalk.blue(`\n📊 [${label}] Memory at ${(timestamp / 1000).toFixed(1)}s:`));
+    console.log(chalk.blue(`\n[${label}] Memory at ${(timestamp / 1000).toFixed(1)}s:`));
     console.log(chalk.white(`   Heap Used:     ${this.formatBytes(usage.heapUsed)}`));
     console.log(chalk.white(`   Heap Total:    ${this.formatBytes(usage.heapTotal)}`));
     console.log(chalk.white(`   RSS:           ${this.formatBytes(usage.rss)}`));
@@ -1537,21 +1559,21 @@ class MemoryTracker {
     
     // Warning threshold
     if (usage.heapUsed > this.warningThreshold && usage.heapUsed < this.criticalThreshold) {
-      console.log(chalk.yellow(`\n⚠️  Memory warning: ${this.formatBytes(usage.heapUsed)} heap used`));
+      console.log(chalk.yellow(`\nMemory warning: ${this.formatBytes(usage.heapUsed)} heap used`));
       this.logMemory('Warning');
     }
     
     // Critical threshold
     if (usage.heapUsed > this.criticalThreshold) {
-      console.log(chalk.red(`\n🚨 CRITICAL: High memory usage: ${this.formatBytes(usage.heapUsed)}`));
+      console.log(chalk.red(`\nCRITICAL: High memory usage: ${this.formatBytes(usage.heapUsed)}`));
       this.logMemory('Critical');
       
       // Suggest actions
-      console.log(chalk.yellow('   💡 Suggestions:'));
-      console.log(chalk.yellow('      - Use --low-memory flag'));
-      console.log(chalk.yellow('      - Use --no-subtitles flag'));
+      console.log(chalk.yellow('   Suggestions:'));
+      console.log(chalk.yellow('      - Stop and restart the current stream'));
+      console.log(chalk.yellow('      - Pick a torrent with fewer/lighter files'));
       console.log(chalk.yellow('      - Close other applications'));
-      console.log(chalk.yellow('      - Consider using VLC instead of browser'));
+      console.log(chalk.yellow('      - Keep only one active player tab'));
     }
   }
   
@@ -1559,14 +1581,14 @@ class MemoryTracker {
     if (!this.enabled || this.snapshots.length === 0) return;
     
     console.log(chalk.cyan('\n\n' + '='.repeat(60)));
-    console.log(chalk.cyan('📊 MEMORY TRACKING REPORT'));
+    console.log(chalk.cyan('MEMORY TRACKING REPORT'));
     console.log(chalk.cyan('='.repeat(60)));
     
     const first = this.snapshots[0];
     const last = this.snapshots[this.snapshots.length - 1];
     const peak = this.snapshots.reduce((max, s) => s.heapUsed > max.heapUsed ? s : max, first);
     
-    console.log(chalk.white('\n📈 Summary:'));
+    console.log(chalk.white('\nSummary:'));
     console.log(chalk.white(`   Duration:      ${(last.timestamp / 1000 / 60).toFixed(1)} minutes`));
     console.log(chalk.white(`   Snapshots:     ${this.snapshots.length}`));
     console.log(chalk.white(`   Start Memory:  ${this.formatBytes(first.heapUsed)}`));
@@ -1591,26 +1613,26 @@ class MemoryTracker {
     }
     
     // Identify potential issues
-    console.log(chalk.white('\n🔍 Potential Issues:'));
+    console.log(chalk.white('\nPotential Issues:'));
     
     const avgArrayBuffers = this.snapshots.reduce((sum, s) => sum + (s.arrayBuffers || 0), 0) / this.snapshots.length;
     if (avgArrayBuffers > 100 * 1024 * 1024) {
-      console.log(chalk.yellow(`   ⚠️  High ArrayBuffer usage (${this.formatBytes(avgArrayBuffers)})`));
-      console.log(chalk.yellow('      → Likely video buffering issue'));
-      console.log(chalk.yellow('      → Try --low-memory flag'));
+      console.log(chalk.yellow(`   High ArrayBuffer usage (${this.formatBytes(avgArrayBuffers)})`));
+      console.log(chalk.yellow('      ? Likely video buffering issue'));
+      console.log(chalk.yellow('      ? Restart stream and choose a higher-seeder torrent'));
     }
     
     const avgExternal = this.snapshots.reduce((sum, s) => sum + s.external, 0) / this.snapshots.length;
     if (avgExternal > 200 * 1024 * 1024) {
-      console.log(chalk.yellow(`   ⚠️  High external memory (${this.formatBytes(avgExternal)})`));
-      console.log(chalk.yellow('      → Likely WebTorrent buffering'));
-      console.log(chalk.yellow('      → Reduce peer connections'));
+      console.log(chalk.yellow(`   High external memory (${this.formatBytes(avgExternal)})`));
+      console.log(chalk.yellow('      ? Likely WebTorrent buffering'));
+      console.log(chalk.yellow('      ? Reduce peer connections'));
     }
     
     if (growth > 100 * 1024 * 1024) {
-      console.log(chalk.red(`   🚨 Memory leak detected!`));
-      console.log(chalk.yellow('      → Memory growing over time'));
-      console.log(chalk.yellow('      → Check browser developer console for errors'));
+      console.log(chalk.red(`   Memory leak detected!`));
+      console.log(chalk.yellow('      ? Memory growing over time'));
+      console.log(chalk.yellow('      ? Check browser developer console for errors'));
     }
     
     // Save to file
@@ -1628,9 +1650,9 @@ class MemoryTracker {
         },
         snapshots: this.snapshots
       }, null, 2));
-      console.log(chalk.green(`\n💾 Report saved: ${reportPath}`));
+      console.log(chalk.green(`\nReport saved: ${reportPath}`));
     } catch (err) {
-      console.log(chalk.red(`\n❌ Could not save report: ${err.message}`));
+      console.log(chalk.red(`\n? Could not save report: ${err.message}`));
     }
     
     console.log(chalk.cyan('\n' + '='.repeat(60) + '\n'));
@@ -1691,21 +1713,22 @@ class StreamManager extends EventEmitter {
     this.sandbox.setupCleanupHandlers();
     
     const sandboxInfo = this.sandbox.getInfo();
-    console.log(chalk.cyan(`🔒 STRICT Isolation: ${sandboxInfo.type} (${sandboxInfo.sizeLimit} limit)`));
-    console.log(chalk.cyan(`   ✓ No file execution allowed`));
-    console.log(chalk.cyan(`   ✓ No path escape allowed`));
-    console.log(chalk.cyan(`   ✓ Stream-only access`));
+    console.log(chalk.cyan(`STRICT Isolation: ${sandboxInfo.type} (${sandboxInfo.sizeLimit} limit)`));
+    console.log(chalk.cyan(`   ? No file execution allowed`));
+    console.log(chalk.cyan(`   ? No path escape allowed`));
+    console.log(chalk.cyan(`   ? Stream-only access`));
     
     this.subtitlePath = null;
     this.subtitlePaths = []; // Array of all available subtitles with metadata
     this.cleanupInterval = null; // Periodic cleanup timer
+    this._cancelPendingStream = null; // Abort in-flight stream setup during teardown
     this._transcodedPath = null; // Path to background-transcoded temp MP4 file
     this._transcodeProc = null;  // ffmpeg child process for background transcoding
     this._bestEncoder = null;    // Cached best encoder result
     
     // ENHANCED: Start periodic memory cleanup in low-memory mode
     if (lowMemoryMode) {
-      console.log(chalk.yellow('⚡ Low-memory mode enabled (with maximum speed settings)'));
+      console.log(chalk.yellow('? Low-memory mode enabled (with maximum speed settings)'));
       console.log(chalk.yellow('   - Max connections: 100 (unlimited)'));
       console.log(chalk.yellow('   - Upload limit: Unlimited'));
       console.log(chalk.yellow('   - Download limit: Unlimited'));
@@ -1716,7 +1739,7 @@ class StreamManager extends EventEmitter {
       this.cleanupInterval = setInterval(() => {
         const activeCount = this.activeStreams.size;
         if (activeCount > 0) {
-          console.log(chalk.cyan(`🧹 Periodic cleanup (${activeCount} active streams)...`));
+          console.log(chalk.cyan(`Periodic cleanup (${activeCount} active streams)...`));
           this.cleanup();
         }
       }, 120000); // Every 2 minutes
@@ -1742,53 +1765,6 @@ class StreamManager extends EventEmitter {
     }
   }
 
-  // Gracefully destroy the WebTorrent client and close the HTTP server
-  async destroy() {
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = null;
-    }
-
-    // Kill background transcoder if still running
-    if (this._transcodeProc) {
-      try { this._transcodeProc.kill(); } catch (e) { /* ignore */ }
-      this._transcodeProc = null;
-    }
-
-    // Remove temp transcoded file and raw dump
-    if (this._transcodedPath) {
-      try { if (fs.existsSync(this._transcodedPath)) fs.unlinkSync(this._transcodedPath); } catch (e) { /* ignore */ }
-      this._transcodedPath = null;
-    }
-    if (this._rawDumpPath) {
-      try { if (fs.existsSync(this._rawDumpPath)) fs.unlinkSync(this._rawDumpPath); } catch (e) { /* ignore */ }
-      this._rawDumpPath = null;
-    }
-
-    const closeServer = () => new Promise((resolve) => {
-      if (this.server) {
-        try { this.server.close(() => resolve()); } catch (e) { resolve(); }
-        this.server = null;
-      } else {
-        resolve();
-      }
-    });
-    const destroyClient = () => new Promise((resolve) => {
-      if (this.client) {
-        try {
-          this.client.destroy((err) => { resolve(); });
-        } catch (e) { resolve(); }
-        this.client = null;
-      } else {
-        resolve();
-      }
-    });
-    await Promise.all([closeServer(), destroyClient()]);
-    this.currentTorrent = null;
-    this.activeStreams.clear();
-    this.emit('exit', { code: 0 });
-  }
-
   findFFmpegBinary(binaryName = 'ffmpeg') {
     const { spawnSync } = require('child_process');
     const fs = require('fs');
@@ -1803,7 +1779,7 @@ class StreamManager extends EventEmitter {
 
     for (const [cmd, args] of lookupCommands) {
       try {
-        const result = spawnSync(cmd, args, { encoding: 'utf8' });
+        const result = spawnSync(cmd, args, hiddenChildProcessOptions({ encoding: 'utf8' }));
         if (result.status === 0 && result.stdout) {
           const firstMatch = result.stdout
             .split(/\r?\n/)
@@ -1866,7 +1842,7 @@ class StreamManager extends EventEmitter {
 
     // Fallback: if executable name itself is callable in PATH
     try {
-      const directRun = spawnSync(binaryName, ['-version'], { stdio: 'ignore' });
+      const directRun = spawnSync(binaryName, ['-version'], hiddenChildProcessOptions({ stdio: 'ignore' }));
       if (directRun.status === 0) {
         return binaryName;
       }
@@ -1968,7 +1944,7 @@ class StreamManager extends EventEmitter {
             '-show_entries', 'stream=index:stream_tags=language,title',
             '-of', 'json',
             samplePath
-          ], { stdio: ['pipe', 'pipe', 'pipe'] });
+          ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
 
           let probeOutput = '';
           ffprobe.stdout.on('data', (data) => {
@@ -1996,7 +1972,7 @@ class StreamManager extends EventEmitter {
                 return;
               }
 
-              console.log(chalk.cyan(`\n📝 Found ${subtitleStreams.length} embedded subtitle track(s) - extracting during download...`));
+              console.log(chalk.cyan(`\nFound ${subtitleStreams.length} embedded subtitle track(s) - extracting during download...`));
               
               // Create placeholder entries immediately so they appear in HTML
               subtitleStreams.forEach((stream, index) => {
@@ -2021,7 +1997,7 @@ class StreamManager extends EventEmitter {
                   if (!this.subtitlePath) {
                     this.subtitlePath = outputPath;
                   }
-                  console.log(chalk.gray(`   📝 Reserved slot for: ${placeholderInfo.label} (will be available during streaming)`));
+                  console.log(chalk.gray(`   Reserved slot for: ${placeholderInfo.label} (will be available during streaming)`));
                 }
               });
               
@@ -2048,7 +2024,7 @@ class StreamManager extends EventEmitter {
                       '-y',
                       '-loglevel', 'error',
                       '-fflags', '+genpts'
-                    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+                    ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
 
                     const videoStream = videoFile.createReadStream();
                     videoStream.pipe(ffmpeg.stdin);
@@ -2134,13 +2110,13 @@ class StreamManager extends EventEmitter {
                 if (extracted.length > 0) {
                   // Print all extracted subtitles in one batch to avoid interleaving with download progress
                   process.stdout.write('\r\x1b[K'); // Clear any progress line
-                  console.log(chalk.green(`\n✅ Successfully extracted ${extracted.length} subtitle track(s):`));
+                  console.log(chalk.green(`\n? Successfully extracted ${extracted.length} subtitle track(s):`));
                   extracted.forEach(sub => {
                     if (sub && sub.label) {
-                      console.log(chalk.green(`   ✅ ${sub.label}`));
+                      console.log(chalk.green(`   ? ${sub.label}`));
                     }
                   });
-                  console.log(chalk.cyan('   💡 Subtitles are available during streaming\n'));
+                  console.log(chalk.cyan('   Subtitles are available during streaming\n'));
                 }
                 resolve(extracted);
               });
@@ -2191,63 +2167,103 @@ class StreamManager extends EventEmitter {
     };
 
     return new Promise((resolve, reject) => {
-      log('📥 Adding torrent...');
+      if (!this.client) {
+        reject(new Error('Stream client is not available'));
+        return;
+      }
+
+      const client = this.client;
+      let settled = false;
+      let errorHandler = null;
+      let connectionTimeout = null;
+      let progressInterval = null;
+      let cancelPendingStream = null;
+
+      const clearPendingSetup = () => {
+        if (connectionTimeout) {
+          clearTimeout(connectionTimeout);
+          connectionTimeout = null;
+        }
+        if (progressInterval) {
+          clearInterval(progressInterval);
+          progressInterval = null;
+        }
+        if (errorHandler && client && typeof client.removeListener === 'function') {
+          client.removeListener('error', errorHandler);
+        }
+        if (this._cancelPendingStream === cancelPendingStream) {
+          this._cancelPendingStream = null;
+        }
+      };
+
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearPendingSetup();
+        fn(value);
+      };
+
+      cancelPendingStream = (message = 'Stream manager destroyed') => {
+        finish(reject, new Error(message));
+      };
+
+      log('Adding torrent...');
       
       if (this.memoryTracker) {
         this.memoryTracker.logMemory('Before adding torrent');
       }
 
       // Set up error handler BEFORE adding torrent
-      const errorHandler = (err) => {
-        log(`❌ WebTorrent error: ${err.message}`);
-        reject(err);
+      errorHandler = (err) => {
+        log(`? WebTorrent error: ${err.message}`);
+        finish(reject, err);
       };
-      this.client.once('error', errorHandler);
+      client.once('error', errorHandler);
+      this._cancelPendingStream = cancelPendingStream;
 
       // Add timeout for torrent connection (60 seconds)
-      const connectionTimeout = setTimeout(() => {
-        this.client.removeListener('error', errorHandler);
-        log('❌ Timeout: Could not connect to torrent after 60 seconds');
-        log('💡 Try:');
+      connectionTimeout = setTimeout(() => {
+        log('? Timeout: Could not connect to torrent after 60 seconds');
+        log('Try:');
         log('   1. Check your internet connection');
         log('   2. Try a different torrent');
         log('   3. Make sure no other torrent client is running');
-        reject(new Error('Torrent connection timeout'));
+        finish(reject, new Error('Torrent connection timeout'));
       }, 60000);
 
       // Show connection progress
-      log('   💡 Connecting to DHT and trackers to find peers...');
+      log('   Connecting to DHT and trackers to find peers...');
       let connectionTimer = 0;
-      const progressInterval = setInterval(() => {
+      progressInterval = setInterval(() => {
         connectionTimer += 5;
         if (connectionTimer >= 15 && connectionTimer % 5 === 0) {
           if (connectionTimer === 15) {
-            log('⚠️  Taking longer than expected...');
+            log('Taking longer than expected...');
             log('   This can happen if:');
             log('   - Torrent has few seeders');
             log('   - DHT/trackers are slow to respond');
             log('   - Network connection issues');
-            log('   💡 Tip: Try using a different torrent source');
+            log('   Tip: Try using a different torrent source');
             log('   Please wait...');
           }
-          log(`   ⏳ Still connecting... (${connectionTimer}s)`);
+          log(`   ? Still connecting... (${connectionTimer}s)`);
         }
       }, 5000);
 
-      this.client.add(magnetLink, async (torrent) => {
-        // Clear timeout and progress indicators
-        clearTimeout(connectionTimeout);
-        clearInterval(progressInterval);
-        this.client.removeListener('error', errorHandler);
-        this.currentTorrent = torrent;
+      client.add(magnetLink, async (torrent) => {
+        clearPendingSetup();
+        if (settled) return;
+
+        try {
+          this.currentTorrent = torrent;
         
         if (this.memoryTracker) {
           this.memoryTracker.logMemory('After adding torrent');
         }
         
-        log(`✅ Torrent added: ${torrent.name}`);
-        log(`📊 Files: ${torrent.files.length}`);
-        log(`👥 Peers: ${torrent.numPeers}`);
+        log(`? Torrent added: ${torrent.name}`);
+        log(`Files: ${torrent.files.length}`);
+        log(`Peers: ${torrent.numPeers}`);
         
         // CRITICAL: Deselect all files first to prevent memory allocation
         // Analysis shows 138MB ArrayBuffer spike when torrent is added
@@ -2260,7 +2276,7 @@ class StreamManager extends EventEmitter {
         });
 
         if (!videoFile) {
-          reject(new Error('No video file found in torrent'));
+          finish(reject, new Error('No video file found in torrent'));
           return;
         }
         
@@ -2269,7 +2285,7 @@ class StreamManager extends EventEmitter {
         
         // WebTorrent's file.select() already enables sequential downloading
         // and prioritizes pieces needed for streaming
-        log('💡 Sequential streaming enabled (WebTorrent auto-prioritization)');
+        log('Sequential streaming enabled (WebTorrent auto-prioritization)');
         
         // OPTIONAL: In low-memory mode, implement piece cleanup to free memory
         let lastCleanupPiece = 0;
@@ -2316,87 +2332,77 @@ class StreamManager extends EventEmitter {
           clearInterval(pieceManagementInterval);
         });
         
-        log(`🎬 Video file: ${videoFile.name}`);
-        log(`📦 Size: ${(videoFile.length / 1024 / 1024 / 1024).toFixed(2)} GB`);
-        log('💡 Other files deselected to save memory');
+        log(`Video file: ${videoFile.name}`);
+        log(`Size: ${(videoFile.length / 1024 / 1024 / 1024).toFixed(2)} GB`);
+        log('Other files deselected to save memory');
         
         if (this.memoryTracker) {
           this.memoryTracker.logMemory('Video file found');
         }
         
-        // Skip subtitle processing if disabled (memory optimization)
-        if (options.disableSubtitles) {
-          log('⚠️  Subtitles disabled (--no-subtitles flag) for better performance');
-          log('   ✅ Skipping subtitle extraction (saves ~50MB memory)');
-        } else {
-          // Extract embedded subtitles as video downloads (streaming extraction)
-          if (this.ffmpegPath && this.ffprobePath) {
-            log('🎬 Extracting embedded subtitles (may use extra memory)...');
-            log('   💡 Use --no-subtitles flag to disable and save ~50MB');
-            
-            this.extractEmbeddedSubtitlesStreaming(videoFile, torrent).then(() => {
-              // Subtitles extracted (or not found), continue with streaming setup
-              if (this.memoryTracker) {
-                this.memoryTracker.logMemory('After subtitle extraction');
-              }
-            }).catch(() => {
-              // Ignore extraction errors
-            });
-          } else {
-            log('⚠️  Embedded subtitle extraction unavailable: ffmpeg/ffprobe not found in PATH');
-            log('   💡 Install ffmpeg (with ffprobe) to load subtitles from MultiSub torrents in browser');
-          }
-          
-          // Add external subtitle if provided
-          if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
-            const subtitleInfo = {
-              path: options.subtitlePath,
-              source: 'external',
-              language: 'en',
-              label: 'External Subtitle',
-              codec: 'srt'
-            };
-            this.subtitlePaths.push(subtitleInfo);
-            if (!this.subtitlePath) {
-              this.subtitlePath = options.subtitlePath;
+        // Extract embedded subtitles as video downloads (streaming extraction)
+        if (this.ffmpegPath && this.ffprobePath) {
+          log('Extracting embedded subtitles...');
+          this.extractEmbeddedSubtitlesStreaming(videoFile, torrent).then(() => {
+            if (this.memoryTracker) {
+              this.memoryTracker.logMemory('After subtitle extraction');
             }
+          }).catch(() => {
+            // Ignore extraction errors
+          });
+        } else {
+          log('Embedded subtitle extraction unavailable: ffmpeg/ffprobe not found in PATH');
+          log('   Install ffmpeg (with ffprobe) to load subtitles from multisub torrents in browser');
+        }
+
+        // Add external subtitle if provided
+        if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
+          const subtitleInfo = {
+            path: options.subtitlePath,
+            source: 'external',
+            language: 'en',
+            label: 'External Subtitle',
+            codec: 'srt'
+          };
+          this.subtitlePaths.push(subtitleInfo);
+          if (!this.subtitlePath) {
+            this.subtitlePath = options.subtitlePath;
           }
         }
         
-        // Start HTTP server for streaming (pass subtitle path and disable flag)
-        await this.startStreamingServer(videoFile, (url) => {
+        // Start HTTP server for streaming
+        await this.startStreamingServer(videoFile, (url, urls) => {
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Streaming server started');
           }
           
           // Show subtitle info if available
-          if (!options.disableSubtitles && options.subtitlePath && fs.existsSync(options.subtitlePath)) {
-            log(`📝 Subtitle available: ${url}/subtitle.srt`);
-            log('   💡 Most players will auto-detect the subtitle file');
+          if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
+            log(`Subtitle available: ${url}/api/subtitles`);
+            log('   Subtitles are available inside the native JS player track menu');
           }
-          log('🚀 Streaming server started!');
-          log(`📺 Stream URL: ${url}`);
-          if (options.disableSubtitles) {
-            log('💡 Opening lightweight player (subtitles disabled)...');
-          } else {
-            log('💡 Opening in default player...');
+          log('Streaming server started!');
+          log(`Stream URL: ${url}`);
+          if (urls && urls.localhost && urls.localhost !== url) {
+            log(`Local fallback: ${urls.localhost}`);
           }
+          log('Opening native JS player...');
           log('   Press Ctrl+C to stop streaming');
 
           // Emit structured player_ready event for server mode
           if (serverMode) {
-            this.emit('player_ready', { url });
+            this.emit('player_ready', { url, urls });
           }
 
           // Open in default player (force new tab for better memory management)
           if (options.openPlayer !== false) {
             open(url, { newInstance: true, wait: false }).catch(() => {
-              log('⚠️  Could not auto-open player. Copy the URL above and open it in VLC or your preferred player.');
+              log('Could not auto-open player. Copy the URL above and open it in your browser.');
             });
           }
 
-          resolve({ url, torrent, videoFile, subtitlePath: options.subtitlePath });
-        }, options.subtitlePath, options.disableSubtitles);
+          finish(resolve, { url, urls, torrent, videoFile, subtitlePath: options.subtitlePath });
+        }, options.subtitlePath);
 
         // Show download progress with throttling to prevent terminal spam
         let downloadCount = 0;
@@ -2436,18 +2442,21 @@ class StreamManager extends EventEmitter {
             });
           } else {
             // Always draw progress on same line (clearing previous content)
-            process.stdout.write(`\r\x1b[K${chalk.cyan(`⬇️  Progress: ${progress}% | Downloaded: ${downloaded} MB | Speed: ${speed} MB/s`)}`);
+            process.stdout.write(`\r\x1b[K${chalk.cyan(`Progress: ${progress}% | Downloaded: ${downloaded} MB | Speed: ${speed} MB/s`)}`);
           }
         });
 
         torrent.on('done', () => {
           downloadComplete = true;
           if (!serverMode) process.stdout.write('\r\x1b[K'); // Clear the progress line
-          log('✅ Download complete!');
+          log('? Download complete!');
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Download complete');
           }
         });
+        } catch (err) {
+          finish(reject, err);
+        }
       });
     });
   }
@@ -2469,7 +2478,7 @@ class StreamManager extends EventEmitter {
           '-v', 'error', '-select_streams', 'v:0',
           '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1',
           samplePath
-        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+        ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
         let out = '';
         ffprobe.stdout.on('data', (d) => { out += d.toString(); });
         ffprobe.on('close', (code) => {
@@ -2482,7 +2491,7 @@ class StreamManager extends EventEmitter {
   }
 
   // Detect the fastest available H.264 encoder by probing ffmpeg with a tiny null test.
-  // Priority: NVIDIA NVENC → Intel QSV → AMD AMF/VCE → Apple VideoToolbox → CPU ultrafast
+  // Priority: NVIDIA NVENC ? Intel QSV ? AMD AMF/VCE ? Apple VideoToolbox ? CPU ultrafast
   async detectBestEncoder() {
     if (this._bestEncoder) return this._bestEncoder;
     if (!this.ffmpegPath) { this._bestEncoder = null; return null; }
@@ -2524,11 +2533,11 @@ class StreamManager extends EventEmitter {
         '-c:v', candidate.encoder,
         ...candidate.extraArgs,
         '-f', 'null', '-',
-      ], { stdio: 'pipe', timeout: 6000 });
+      ], hiddenChildProcessOptions({ stdio: 'pipe', timeout: 6000 }));
 
       if (result.status === 0) {
         this._bestEncoder = candidate;
-        console.log(chalk.green(`\n⚡ GPU/HW encoder selected: ${candidate.label}`));
+        console.log(chalk.green(`\n? GPU/HW encoder selected: ${candidate.label}`));
         return candidate;
       }
     }
@@ -2550,7 +2559,7 @@ class StreamManager extends EventEmitter {
     return [...scaleAndPix, '-c:v', enc.encoder, ...enc.extraArgs];
   }
 
-  async startStreamingServer(videoFile, callback, subtitlePath = null, disableSubtitles = false) {
+  async startStreamingServer(videoFile, callback, subtitlePath = null) {
     const port = 8000;
     const videoExt = path.extname(videoFile.name).toLowerCase();
 
@@ -2564,16 +2573,16 @@ class StreamManager extends EventEmitter {
       needsTranscode = true;
       if (this.ffmpegPath) {
         selectedEncoder = await this.detectBestEncoder();
-        this._log(`🔄 HEVC detected — will transcode live via ${selectedEncoder ? selectedEncoder.label : 'CPU ultrafast'}.`);
+        this._log(`HEVC detected - will transcode live via ${selectedEncoder ? selectedEncoder.label : 'CPU ultrafast'}.`);
       } else {
-        console.log(chalk.yellow('\n⚠️  HEVC video - browser may not play it. Install ffmpeg for auto-transcoding.'));
+        console.log(chalk.yellow('\nHEVC video - browser may not play it. Install ffmpeg for auto-transcoding.'));
       }
     }
 
     const serveTranscoded = needsTranscode && this.ffmpegPath;
 
     if (serveTranscoded) {
-      this._log('🔄 HEVC will be transcoded live on-the-fly when you open the player.');
+      this._log('HEVC will be transcoded live on-the-fly when you open the player.');
     }
 
     const videoUrl = needsTranscode && this.ffmpegPath ? '/video.mp4' : `/video${videoExt}`;
@@ -2585,14 +2594,36 @@ class StreamManager extends EventEmitter {
     const htmlVideoType = `type="${contentType}"`;
 
     this.server = http.createServer((req, res) => {
-      // Handle root request - serve HTML player page
+      // Handle root request - serve unified native JS player page
       if (req.url === '/' || req.url === '/index.html') {
-        const html = this.getHTMLPlayer(videoUrl, htmlVideoType, videoName, disableSubtitles, serveTranscoded);
+        const html = this.getNativePlayerHTML(videoUrl, htmlVideoType, videoName, serveTranscoded);
         res.writeHead(200, {
           'Content-Type': 'text/html; charset=utf-8',
           'Access-Control-Allow-Origin': '*'
         });
         res.end(html);
+        return;
+      }
+
+      if (req.url === '/player.css') {
+        const css = this.getNativePlayerCSS();
+        res.writeHead(200, {
+          'Content-Type': 'text/css; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end(css);
+        return;
+      }
+
+      if (req.url === '/player.js') {
+        const js = this.getNativePlayerJS();
+        res.writeHead(200, {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end(js);
         return;
       }
       
@@ -2719,8 +2750,9 @@ class StreamManager extends EventEmitter {
           }
         });
 
-        // HEVC live on-the-fly transcoding: pipe torrent stream → ffmpeg → HTTP (chunked)
-        if (serveTranscoded) {
+        // HEVC live on-the-fly transcoding: pipe torrent stream ? ffmpeg ? HTTP (chunked)
+        const forceCompatTranscode = /\bcompat=1\b/.test(req.url || '');
+        if ((serveTranscoded || forceCompatTranscode) && this.ffmpegPath) {
           const { spawn } = require('child_process');
           const videoArgs = this._encoderArgs(selectedEncoder);
           const inputStream = videoFile.createReadStream();
@@ -2737,7 +2769,7 @@ class StreamManager extends EventEmitter {
             '-c:a', 'aac', '-b:a', '192k',
             '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
             '-f', 'mp4', 'pipe:1',
-          ], { stdio: ['pipe', 'pipe', 'pipe'] });
+          ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
 
           stream = ffmpeg;
           this.activeStreams.add(ffmpeg);
@@ -2747,7 +2779,7 @@ class StreamManager extends EventEmitter {
           ffmpeg.stderr.on('data', (d) => {
             const line = d.toString().trim();
             if (line.includes('fps=') || line.includes('speed=')) {
-              this._log(`🎬 Live transcode: ${line.replace(/\s+/g, ' ')}`);
+              this._log(`Live transcode: ${line.replace(/\s+/g, ' ')}`);
             }
           });
           ffmpeg.on('close', () => { destroyStream(); });
@@ -2836,1131 +2868,132 @@ class StreamManager extends EventEmitter {
       });
     });
 
-    this.server.listen(port, () => {
-      callback(`http://localhost:${port}`);
+    const urls = buildAccessibleUrls(port);
+    this.server.listen(port, urls.bindHost, () => {
+      callback(urls.preferred, urls);
     });
   }
   
-  getHTMLPlayer(videoUrl, htmlVideoType, videoName, disableSubtitles = false, transcoding = false) {
-    // If subtitles are disabled, return a lightweight player with NO subtitle functionality
-    if (disableSubtitles) {
-      return this.getLightweightHTMLPlayer(videoUrl, htmlVideoType, videoName, transcoding);
+  getNativePlayerCSS() {
+    try {
+      return fs.readFileSync(path.join(__dirname, 'public', 'player', 'native-player.css'), 'utf8');
+    } catch (e) {
+      return 'body{margin:0;background:#000;color:#fff;font-family:Arial,sans-serif;}';
     }
-    
-    const normalizeTrackLanguage = (language) => {
-      const lang = (language || '').toString().trim().toLowerCase();
-      if (!lang || lang === 'unknown' || lang === 'und' || lang === 'n/a' || lang === 'null') {
-        return 'en';
-      }
-      return lang;
-    };
+  }
 
-    const tracks = this.subtitlePaths.length > 0 ? this.subtitlePaths.map((sub, index) => {
-      const normalizedLanguage = normalizeTrackLanguage(sub.language);
-      return `            <track kind="subtitles" src="/subtitle_${index}.vtt" srclang="${normalizedLanguage}" label="${sub.label || `Subtitle ${index + 1}`}" data-source="${sub.source || 'unknown'}" ${index === 0 ? 'default' : ''} type="text/vtt">`;
-    }).join('\n') : '            <!-- Subtitles will appear here as they are extracted during download -->';
-    
-    // Pass subtitle metadata to the player for smart refresh logic
-    const subtitleMetadata = JSON.stringify(this.subtitlePaths.map((sub, index) => ({
-      index: index,
-      source: sub.source || 'unknown',
-      language: normalizeTrackLanguage(sub.language),
-      label: sub.label || `Subtitle ${index + 1}`
-    })));
-    
+  getNativePlayerJS() {
+    try {
+      return fs.readFileSync(path.join(__dirname, 'public', 'player', 'native-player.js'), 'utf8');
+    } catch (e) {
+      return 'console.error("Native player script not found");';
+    }
+  }
+
+  getNativePlayerHTML(videoUrl, htmlVideoType, videoName, transcoding = false) {
+    const esc = (value) => String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+
+    const normalizedTracks = this.subtitlePaths.map((sub, index) => {
+      const language = (sub.language || 'en').toString().trim().toLowerCase() || 'en';
+      return {
+        index,
+        language,
+        label: sub.label || `Subtitle ${index + 1}`,
+        source: sub.source || 'unknown',
+      };
+    });
+
+    const trackTags = normalizedTracks.map((track, index) => {
+      return `<track kind="subtitles" src="/subtitle_${track.index}.vtt" srclang="${esc(track.language)}" label="${esc(track.label)}" ${index === 0 ? 'default' : ''}>`;
+    }).join('\n');
+
+    const compatFallbackUrl = this.ffmpegPath && videoUrl !== '/video.mp4'
+      ? '/video.mp4?compat=1'
+      : null;
+
+    const config = JSON.stringify({
+      transcoding: !!transcoding,
+      compatFallbackUrl,
+      subtitleCount: normalizedTracks.length,
+      subtitleTracks: normalizedTracks,
+    });
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${videoName}</title>
-    <link href="https://vjs.zencdn.net/8.6.1/video-js.css" rel="stylesheet" />
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: #000; display: flex; justify-content: center; align-items: center; min-height: 100vh; font-family: Arial, sans-serif; }
-        .container { width: 100%; max-width: 1280px; padding: 20px; }
-        .video-js { width: 100%; height: auto; background: #000; }
-        .video-info { margin-top: 10px; color: #fff; text-align: center; font-size: 14px; }
-        .subtitle-adjust-btn {
-            position: fixed; top: 20px; left: 20px; width: 48px; height: 48px;
-            background: rgba(0, 0, 0, 0.8); border: 2px solid #4CAF50; border-radius: 50%;
-            cursor: pointer; display: flex; align-items: center; justify-content: center;
-            font-size: 24px; color: #4CAF50; z-index: 10000; transition: all 0.3s ease;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-        }
-        .subtitle-adjust-btn:hover { background: rgba(76, 175, 80, 0.2); transform: scale(1.1); }
-        .subtitle-adjust-popup {
-            position: fixed; top: 80px; left: 20px; width: 400px; max-height: 600px;
-            background: rgba(0, 0, 0, 0.95); border: 2px solid #4CAF50; border-radius: 12px;
-            padding: 20px; z-index: 10001; display: none; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
-            color: #fff; font-family: 'Segoe UI', Arial, sans-serif;
-        }
-        .subtitle-adjust-popup.active { display: block; }
-        .subtitle-adjust-popup h3 {
-            margin: 0 0 15px 0; color: #4CAF50; font-size: 18px;
-            border-bottom: 1px solid rgba(76, 175, 80, 0.3); padding-bottom: 10px;
-        }
-        .subtitle-preview {
-            max-height: 200px; overflow-y: auto; background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(76, 175, 80, 0.3); border-radius: 6px; padding: 10px;
-            margin-bottom: 15px; font-size: 13px; line-height: 1.6;
-        }
-        .subtitle-item {
-            padding: 8px; margin-bottom: 5px; border-radius: 4px; cursor: pointer;
-            transition: background 0.2s;
-        }
-        .subtitle-item:hover { background: rgba(76, 175, 80, 0.2); }
-        .subtitle-item.active {
-            background: rgba(76, 175, 80, 0.4); border-left: 3px solid #4CAF50;
-        }
-        .subtitle-item .time {
-            color: #4CAF50; font-weight: bold; font-size: 11px; margin-bottom: 4px;
-        }
-        .subtitle-item .text { color: #fff; }
-        .adjust-controls {
-            display: flex; gap: 10px; margin-bottom: 15px;
-        }
-        .adjust-btn {
-            flex: 1; padding: 10px; background: rgba(76, 175, 80, 0.2);
-            border: 1px solid #4CAF50; border-radius: 6px; color: #4CAF50;
-            cursor: pointer; font-size: 14px; font-weight: bold; transition: all 0.2s;
-        }
-        .adjust-btn:hover { background: rgba(76, 175, 80, 0.4); transform: translateY(-2px); }
-        .offset-display {
-            text-align: center; padding: 10px; background: rgba(76, 175, 80, 0.1);
-            border-radius: 6px; margin-bottom: 15px;
-        }
-        .offset-display .value {
-            font-size: 20px; color: #4CAF50; font-weight: bold;
-        }
-        .close-btn {
-            position: absolute; top: 10px; right: 10px; width: 30px; height: 30px;
-            background: rgba(255, 255, 255, 0.1); border: 1px solid #4CAF50;
-            border-radius: 50%; color: #4CAF50; cursor: pointer; display: flex;
-            align-items: center; justify-content: center; font-size: 18px;
-        }
-        .close-btn:hover { background: rgba(255, 0, 0, 0.2); border-color: #f44336; color: #f44336; }
-        .video-error-overlay {
-            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92);
-            z-index: 20000; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box;
-        }
-        .video-error-overlay.visible { display: flex; }
-        .video-error-box {
-            max-width: 480px; background: #1a1a1a; border: 1px solid #f44336; border-radius: 12px;
-            padding: 24px; color: #fff; font-family: Arial, sans-serif;
-        }
-        .video-error-box h2 { color: #f44336; font-size: 1.1rem; margin: 0 0 12px 0; }
-        .video-error-box p { margin: 0 0 16px 0; line-height: 1.5; color: #ccc; }
-        .video-error-box ul { margin: 0 0 16px 0; padding-left: 20px; color: #aaa; font-size: 0.9rem; }
-        .video-error-box a { color: #4CAF50; }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${esc(videoName)}</title>
+  <link rel="stylesheet" href="/player.css">
 </head>
 <body>
-    <div id="videoErrorOverlay" class="video-error-overlay">
-        <div class="video-error-box">
-            <h2>Media could not be loaded</h2>
-            <p id="videoErrorDetail">The media could not be loaded, either because the server or network failed or because the format is not supported.</p>
-            <ul>
-                <li>If this is HEVC: transcoding may still be starting — wait 30s and refresh.</li>
-                <li>Try opening in <a href="${videoUrl}" target="_blank">VLC</a> or another player (File → Open Network).</li>
-                <li>Refresh the page and press play again.</li>
-                <li>Check that the stream is still running (terminal or web GUI).</li>
-            </ul>
-            <button type="button" id="videoErrorRetryBtn" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;">Retry</button>
-        </div>
-    </div>
-    <div class="subtitle-adjust-btn" id="subtitleAdjustBtn" title="Adjust Subtitle Timing">⏱️</div>
-    <div class="subtitle-adjust-popup" id="subtitleAdjustPopup">
-        <div class="close-btn" id="closePopupBtn">×</div>
-        <h3>⏱️ Subtitle Timing Adjustment</h3>
+  <div class="player-shell">
+    <div class="video-wrap">
+      <video id="videoPlayer" controls preload="metadata" playsinline>
+        <source src="${esc(videoUrl)}" ${htmlVideoType}>
+        ${trackTags}
+      </video>
+      <div id="subtitleOverlay" class="subtitle-overlay" aria-live="polite" aria-atomic="true"></div>
+      <button id="subtitleAdjustBtn" class="subtitle-adjust-btn" type="button" title="Adjust subtitle timing" ${normalizedTracks.length > 0 ? '' : 'hidden'}>
+        Sub Sync
+      </button>
+      <div id="subtitleAdjustPopup" class="subtitle-adjust-popup" hidden>
+        <button class="close-btn" id="closePopupBtn" type="button" aria-label="Close subtitle timing controls">x</button>
+        <h3>Subtitle Timing</h3>
+        <p class="sync-hint">Positive values delay subtitles. Negative values show them earlier.</p>
         <div class="offset-display">
-            <div class="value" id="offsetValue">+0.00s</div>
+          <div class="label">Offset</div>
+          <div class="value" id="offsetValue">+0.00s</div>
         </div>
         <div class="adjust-controls">
-            <button class="adjust-btn" id="subtract1Btn">-1.0s</button>
-            <button class="adjust-btn" id="subtract0_5Btn">-0.5s</button>
-            <button class="adjust-btn" id="add0_5Btn">+0.5s</button>
-            <button class="adjust-btn" id="add1Btn">+1.0s</button>
+          <button class="btn adjust-btn" id="subtract1Btn" type="button">-1.0s</button>
+          <button class="btn adjust-btn" id="subtract0_5Btn" type="button">-0.5s</button>
+          <button class="btn adjust-btn" id="add0_5Btn" type="button">+0.5s</button>
+          <button class="btn adjust-btn" id="add1Btn" type="button">+1.0s</button>
         </div>
         <div class="adjust-controls">
-            <button class="adjust-btn" id="subtract0_1Btn">-0.1s</button>
-            <button class="adjust-btn" id="resetBtn">Reset</button>
-            <button class="adjust-btn" id="add0_1Btn">+0.1s</button>
+          <button class="btn adjust-btn" id="subtract0_1Btn" type="button">-0.1s</button>
+          <button class="btn adjust-btn" id="resetBtn" type="button">Reset</button>
+          <button class="btn adjust-btn" id="add0_1Btn" type="button">+0.1s</button>
         </div>
         <div class="subtitle-preview" id="subtitlePreview">
-            <div style="text-align: center; color: #999; padding: 20px;">Load video to see subtitles</div>
+          <div class="subtitle-empty">Load video to inspect subtitle timing.</div>
         </div>
-    </div>
-    <div class="container">
-        <video id="videoPlayer" class="video-js vjs-default-skin vjs-big-play-centered" controls preload="metadata" data-setup='{}' crossorigin="anonymous" playsinline>
-            <source src="${videoUrl}" ${htmlVideoType}>
-${tracks}
-        </video>
-        <div class="video-info">
-            <p>${videoName}</p>
-            ${transcoding ? `<p id="transcodeStatus" style="color:#ffa726;font-size:12px;margin-top:4px;">🔄 Transcoding HEVC → H.264 in progress… player will start automatically.</p>` : ''}
+      </div>
+      <div id="errorOverlay" class="error-overlay">
+        <div class="error-card">
+          <h2>Playback issue</h2>
+          <p id="errorMessage">The media could not be played in the current format.</p>
+          <div class="actions">
+            <button class="btn" id="retryBtn" type="button">Retry</button>
+            <button class="btn" id="reloadBtn" type="button">Reload</button>
+          </div>
         </div>
+      </div>
     </div>
-    <script src="https://vjs.zencdn.net/8.6.1/video.min.js"></script>
-    <script>
-        // Subtitle metadata from server - tells us which subtitles need refresh monitoring
-        const subtitleMetadata = ${subtitleMetadata};
-        
-        const player = videojs('videoPlayer', {
-            fluid: true, responsive: true,
-            html5: { nativeTextTracks: true }
-        });
-
-        // Show on-page error when media could not be loaded (server/network/format)
-        player.on('error', () => {
-            const overlay = document.getElementById('videoErrorOverlay');
-            const detail = document.getElementById('videoErrorDetail');
-            const err = player.error();
-            const msg = err ? (err.message || 'The media could not be loaded, either because the server or network failed or because the format is not supported.') : 'The media could not be loaded, either because the server or network failed or because the format is not supported.';
-            if (detail) detail.textContent = msg;
-            if (overlay) overlay.classList.add('visible');
-        });
-        document.getElementById('videoErrorRetryBtn').addEventListener('click', () => {
-            document.getElementById('videoErrorOverlay').classList.remove('visible');
-            player.load();
-            player.play().catch(function() {});
-        });
-
-        // Auto-retry: if transcoding is in progress the file may not be ready yet.
-        // Poll the video URL until we get a non-error response, then reload.
-        let _autoRetryCount = 0;
-        player.on('error', () => {
-            if (_autoRetryCount < 12) { // up to ~60s of retries
-                _autoRetryCount++;
-                setTimeout(() => {
-                    fetch('/video.mp4', { method: 'HEAD' }).then((r) => {
-                        if (r.ok && parseInt(r.headers.get('content-length') || '0') > 1024 * 1024) {
-                            document.getElementById('videoErrorOverlay').classList.remove('visible');
-                            const ts = document.getElementById('transcodeStatus');
-                            if (ts) ts.textContent = '✅ Transcoding buffered — starting playback...';
-                            player.load();
-                            player.play().catch(function() {});
-                        }
-                    }).catch(function() {});
-                }, 5000);
-            }
-        });
-
-        let subtitleOffset = 0;
-        let allSubtitles = [];
-        let selectedSubtitleLanguage = null; // Track user's selected subtitle language
-        const adjustBtn = document.getElementById('subtitleAdjustBtn');
-        const popup = document.getElementById('subtitleAdjustPopup');
-        const closeBtn = document.getElementById('closePopupBtn');
-        const offsetValue = document.getElementById('offsetValue');
-        const subtitlePreview = document.getElementById('subtitlePreview');
-        
-        adjustBtn.addEventListener('click', () => {
-            popup.classList.toggle('active');
-            if (popup.classList.contains('active')) {
-                loadSubtitles();
-            } else {
-                // Free memory when popup closes (critical for preventing tab crashes)
-                allSubtitles = [];
-                subtitlePreview.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">Load video to see subtitles</div>';
-            }
-        });
-        closeBtn.addEventListener('click', () => {
-            popup.classList.remove('active');
-            // Free memory when popup closes (critical for preventing tab crashes)
-            allSubtitles = [];
-            subtitlePreview.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">Load video to see subtitles</div>';
-        });
-        
-        // Event delegation for subtitle items (prevents memory leaks)
-        subtitlePreview.addEventListener('click', (e) => {
-            const item = e.target.closest('.subtitle-item');
-            if (item) {
-                const index = parseInt(item.dataset.index);
-                if (!isNaN(index) && allSubtitles[index]) {
-                    const sub = allSubtitles[index];
-                    player.currentTime(sub.start + subtitleOffset);
-                }
-            }
-        });
-        
-        function loadSubtitles() {
-            allSubtitles = [];
-            const tracks = player.textTracks();
-            
-            if (!tracks || tracks.length === 0) {
-                renderSubtitlePreview();
-                return;
-            }
-            
-            const subtitleTracks = Array.from(tracks).filter(t => t.kind === 'subtitles');
-            
-            if (subtitleTracks.length === 0) {
-                renderSubtitlePreview();
-                return;
-            }
-            
-            // Prioritize user's selected language
-            let subtitleTrack = null;
-            if (selectedSubtitleLanguage) {
-                subtitleTrack = subtitleTracks.find(t => 
-                    (t.language === selectedSubtitleLanguage || t.label === selectedSubtitleLanguage) && 
-                    t.cues && t.cues.length > 0
-                );
-            }
-            
-            // Fallback to any track with cues or the showing track
-            if (!subtitleTrack) {
-                subtitleTrack = subtitleTracks.find(t => t.cues && t.cues.length > 0);
-            }
-            
-            if (!subtitleTrack) {
-                subtitleTrack = subtitleTracks.find(t => t.mode === 'showing') || subtitleTracks[0];
-                
-                if (subtitleTrack && (!subtitleTrack.cues || subtitleTrack.cues.length === 0)) {
-                    // Track exists but cues aren't loaded, wait for them
-                    const waitForCues = (attempts = 0) => {
-                        if (subtitleTrack.cues && subtitleTrack.cues.length > 0) {
-                            // Memory optimization: limit cues for TV shows (reduced to prevent tab crashes)
-                            const maxCuesToLoad = 2000;
-                            const cuesToLoad = Math.min(subtitleTrack.cues.length, maxCuesToLoad);
-                            for (let i = 0; i < cuesToLoad; i++) {
-                                const cue = subtitleTrack.cues[i];
-                                allSubtitles.push({
-                                    start: cue.startTime,
-                                    end: cue.endTime,
-                                    text: cue.text
-                                });
-                            }
-                            renderSubtitlePreview();
-                        } else if (attempts < 20) {
-                            setTimeout(() => waitForCues(attempts + 1), 500);
-                        } else {
-                            renderSubtitlePreview();
-                        }
-                    };
-                    
-                    subtitleTrack.addEventListener('load', () => {
-                        if (subtitleTrack.cues && subtitleTrack.cues.length > 0) {
-                            // Memory optimization: limit cues for TV shows (reduced to prevent tab crashes)
-                            const maxCuesToLoad = 2000;
-                            const cuesToLoad = Math.min(subtitleTrack.cues.length, maxCuesToLoad);
-                            for (let i = 0; i < cuesToLoad; i++) {
-                                const cue = subtitleTrack.cues[i];
-                                allSubtitles.push({
-                                    start: cue.startTime,
-                                    end: cue.endTime,
-                                    text: cue.text
-                                });
-                            }
-                            renderSubtitlePreview();
-                        }
-                    });
-                    
-                    subtitleTrack.addEventListener('loadeddata', () => {
-                        if (subtitleTrack.cues && subtitleTrack.cues.length > 0) {
-                            // Memory optimization: limit cues for TV shows (reduced to prevent tab crashes)
-                            const maxCuesToLoad = 2000;
-                            const cuesToLoad = Math.min(subtitleTrack.cues.length, maxCuesToLoad);
-                            for (let i = 0; i < cuesToLoad; i++) {
-                                const cue = subtitleTrack.cues[i];
-                                allSubtitles.push({
-                                    start: cue.startTime,
-                                    end: cue.endTime,
-                                    text: cue.text
-                                });
-                            }
-                            renderSubtitlePreview();
-                        }
-                    });
-                    
-                    waitForCues();
-                    return;
-                }
-            }
-            
-            if (subtitleTrack && subtitleTrack.cues && subtitleTrack.cues.length > 0) {
-                // Memory optimization: For large subtitle files (TV shows), limit initial load
-                const maxCuesToLoad = 2000; // Reduced limit to prevent tab crashes
-                const totalCues = subtitleTrack.cues.length;
-                const cuesToLoad = Math.min(totalCues, maxCuesToLoad);
-                
-                for (let i = 0; i < cuesToLoad; i++) {
-                    const cue = subtitleTrack.cues[i];
-                    allSubtitles.push({
-                        start: cue.startTime,
-                        end: cue.endTime,
-                        text: cue.text
-                    });
-                }
-                
-                if (totalCues > maxCuesToLoad) {
-                    console.log('Loaded ' + cuesToLoad + ' of ' + totalCues + ' subtitles for better performance');
-                }
-            }
-            
-            renderSubtitlePreview();
-        }
-        
-        function renderSubtitlePreview() {
-            if (allSubtitles.length === 0) {
-                subtitlePreview.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">No subtitles available</div>';
-                return;
-            }
-            const currentTime = player.currentTime();
-            const timeWindow = 120; // Show subtitles within ±2 minutes (120 seconds) to prevent tab crashes
-            let html = '';
-            let activeIndex = -1;
-            
-            // Find active subtitle first
-            for (let i = 0; i < allSubtitles.length; i++) {
-                const sub = allSubtitles[i];
-                const adjustedStart = sub.start + subtitleOffset;
-                const adjustedEnd = sub.end + subtitleOffset;
-                if (currentTime >= adjustedStart && currentTime <= adjustedEnd) {
-                    activeIndex = i;
-                    break;
-                }
-            }
-            
-            // Only render subtitles within time window to reduce memory usage
-            allSubtitles.forEach((sub, index) => {
-                const adjustedStart = sub.start + subtitleOffset;
-                const adjustedEnd = sub.end + subtitleOffset;
-                
-                // Skip subtitles outside the time window (memory optimization for TV shows)
-                if (Math.abs(adjustedStart - currentTime) > timeWindow) {
-                    return;
-                }
-                
-                const isActive = index === activeIndex;
-                const timeStr = formatTime(adjustedStart) + ' → ' + formatTime(adjustedEnd);
-                html += '<div class="subtitle-item ' + (isActive ? 'active' : '') + '" data-index="' + index + '">';
-                html += '<div class="time">' + timeStr + '</div>';
-                html += '<div class="text">' + sub.text.replace(/\\n/g, '<br>') + '</div>';
-                html += '</div>';
-            });
-            
-            if (html === '') {
-                html = '<div style="text-align: center; color: #999; padding: 20px;">No subtitles in current time range</div>';
-            }
-            
-            subtitlePreview.innerHTML = html;
-            if (activeIndex >= 0) {
-                const activeItem = subtitlePreview.querySelector('.subtitle-item[data-index="' + activeIndex + '"]');
-                if (activeItem) {
-                    activeItem.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }
-            }
-            // Use event delegation to avoid memory leaks from repeated event listener attachment
-            // This was a major cause of tab crashes
-        }
-        
-        function formatTime(seconds) {
-            const h = Math.floor(seconds / 3600);
-            const m = Math.floor((seconds % 3600) / 60);
-            const s = Math.floor(seconds % 60);
-            const ms = Math.floor((seconds % 1) * 1000);
-            if (h > 0) {
-                return h + ':' + m.toString().padStart(2, '0') + ':' + s.toString().padStart(2, '0') + '.' + ms.toString().padStart(3, '0');
-            }
-            return m + ':' + s.toString().padStart(2, '0') + '.' + ms.toString().padStart(3, '0');
-        }
-        
-        function updateOffsetDisplay() {
-            const sign = subtitleOffset >= 0 ? '+' : '';
-            offsetValue.textContent = sign + subtitleOffset.toFixed(2) + 's';
-            renderSubtitlePreview();
-        }
-        
-        function adjustOffset(seconds) {
-            subtitleOffset += seconds;
-            updateOffsetDisplay();
-        }
-        
-        document.getElementById('subtract1Btn').addEventListener('click', () => adjustOffset(-1.0));
-        document.getElementById('subtract0_5Btn').addEventListener('click', () => adjustOffset(-0.5));
-        document.getElementById('add0_5Btn').addEventListener('click', () => adjustOffset(0.5));
-        document.getElementById('add1Btn').addEventListener('click', () => adjustOffset(1.0));
-        document.getElementById('subtract0_1Btn').addEventListener('click', () => adjustOffset(-0.1));
-        document.getElementById('add0_1Btn').addEventListener('click', () => adjustOffset(0.1));
-        document.getElementById('resetBtn').addEventListener('click', () => {
-            subtitleOffset = 0;
-            updateOffsetDisplay();
-        });
-        
-        // Throttle timeupdate to reduce memory/CPU usage (was causing tab crashes)
-        let lastUpdateTime = 0;
-        player.on('timeupdate', () => {
-            if (popup.classList.contains('active')) {
-                const now = Date.now();
-                // Only update every 500ms instead of every frame (major performance improvement)
-                if (now - lastUpdateTime > 500) {
-                    lastUpdateTime = now;
-                    renderSubtitlePreview();
-                }
-            }
-        });
-        
-        function getTrackElement(track) {
-            const videoElement = document.getElementById('videoPlayer');
-            if (!videoElement) {
-                return null;
-            }
-
-            const trackElements = videoElement.querySelectorAll('track');
-            for (const trackElement of trackElements) {
-                if (trackElement.track === track) {
-                    return trackElement;
-                }
-            }
-            return null;
-        }
-
-        function getTrackSource(track, trackIndex) {
-            const trackElement = getTrackElement(track);
-            if (trackElement && trackElement.dataset && trackElement.dataset.source) {
-                return trackElement.dataset.source;
-            }
-
-            const byIndex = subtitleMetadata.find(m => m.index === trackIndex);
-            if (byIndex && byIndex.source) {
-                return byIndex.source;
-            }
-
-            const byLabelOrLanguage = subtitleMetadata.find(m =>
-                (m.label && track.label && m.label === track.label) ||
-                (m.language && track.language && m.language === track.language)
-            );
-            return byLabelOrLanguage ? byLabelOrLanguage.source : 'unknown';
-        }
-
-        function ensureSubtitleVisible() {
-            const tracks = player.textTracks();
-            if (!tracks) {
-                return;
-            }
-
-            const subtitleTracks = Array.from(tracks).filter(t => t.kind === 'subtitles');
-            if (subtitleTracks.length === 0) {
-                return;
-            }
-
-            const hasShowingTrack = subtitleTracks.some(t => t.mode === 'showing');
-            if (hasShowingTrack) {
-                return;
-            }
-
-            const preferredTrack = subtitleTracks.find(t => t.cues && t.cues.length > 0) || subtitleTracks[0];
-            if (preferredTrack) {
-                preferredTrack.mode = 'showing';
-            }
-        }
-
-        // Set up automatic subtitle detection - listens for cues as they load
-        function setupAutoSubtitleDetection() {
-            const tracks = player.textTracks();
-            if (tracks) {
-                const monitoredTracks = new Set();
-                
-                const monitorTracks = () => {
-                    Array.from(tracks).forEach((track, trackIndex) => {
-                        if (track.kind === 'subtitles' && !monitoredTracks.has(track)) {
-                            const trackSource = getTrackSource(track, trackIndex);
-                            const isEmbedded = trackSource === 'embedded';
-                            
-                            // Only monitor embedded subtitles - external/downloaded ones are already complete
-                            if (!isEmbedded) {
-                                console.log('Skipping refresh monitoring for', track.label, '(source:', trackSource + ')');
-                                return;
-                            }
-                            
-                            console.log('Setting up refresh monitoring for embedded subtitle:', track.label);
-                            monitoredTracks.add(track);
-                            
-                            track.addEventListener('load', function() {
-                                const cueCount = track.cues ? track.cues.length : 0;
-                                console.log('Subtitle track loaded:', track.label, 'cues:', cueCount);
-                                ensureSubtitleVisible();
-                                if (popup && popup.classList.contains('active')) {
-                                    loadSubtitles();
-                                }
-                            });
-                            
-                            track.addEventListener('loadeddata', function() {
-                                const cueCount = track.cues ? track.cues.length : 0;
-                                console.log('Subtitle track data loaded:', track.label, 'cues:', cueCount);
-                                ensureSubtitleVisible();
-                                if (popup && popup.classList.contains('active')) {
-                                    loadSubtitles();
-                                }
-                            });
-                            
-                            // Periodically reload track to pick up new cues as file is being written
-                            let trackElement = getTrackElement(track);
-                            
-                            let lastCueCount = 0;
-                            let lastFileSize = 0;
-                            let noChangeCount = 0;
-                            let checkCount = 0;
-                            let isComplete = false; // Track if subtitle extraction is complete
-                            const maxChecks = 30; // Stop after 30 checks (1 minute) to prevent memory leaks
-                            
-                            const reloadInterval = setInterval(() => {
-                                checkCount++;
-                                
-                                // Stop checking after max attempts to prevent memory leaks (critical fix for tab crashes)
-                                if (checkCount > maxChecks) {
-                                    clearInterval(reloadInterval);
-                                    isComplete = true;
-                                    console.log('Stopped subtitle polling after ' + maxChecks + ' checks to conserve memory');
-                                    return;
-                                }
-                                
-                                // Skip all checks if extraction is complete
-                                if (isComplete) {
-                                    return;
-                                }
-                                
-                                const currentCueCount = track.cues ? track.cues.length : 0;
-                                
-                                // Check if file has changed by fetching its size
-                                if (trackElement && trackElement.src) {
-                                    const originalSrc = trackElement.src.split('?')[0];
-                                    
-                                    fetch(originalSrc, { method: 'HEAD' })
-                                        .then(response => {
-                                            if (response.ok) {
-                                                const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
-                                                
-                                                // Only reload if file size actually changed (new subtitles extracted)
-                                                if (contentLength > lastFileSize && lastFileSize > 0) {
-                                                    console.log('File updated: ' + contentLength + ' bytes (was ' + lastFileSize + ')');
-                                                    lastFileSize = contentLength;
-                                                    noChangeCount = 0;
-                                                    
-                                                    // Save current track mode and selected language
-                                                    const currentMode = track.mode;
-                                                    const wasShowing = currentMode === 'showing';
-                                                    
-                                                    const newSrc = originalSrc + '?t=' + Date.now();
-                                                    if (trackElement.parentNode) {
-                                                        const parent = trackElement.parentNode;
-                                                        const newTrack = trackElement.cloneNode(false);
-                                                        newTrack.src = newSrc;
-                                                        newTrack.dataset.source = 'embedded';
-                                                        
-                                                        // DON'T set default - let restoration handle it
-                                                        // This prevents browser from auto-selecting wrong language
-                                                        
-                                                        parent.removeChild(trackElement);
-                                                        parent.appendChild(newTrack);
-                                                        trackElement = newTrack;
-                                                        
-                                                        // Restore the user's selected subtitle language after track loads
-                                                        const restoreTrack = () => {
-                                                            if (newTrack.track) {
-                                                                // Restore user's selection or keep showing if it was showing
-                                                                if (selectedSubtitleLanguage) {
-                                                                    console.log('Restoring after reload...');
-                                                                    restoreSubtitleSelection();
-                                                                } else if (wasShowing) {
-                                                                    // If no specific language selected, just keep this track showing
-                                                                    newTrack.track.mode = 'showing';
-                                                                }
-                                                                ensureSubtitleVisible();
-                                                            }
-                                                        };
-                                                        
-                                                        newTrack.addEventListener('load', function() {
-                                                            // Wait a bit for track to be fully ready
-                                                            setTimeout(restoreTrack, 150);
-                                                        }, { once: true });
-                                                        
-                                                        // Also try to restore after a delay in case 'load' event doesn't fire
-                                                        setTimeout(restoreTrack, 300);
-                                                    }
-                                                } else if (lastFileSize === 0) {
-                                                    // First check - just record the size
-                                                    lastFileSize = contentLength;
-                                                } else {
-                                                    // Size hasn't changed
-                                                    noChangeCount++;
-                                                    
-                                                    if (noChangeCount >= 3) {
-                                                        clearInterval(reloadInterval);
-                                                        isComplete = true; // Mark as complete to prevent any further checks
-                                                        console.log('File extraction complete - stopped reloading (no more updates needed)');
-                                                        // Don't do any final reload - subtitles are already loaded and complete
-                                                        // This prevents unnecessary refreshing when extraction is done
-                                                    }
-                                                }
-                                            }
-                                        })
-                                        .catch(() => {});
-                                }
-                                
-                                if (currentCueCount > lastCueCount) {
-                                    console.log('New cues detected: ' + currentCueCount + ' (was ' + lastCueCount + ')');
-                                    lastCueCount = currentCueCount;
-                                    ensureSubtitleVisible();
-                                    if (popup && popup.classList.contains('active')) {
-                                        loadSubtitles();
-                                    }
-                                }
-                            }, 2000);
-                        }
-                    });
-                };
-                
-                monitorTracks();
-
-                if (typeof tracks.addEventListener === 'function') {
-                    tracks.addEventListener('addtrack', function(event) {
-                        if (event.track.kind === 'subtitles') {
-                            monitorTracks();
-                            ensureSubtitleVisible();
-                            if (popup && popup.classList.contains('active')) {
-                                loadSubtitles();
-                            }
-                        }
-                    });
-                } else {
-                    tracks.onaddtrack = function(event) {
-                        if (event.track.kind === 'subtitles') {
-                            monitorTracks();
-                            ensureSubtitleVisible();
-                            if (popup && popup.classList.contains('active')) {
-                                loadSubtitles();
-                            }
-                        }
-                    };
-                }
-            }
-        }
-        
-        // Track user's subtitle language selection
-        function trackSubtitleSelection() {
-            const tracks = player.textTracks();
-            if (tracks) {
-                // Listen for track changes to remember user's selection
-                tracks.addEventListener('change', function() {
-                    Array.from(tracks).forEach(track => {
-                        if (track.kind === 'subtitles' && track.mode === 'showing') {
-                            selectedSubtitleLanguage = track.language || track.label;
-                            console.log('User selected subtitle language:', selectedSubtitleLanguage);
-                        }
-                    });
-                });
-            }
-        }
-        
-        // Restore user's selected subtitle language
-        function restoreSubtitleSelection() {
-            if (!selectedSubtitleLanguage) {
-                console.log('No subtitle language to restore');
-                return;
-            }
-            
-            const tracks = player.textTracks();
-            if (!tracks) {
-                console.log('No tracks available to restore');
-                return;
-            }
-            
-            console.log('Attempting to restore subtitle language:', selectedSubtitleLanguage);
-            
-            // First, hide ALL subtitle tracks to prevent conflicts
-            Array.from(tracks).forEach(track => {
-                if (track.kind === 'subtitles') {
-                    track.mode = 'disabled';
-                }
-            });
-            
-            // Then find and activate ONLY the previously selected language
-            let restored = false;
-            Array.from(tracks).forEach(track => {
-                if (track.kind === 'subtitles') {
-                    const trackLang = track.language || track.label;
-                    console.log('Checking track:', trackLang, 'against selected:', selectedSubtitleLanguage);
-                    
-                    if (trackLang === selectedSubtitleLanguage) {
-                        track.mode = 'showing';
-                        restored = true;
-                        console.log('✓ Restored subtitle language:', selectedSubtitleLanguage);
-                    }
-                }
-            });
-            
-            if (!restored) {
-                console.log('⚠ Could not find track with language:', selectedSubtitleLanguage);
-                // Try partial match as fallback
-                Array.from(tracks).forEach(track => {
-                    if (track.kind === 'subtitles' && !restored) {
-                        const trackLang = track.language || track.label;
-                        if (trackLang && selectedSubtitleLanguage && 
-                            (trackLang.includes(selectedSubtitleLanguage) || selectedSubtitleLanguage.includes(trackLang))) {
-                            track.mode = 'showing';
-                            restored = true;
-                            console.log('✓ Restored subtitle language (partial match):', trackLang);
-                        }
-                    }
-                });
-            }
-        }
-        
-        player.ready(() => {
-            setupAutoSubtitleDetection();
-            trackSubtitleSelection();
-            ensureSubtitleVisible();
-            setTimeout(ensureSubtitleVisible, 400);
-            // Don't auto-load subtitles to save memory - only load when user opens popup
-            // This prevents tab crashes on TV shows with large subtitle files
-        });
-        
-        player.on('loadedmetadata', () => {
-            // Subtitles will load on-demand when popup is opened
-            restoreSubtitleSelection();
-            ensureSubtitleVisible();
-        });
-    </script>
+    <div class="toolbar">
+      <div class="meta">
+        <h1>${esc(videoName)}</h1>
+        <p id="statusText">${transcoding ? 'Transcoding in progress...' : 'Loading stream...'}</p>
+      </div>
+      <div class="controls">
+        <select id="subtitleSelect" class="select">
+          <option value="-1">Subtitles: Off</option>
+        </select>
+      </div>
+    </div>
+  </div>
+  <script>window.__UPLAYER_PLAYER_CONFIG__ = ${config};</script>
+  <script src="/player.js"></script>
 </body>
 </html>`;
   }
-
-  getLightweightHTMLPlayer(videoUrl, htmlVideoType, videoName, transcoding = false) {
-    // Ultra-lightweight player with ZERO subtitle functionality
-    // This eliminates ALL memory overhead from subtitle processing
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${videoName}</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            background: #000; 
-            display: flex; 
-            justify-content: center; 
-            align-items: center; 
-            min-height: 100vh; 
-            font-family: Arial, sans-serif; 
-        }
-        .container { 
-            width: 100%; 
-            max-width: 1280px; 
-            padding: 20px; 
-        }
-        video { 
-            width: 100%; 
-            height: auto; 
-            background: #000; 
-            outline: none;
-        }
-        .video-info { 
-            margin-top: 10px; 
-            color: #fff; 
-            text-align: center; 
-            font-size: 14px; 
-        }
-        .lightweight-badge {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            background: rgba(76, 175, 80, 0.9);
-            color: #fff;
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: bold;
-            z-index: 1000;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-        }
-        .memory-stats {
-            position: fixed;
-            top: 60px;
-            right: 20px;
-            background: rgba(0, 0, 0, 0.8);
-            color: #4CAF50;
-            padding: 10px;
-            border-radius: 8px;
-            font-size: 11px;
-            font-family: monospace;
-            z-index: 1000;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
-            display: none;
-        }
-        .memory-stats.visible {
-            display: block;
-        }
-        .memory-warning {
-            color: #ff9800;
-        }
-        .memory-critical {
-            color: #f44336;
-            font-weight: bold;
-        }
-        .video-error-overlay {
-            display: none;
-            position: fixed;
-            inset: 0;
-            background: rgba(0,0,0,0.92);
-            z-index: 2000;
-            align-items: center;
-            justify-content: center;
-            padding: 24px;
-            box-sizing: border-box;
-        }
-        .video-error-overlay.visible {
-            display: flex;
-        }
-        .video-error-box {
-            max-width: 480px;
-            background: #1a1a1a;
-            border: 1px solid #f44336;
-            border-radius: 12px;
-            padding: 24px;
-            color: #fff;
-            font-family: Arial, sans-serif;
-        }
-        .video-error-box h2 {
-            color: #f44336;
-            font-size: 1.1rem;
-            margin: 0 0 12px 0;
-        }
-        .video-error-box p {
-            margin: 0 0 16px 0;
-            line-height: 1.5;
-            color: #ccc;
-        }
-        .video-error-box ul {
-            margin: 0 0 16px 0;
-            padding-left: 20px;
-            color: #aaa;
-            font-size: 0.9rem;
-        }
-        .video-error-box a {
-            color: #4CAF50;
-        }
-    </style>
-</head>
-<body>
-    <div id="videoErrorOverlay" class="video-error-overlay">
-        <div class="video-error-box">
-            <h2>Media could not be loaded</h2>
-            <p id="videoErrorDetail">The media could not be loaded, either because the server or network failed or because the format is not supported.</p>
-            <ul>
-                <li>If this is HEVC: transcoding may still be starting — wait 30s and refresh.</li>
-                <li>Try opening in <a href="${videoUrl}" target="_blank">VLC</a> or another player (File → Open Network).</li>
-                <li>Refresh the page and press play again.</li>
-                <li>Check that the stream is still running (terminal or web GUI).</li>
-            </ul>
-            <button type="button" onclick="document.getElementById('videoErrorOverlay').classList.remove('visible'); document.getElementById('videoPlayer').load();" style="padding:8px 16px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;">Retry</button>
-        </div>
-    </div>
-    <div class="lightweight-badge">⚡ Lightweight Mode - No Subtitles</div>
-    <div class="memory-stats" id="memoryStats">
-        <div>Memory: <span id="memUsed">--</span> MB</div>
-        <div>Status: <span id="memStatus">OK</span></div>
-    </div>
-    <div class="container">
-        <video id="videoPlayer" controls preload="none" playsinline>
-            <source src="${videoUrl}" ${htmlVideoType}>
-            Your browser does not support the video tag.
-        </video>
-        <div class="video-info">
-            <p>${videoName}</p>
-            <p style="color: #4CAF50; font-size: 12px; margin-top: 5px;">
-                🚀 Lightweight player for maximum performance
-            </p>
-            ${transcoding ? `<p id="transcodeStatus" style="color:#ffa726;font-size:12px;margin-top:4px;">🔄 Transcoding HEVC → H.264 in progress… player will start automatically.</p>` : ''}
-        </div>
-    </div>
-    <script>
-        // Minimal JavaScript - no subtitle processing, no memory overhead
-        const video = document.getElementById('videoPlayer');
-        const memoryStats = document.getElementById('memoryStats');
-        const memUsed = document.getElementById('memUsed');
-        const memStatus = document.getElementById('memStatus');
-        
-        // ENHANCED: Browser-side memory tracking with auto-cleanup
-        let memoryCheckCount = 0;
-        let lastCleanupTime = Date.now();
-        const CLEANUP_INTERVAL = 60000; // Cleanup every 60 seconds if needed
-        
-        function trackMemory() {
-            if (performance.memory) {
-                memoryStats.classList.add('visible');
-                
-                setInterval(() => {
-                    memoryCheckCount++;
-                    const used = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024);
-                    const limit = Math.round(performance.memory.jsHeapSizeLimit / 1024 / 1024);
-                    const percent = (used / limit) * 100;
-                    
-                    memUsed.textContent = used;
-                    
-                    // CRITICAL: Auto-cleanup when memory is high
-                    if (percent > 80) {
-                        memStatus.textContent = 'CRITICAL';
-                        memStatus.className = 'memory-critical';
-                        console.error('⚠️ CRITICAL: Memory usage at ' + percent.toFixed(1) + '%');
-                        console.error('💡 Triggering emergency cleanup...');
-                        
-                        // Emergency cleanup: clear video buffer
-                        if (video && !video.paused) {
-                            const currentTime = video.currentTime;
-                            // Force browser to release buffered data
-                            video.load();
-                            video.currentTime = currentTime;
-                            video.play().catch(e => console.log('Playback resume failed:', e));
-                        }
-                        
-                        // Clear any cached data
-                        if (window.caches) {
-                            caches.keys().then(names => {
-                                names.forEach(name => caches.delete(name));
-                            });
-                        }
-                    } else if (percent > 60) {
-                        memStatus.textContent = 'WARNING';
-                        memStatus.className = 'memory-warning';
-                        console.warn('⚠️ Memory usage high: ' + percent.toFixed(1) + '%');
-                        
-                        // Preventive cleanup every minute when in warning zone
-                        const now = Date.now();
-                        if (now - lastCleanupTime > CLEANUP_INTERVAL) {
-                            console.log('🧹 Running preventive cleanup...');
-                            lastCleanupTime = now;
-                            
-                            // Reduce video buffer
-                            if (video && video.buffered.length > 0) {
-                                const currentTime = video.currentTime;
-                                const bufferedEnd = video.buffered.end(video.buffered.length - 1);
-                                
-                                // If buffered more than 30 seconds ahead, trigger cleanup
-                                if (bufferedEnd - currentTime > 30) {
-                                    console.log('🧹 Clearing excess buffer (' + (bufferedEnd - currentTime).toFixed(1) + 's ahead)');
-                                    video.load();
-                                    video.currentTime = currentTime;
-                                    if (!video.paused) {
-                                        video.play().catch(e => console.log('Playback resume failed:', e));
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        memStatus.textContent = 'OK';
-                        memStatus.className = '';
-                    }
-                    
-                    // Log memory stats every 30 checks (~60 seconds)
-                    if (memoryCheckCount % 30 === 0) {
-                        console.log('📊 Memory: ' + used + 'MB / ' + limit + 'MB (' + percent.toFixed(1) + '%)');
-                        if (video && video.buffered.length > 0) {
-                            const bufferedSeconds = video.buffered.end(video.buffered.length - 1) - video.currentTime;
-                            console.log('📦 Buffer: ' + bufferedSeconds.toFixed(1) + 's ahead');
-                        }
-                    }
-                }, 2000); // Check every 2 seconds
-            } else {
-                console.log('Memory tracking not available in this browser');
-            }
-        }
-        
-        // Start memory tracking
-        trackMemory();
-        
-        // Show on-page error when media could not be loaded (server/network/format)
-        let _autoRetryCount = 0;
-        video.addEventListener('error', (e) => {
-            const overlay = document.getElementById('videoErrorOverlay');
-            const detail = document.getElementById('videoErrorDetail');
-            const msg = video.error ? (video.error.message || 'The media could not be loaded, either because the server or network failed or because the format is not supported.') : 'The media could not be loaded, either because the server or network failed or because the format is not supported.';
-            if (detail) detail.textContent = msg;
-            console.error('Video error:', video.error ? video.error.code + ' ' + video.error.message : e);
-
-            // Auto-retry while transcoding is still building the temp file (up to ~60s)
-            if (_autoRetryCount < 12) {
-                _autoRetryCount++;
-                setTimeout(() => {
-                    fetch(video.currentSrc || video.src || '${videoUrl}', { method: 'HEAD' }).then((r) => {
-                        if (r.ok && parseInt(r.headers.get('content-length') || '0') > 1024 * 1024) {
-                            if (overlay) overlay.classList.remove('visible');
-                            const ts = document.getElementById('transcodeStatus');
-                            if (ts) ts.textContent = '✅ Transcoding buffered — starting playback...';
-                            video.load();
-                            video.play().catch(function() {});
-                        }
-                    }).catch(function() {});
-                }, 5000);
-            } else {
-                if (overlay) overlay.classList.add('visible');
-            }
-        });
-        
-        // ENHANCED: Configure video for optimal memory usage
-        video.addEventListener('loadedmetadata', () => {
-            console.log('✅ Video loaded successfully');
-            
-            // Set preload to 'auto' but browser will respect memory constraints
-            video.preload = 'auto';
-            
-            if (performance.memory) {
-                const used = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024);
-                console.log('📊 Memory usage: ' + used + ' MB');
-            }
-            
-            console.log('🎬 Video duration: ' + (video.duration / 60).toFixed(1) + ' minutes');
-        });
-        
-        // ENHANCED: Monitor buffer levels and prevent excessive buffering
-        video.addEventListener('progress', () => {
-            if (video.buffered.length > 0) {
-                const bufferedEnd = video.buffered.end(video.buffered.length - 1);
-                const bufferedSeconds = bufferedEnd - video.currentTime;
-                
-                // If buffered more than 60 seconds ahead, pause buffering temporarily
-                // This prevents excessive memory usage from over-buffering
-                if (bufferedSeconds > 60 && performance.memory) {
-                    const percent = (performance.memory.usedJSHeapSize / performance.memory.jsHeapSizeLimit) * 100;
-                    if (percent > 50) {
-                        console.log('⚠️ Excessive buffering detected (' + bufferedSeconds.toFixed(1) + 's), memory at ' + percent.toFixed(1) + '%');
-                    }
-                }
-            }
-        });
-        
-        // Log playback events
-        video.addEventListener('play', () => {
-            console.log('▶️ Playback started');
-        });
-        
-        video.addEventListener('pause', () => {
-            console.log('⏸️ Playback paused');
-        });
-        
-        // Warning before page close
-        window.addEventListener('beforeunload', (e) => {
-            if (!video.paused) {
-                e.preventDefault();
-                e.returnValue = '';
-            }
-        });
-        
-        // Log memory on visibility change (tab switch)
-        document.addEventListener('visibilitychange', () => {
-            if (!document.hidden && performance.memory) {
-                const used = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024);
-                console.log('📊 Memory on tab focus: ' + used + ' MB');
-            }
-        });
-        
-        // That's it! Minimal code = minimal memory issues
-    </script>
-</body>
-</html>`;
+  getHTMLPlayer(videoUrl, htmlVideoType, videoName, transcoding = false) {
+    return this.getNativePlayerHTML(videoUrl, htmlVideoType, videoName, transcoding);
   }
 
   stop() {
@@ -3992,11 +3025,20 @@ ${tracks}
     }
   }
 
-  destroy() {
+  async destroy() {
     // Stop periodic cleanup
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
+    }
+
+    if (this._cancelPendingStream) {
+      try {
+        this._cancelPendingStream();
+      } catch (e) {
+        // Ignore pending setup cancellation failures during teardown
+      }
+      this._cancelPendingStream = null;
     }
     
     // Clean up all active streams
@@ -4007,13 +3049,43 @@ ${tracks}
     });
     this.activeStreams.clear();
     
-    this.stop();
-    this.client.destroy();
+    if (this.server) {
+      try {
+        await new Promise((resolve) => this.server.close(() => resolve()));
+      } catch (e) {
+        // Ignore close failures during teardown
+      }
+      this.server = null;
+    }
+
+    if (this.currentTorrent && this.client) {
+      try {
+        this.client.remove(this.currentTorrent);
+      } catch (e) {
+        // Ignore torrent removal failures during teardown
+      }
+      this.currentTorrent = null;
+    }
+
+    if (this.client) {
+      try {
+        await new Promise((resolve) => this.client.destroy(() => resolve()));
+      } catch (e) {
+        // Ignore client destroy failures during teardown
+      }
+      this.client = null;
+    }
     
     // SECURITY: Clean up sandbox
     if (this.sandbox) {
-      this.sandbox.cleanup();
+      try {
+        this.sandbox.cleanup();
+      } catch (e) {
+        // Ignore sandbox cleanup failures during teardown
+      }
     }
+
+    this.emit('exit', { code: 0 });
   }
 }
 
@@ -4040,7 +3112,56 @@ async function main() {
           count++;
         } catch (e) { /* ignore */ }
       }
-      console.log(chalk.green(`✅ Cleaned ${count} temp/cache location(s). Restart UPlayer and try again.`));
+      console.log(chalk.green(`? Cleaned ${count} temp/cache location(s). Restart UPlayer and try again.`));
+    });
+
+  program
+    .command('web')
+    .description('Start the Uplayer web interface')
+    .option('-p, --port <port>', 'Port to run the web interface on')
+    .action(async (options) => {
+      const requestedPort = options.port ? Number(options.port) : Number(process.env.PORT || 3000);
+      const port = Number.isFinite(requestedPort) && requestedPort > 0 ? requestedPort : 3000;
+      const { startServer, stopServer, getServerUrl } = require('./server');
+
+      let server;
+      try {
+        server = startServer(port);
+        await waitForServerReady(server);
+      } catch (error) {
+        if (error && error.code === 'EADDRINUSE') {
+          const alreadyRunning = await probeExistingWebServer(port);
+          if (alreadyRunning) {
+            const existingUrl = buildAccessibleUrls(port).preferred;
+            console.log(chalk.yellow(`Uplayer web is already running at ${existingUrl}`));
+            await open(existingUrl, { newInstance: true, wait: false }).catch(() => {});
+            return;
+          }
+        }
+        throw error;
+      }
+
+      const webUrl = typeof getServerUrl === 'function' ? getServerUrl() : buildAccessibleUrls(port).preferred;
+      console.log(chalk.green(`Web interface ready at ${webUrl}`));
+      await open(webUrl, { newInstance: true, wait: false }).catch(() => {});
+
+      let shuttingDown = false;
+      const shutdown = async (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        if (signal) {
+          console.log(chalk.yellow(`\nStopping web server (${signal})...`));
+        }
+        try {
+          await stopServer();
+        } catch (err) {
+          // Ignore shutdown errors and exit cleanly.
+        }
+        process.exit(0);
+      };
+
+      process.on('SIGINT', () => { shutdown('SIGINT'); });
+      process.on('SIGTERM', () => { shutdown('SIGTERM'); });
     });
 
   program
@@ -4048,32 +3169,53 @@ async function main() {
     .option('-m, --magnet <link>', 'Direct magnet link to stream')
     .option('-t, --torrent <file>', 'Torrent file path')
     .option('--no-open', 'Do not auto-open player')
-    .option('--no-subtitles', 'Disable all subtitle features (reduces memory usage, prevents tab crashes)')
-    .option('--low-memory', 'Ultra low-memory mode (limits connections, reduces buffer, minimal UI, periodic cleanup)')
+    .option('--no-subtitles', 'Deprecated no-op (single runtime mode always handles subtitles automatically)')
+    .option('--low-memory', 'Deprecated no-op (single runtime mode always uses the default setup)')
     .option('--debug-memory', 'Enable detailed memory tracking and diagnostics (helps identify crash causes)')
     .option('--expose-gc', 'Enable garbage collection (run with: node --expose-gc stream.js)')
     .action(async (query, options) => {
-      const lowMemoryMode = options.lowMemory === true;
       const debugMemory = options.debugMemory === true;
+      const deprecatedFlags = [];
+      if (options.lowMemory === true) deprecatedFlags.push('--low-memory');
+      if (options.subtitles === false) deprecatedFlags.push('--no-subtitles');
+      if (deprecatedFlags.length > 0) {
+        console.log(
+          chalk.yellow(
+            `${deprecatedFlags.join(', ')} ${deprecatedFlags.length > 1 ? 'are' : 'is'} deprecated and now treated as no-op.`
+          )
+        );
+      }
+
+      const services = createSharedServices({
+        constructors: {
+          TorrentScraper,
+          StreamManager,
+          MediaSearcher,
+          SubtitleManager,
+        },
+      });
+      for (const warning of services.runtime.warnings) {
+        console.warn(chalk.yellow(`${warning}`));
+      }
       
       // Initialize memory tracker if requested
       const memoryTracker = new MemoryTracker(debugMemory);
       
-      const streamManager = new StreamManager(lowMemoryMode, memoryTracker);
-      const scraper = new TorrentScraper();
-      const mediaSearcher = new MediaSearcher();
+      const streamManager = services.createStreamManager({ memoryTracker });
+      const scraper = services.createTorrentScraper();
+      const mediaSearcher = services.createMediaSearcher();
 
       // Cleanup function to ensure proper resource cleanup
-      const cleanup = (exitCode = 0) => {
+      const cleanup = async (exitCode = 0) => {
         try {
           // Clear the progress line first to prevent terminal clutter
           process.stdout.write('\r\x1b[K');
-          console.log(chalk.yellow('\n🛑 Stopping stream...'));
+          console.log(chalk.yellow('\nStopping stream...'));
           if (memoryTracker) {
             memoryTracker.stop();
           }
           if (streamManager) {
-            streamManager.destroy();
+            await streamManager.destroy();
           }
         } catch (err) {
           // Ignore cleanup errors
@@ -4082,8 +3224,8 @@ async function main() {
       };
 
       // Handle cleanup on all exit scenarios
-      process.on('SIGINT', () => cleanup(0));
-      process.on('SIGTERM', () => cleanup(0));
+      process.on('SIGINT', () => { cleanup(0); });
+      process.on('SIGTERM', () => { cleanup(0); });
       process.on('exit', () => {
         // Synchronous cleanup only
         try {
@@ -4135,15 +3277,16 @@ async function main() {
               name: 'mediaType',
               message: 'What are you searching for?',
               choices: [
-                { name: '🎬 Movie', value: 'movie' },
-                { name: '📺 TV Show', value: 'tv' }
+                { name: 'Movie', value: 'movie' },
+                { name: 'TV Show', value: 'tv' }
               ]
             }
           ]);
           const mediaType = typeAnswer.mediaType;
 
           // Search TMDB database using API only
-          console.log(chalk.blue(`\n🔍 Searching TMDB database for: ${searchQuery}...`));
+          console.log(chalk.cyan('\n[1/4] Discovering title metadata'));
+          console.log(chalk.blue(`Searching TMDB database for: ${searchQuery}...`));
           let tmdbResults = [];
           
           try {
@@ -4153,8 +3296,8 @@ async function main() {
               tmdbResults = await mediaSearcher.searchTVShows(searchQuery);
             }
           } catch (error) {
-            console.error(chalk.red(`\n❌ Error searching TMDB: ${error.message}`));
-            console.log(chalk.yellow('💡 Falling back to direct torrent search...'));
+            console.error(chalk.red(`\n? Error searching TMDB: ${error.message}`));
+            console.log(chalk.yellow('Falling back to direct torrent search...'));
             tmdbResults = [];
           }
 
@@ -4178,7 +3321,7 @@ async function main() {
             ]);
 
             selectedMedia = tmdbResults[mediaAnswer.media];
-            console.log(chalk.green(`\n✅ Selected: ${selectedMedia.displayTitle}`));
+            console.log(chalk.green(`\n? Selected: ${selectedMedia.displayTitle}`));
             
             // Use TMDB title for torrent search (without year - only title)
             searchQuery = selectedMedia.title;
@@ -4187,18 +3330,18 @@ async function main() {
             // For TV shows, get seasons and episodes from TMDB (like Elementum)
             if (mediaType === 'tv' && (selectedMedia.tmdbId || selectedMedia.id)) {
               const tvShowId = selectedMedia.tmdbId || selectedMedia.id;
-              console.log(chalk.blue(`\n📺 Loading seasons for ${selectedMedia.title}...`));
+              console.log(chalk.blue(`\nLoading seasons for ${selectedMedia.title}...`));
               let seasons = [];
               try {
                 seasons = await mediaSearcher.getTVShowSeasons(tvShowId);
               } catch (error) {
-                console.error(chalk.red(`\n❌ Error loading seasons: ${error.message}`));
+                console.error(chalk.red(`\n? Error loading seasons: ${error.message}`));
               }
               
               if (seasons.length > 0) {
                 // Add "Last Season" option at the top
                 const seasonChoices = [
-                  { name: '📺 Last Season', value: 'last' },
+                  { name: 'Last Season', value: 'last' },
                   ...seasons.map(s => ({
                     name: s.displayName,
                     value: s.number
@@ -4224,7 +3367,7 @@ async function main() {
 
                 if (selectedSeason) {
                   const tvShowId = selectedMedia.tmdbId || selectedMedia.id;
-                  console.log(chalk.cyan(`\n📋 Loading episodes for ${selectedSeason.displayName}...`));
+                  console.log(chalk.cyan(`\nLoading episodes for ${selectedSeason.displayName}...`));
                   const episodes = await mediaSearcher.getSeasonEpisodes(tvShowId, selectedSeason.number);
                   
                   if (episodes.length > 0) {
@@ -4256,7 +3399,7 @@ async function main() {
                 }
               } else {
                 // Fallback to manual input if seasons not found
-                console.log(chalk.yellow('\n⚠️  Could not load seasons. Enter manually...'));
+                console.log(chalk.yellow('\nCould not load seasons. Enter manually...'));
                 const seasonAnswer = await inquirer.prompt([
                   {
                     type: 'input',
@@ -4341,15 +3484,16 @@ async function main() {
           
           // If no TMDB results, use original search query
           if (tmdbResults.length === 0) {
-            console.log(chalk.yellow('\n⚠️  No results from TMDB. Using original search query...'));
+            console.log(chalk.yellow('\nNo results from TMDB. Using original search query...'));
           }
 
           // Search for torrents using only the show/movie name (filter by season/episode after)
-          console.log(chalk.blue(`\n🔍 Searching torrents for: ${searchQuery}...`));
+          console.log(chalk.cyan('\n[2/4] Finding torrents'));
+          console.log(chalk.blue(`Searching torrents for: ${searchQuery}...`));
           const results = await scraper.searchAllSources(searchQuery, null, searchSeason, searchEpisode);
             
           if (results.length === 0) {
-            console.error(chalk.red('\n❌ No torrents found. Try a different search term.'));
+            console.error(chalk.red('\n? No torrents found. Try a different search term.'));
             process.exit(1);
           }
 
@@ -4362,7 +3506,7 @@ async function main() {
           } else {
             // Show top 10 results
             const choices = results.slice(0, 10).map((r, i) => ({
-              name: `${r.name} | ${r.size} | 👥 ${r.seeders} | 📍 ${r.source}`,
+              name: `${r.name} | ${r.size} | Seeds ${r.seeders} | Source ${r.source}`,
               value: i
             }));
 
@@ -4379,7 +3523,7 @@ async function main() {
             selectedResult = results[answer.torrent];
           }
 
-          console.log(chalk.green(`\n✅ Selected: ${selectedResult.name}`));
+          console.log(chalk.green(`\n? Selected: ${selectedResult.name}`));
           
           // Ask if user wants subtitles
           const subtitleAnswer = await inquirer.prompt([
@@ -4400,17 +3544,17 @@ async function main() {
                 name: 'language',
                 message: 'Select subtitle language:',
                 choices: [
-                  { name: '🇬🇧 English', value: 'en' },
-                  { name: '🇸🇦 Arabic', value: 'ar' },
-                  { name: '🇪🇸 Spanish', value: 'es' },
-                  { name: '🇫🇷 French', value: 'fr' },
-                  { name: '🇩🇪 German', value: 'de' },
-                  { name: '🇮🇹 Italian', value: 'it' },
-                  { name: '🇵🇹 Portuguese', value: 'pt' },
-                  { name: '🇷🇺 Russian', value: 'ru' },
-                  { name: '🇨🇳 Chinese', value: 'zh' },
-                  { name: '🇯🇵 Japanese', value: 'ja' },
-                  { name: '🇰🇷 Korean', value: 'ko' }
+                  { name: 'English', value: 'en' },
+                  { name: 'Arabic', value: 'ar' },
+                  { name: 'Spanish', value: 'es' },
+                  { name: 'French', value: 'fr' },
+                  { name: 'German', value: 'de' },
+                  { name: 'Italian', value: 'it' },
+                  { name: 'Portuguese', value: 'pt' },
+                  { name: 'Russian', value: 'ru' },
+                  { name: 'Chinese', value: 'zh' },
+                  { name: 'Japanese', value: 'ja' },
+                  { name: 'Korean', value: 'ko' }
                 ],
                 default: 'en'
               }
@@ -4431,9 +3575,10 @@ async function main() {
               'ko': 'Korean'
             };
             
-            console.log(chalk.green(`✅ Selected language: ${languageNames[selectedLanguage]}`));
+            console.log(chalk.cyan('\n[3/4] Resolving subtitles'));
+            console.log(chalk.green(`? Selected language: ${languageNames[selectedLanguage]}`));
             
-            const subtitleManager = new SubtitleManager();
+            const subtitleManager = services.createSubtitleManager();
             
             // Prepare subtitle search query - ALWAYS use TMDB data when available (clean and accurate)
             let subtitleQuery = searchQuery;
@@ -4450,7 +3595,7 @@ async function main() {
               subtitleTmdbId = selectedMedia.tmdbId || selectedMedia.id;
               subtitleMediaType = mediaType;
               
-              console.log(chalk.cyan(`💡 Using TMDB data for subtitles:`));
+              console.log(chalk.cyan(`Using TMDB data for subtitles:`));
               console.log(chalk.cyan(`   Title: ${subtitleQuery}`));
               console.log(chalk.cyan(`   Year: ${subtitleYear || 'N/A'}`));
               console.log(chalk.cyan(`   TMDB ID: ${subtitleTmdbId || 'N/A'}`));
@@ -4467,15 +3612,15 @@ async function main() {
               const torrentName = selectedResult.name;
               const yearMatch = torrentName.match(/\((\d{4})\)|\[(\d{4})\]|[\s\.](\d{4})[\s\.]/);
               subtitleYear = yearMatch ? (yearMatch[1] || yearMatch[2] || yearMatch[3]) : null;
-              console.log(chalk.cyan(`💡 No TMDB data - using search query: ${subtitleQuery} (${subtitleYear || 'N/A'})`));
+              console.log(chalk.cyan(`No TMDB data - using search query: ${subtitleQuery} (${subtitleYear || 'N/A'})`));
             }
             
             // Build display query with year for user feedback
             const displayQuery = subtitleYear ? `${subtitleQuery} (${subtitleYear})` : subtitleQuery;
             if (subtitleSeason && subtitleEpisode) {
-              console.log(chalk.blue(`\n🔍 Searching ${languageNames[selectedLanguage]} subtitles for: ${displayQuery} S${subtitleSeason.toString().padStart(2, '0')}E${subtitleEpisode.toString().padStart(2, '0')}...`));
+              console.log(chalk.blue(`\nSearching ${languageNames[selectedLanguage]} subtitles for: ${displayQuery} S${subtitleSeason.toString().padStart(2, '0')}E${subtitleEpisode.toString().padStart(2, '0')}...`));
             } else {
-              console.log(chalk.blue(`\n🔍 Searching ${languageNames[selectedLanguage]} subtitles for: ${displayQuery}...`));
+              console.log(chalk.blue(`\nSearching ${languageNames[selectedLanguage]} subtitles for: ${displayQuery}...`));
             }
             
             const subtitles = await subtitleManager.searchSubtitles(
@@ -4490,11 +3635,11 @@ async function main() {
 
             if (subtitles.length > 0) {
               const subtitleChoices = subtitles.slice(0, 15).map((s, i) => ({
-                name: `${s.title} | 🌐 ${s.language} | ⬇️ ${s.downloadCount} downloads`,
+                name: `${s.title} | ${s.language} | ${s.downloadCount} downloads`,
                 value: i
               }));
 
-              subtitleChoices.push({ name: '❌ Skip subtitles', value: -1 });
+              subtitleChoices.push({ name: '? Skip subtitles', value: -1 });
 
               const subtitleSelect = await inquirer.prompt([
                 {
@@ -4514,7 +3659,7 @@ async function main() {
                 }
                 subtitlePath = path.join(tempDir, `subtitle_${Date.now()}.srt`);
                 
-                console.log(chalk.cyan(`📥 Downloading subtitle from ${selectedSubtitle.source}...`));
+                console.log(chalk.cyan(`Downloading subtitle from ${selectedSubtitle.source}...`));
                 const downloaded = await subtitleManager.downloadSubtitle(
                   selectedSubtitle.fileId || selectedSubtitle.id,
                   subtitlePath,
@@ -4523,18 +3668,19 @@ async function main() {
                 );
                 
                 if (downloaded) {
-                  console.log(chalk.green(`✅ Subtitle downloaded: ${subtitlePath}`));
+                  console.log(chalk.green(`? Subtitle downloaded: ${subtitlePath}`));
                 } else {
-                  console.log(chalk.yellow(`⚠️  Failed to download subtitle`));
+                  console.log(chalk.yellow(`Failed to download subtitle`));
                   subtitlePath = null;
                 }
               }
             } else {
-              console.log(chalk.yellow(`⚠️  No subtitles found`));
+              console.log(chalk.yellow(`No subtitles found`));
             }
           }
           
-          console.log(chalk.cyan(`📥 Getting magnet link...`));
+          console.log(chalk.cyan('\n[4/4] Starting stream'));
+          console.log(chalk.cyan(`Getting magnet link...`));
           magnetLink = await scraper.getMagnetLink(selectedResult);
           
           // Store subtitle path for later use
@@ -4544,7 +3690,7 @@ async function main() {
         }
 
         if (!magnetLink) {
-          console.error(chalk.red('\n❌ Could not get magnet link.'));
+          console.error(chalk.red('\n? Could not get magnet link.'));
           cleanup(1);
           return;
         }
@@ -4553,7 +3699,6 @@ async function main() {
         await streamManager.stream(magnetLink, {
           openPlayer: options.open !== false,
           subtitlePath: selectedResult?.subtitlePath || null,
-          disableSubtitles: options.subtitles === false  // Pass the --no-subtitles flag
         });
       }
     } catch (error) {
@@ -4562,7 +3707,17 @@ async function main() {
           cleanup(0);
           return;
         }
-        console.error(chalk.red(`\n❌ Error: ${error.message}`));
+        const message = String(error && error.message ? error.message : error);
+        console.error(chalk.red(`\n? Error: ${message}`));
+        if (/timeout|no peers|Could not connect to torrent/i.test(message)) {
+          console.log(chalk.yellow('   Hint: pick a torrent with more seeders or retry in a few minutes.'));
+        }
+        if (/EADDRINUSE|address already in use/i.test(message)) {
+          console.log(chalk.yellow('   Hint: stop previous streams or run `uplayer clean`, then retry.'));
+        }
+        if (/subtitle token/i.test(message)) {
+          console.log(chalk.yellow('   Hint: subtitle tokens expire; restart the subtitle step and try again.'));
+        }
         cleanup(1);
       }
     });
@@ -4570,10 +3725,11 @@ async function main() {
   program.parse();
 }
 
+module.exports = { TorrentScraper, StreamManager, MediaSearcher, SubtitleManager };
+
 // Run if called directly
 if (require.main === module) {
   main().catch(console.error);
 }
 
-module.exports = { TorrentScraper, StreamManager, MediaSearcher, SubtitleManager };
 

@@ -1,49 +1,68 @@
 'use strict';
 
 const express = require('express');
-const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { TorrentScraper, SubtitleManager, StreamManager } = require('./uplayer.js');
+const { loadEnvFileOnce } = require('./core/config');
+const { createSharedServices } = require('./core/shared-services');
+const { StreamLifecycleState } = require('./core/stream-lifecycle');
+const { buildAccessibleUrls } = require('./core/network-address');
+
+loadEnvFileOnce();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const TMDB_API_KEY = process.env.TMDB_API_KEY || 'aee3a88db6bb9228aec32784ef2dd1c1';
-const TMDB_BASE = 'https://api.themoviedb.org/3';
-const HISTORY_FILE = path.join(os.homedir(), '.uplayer-history.json');
+const PLAYER_MODE = 'native-js';
+let services = null;
+let servicesWarningsShown = false;
+
+function getServices() {
+  if (services) return services;
+  const { TorrentScraper, SubtitleManager, StreamManager } = require('./uplayer.js');
+  services = createSharedServices({
+    constructors: {
+      TorrentScraper,
+      SubtitleManager,
+      StreamManager,
+    },
+  });
+  if (!servicesWarningsShown) {
+    for (const warning of services.runtime.warnings) {
+      console.warn(warning);
+    }
+    servicesWarningsShown = true;
+  }
+  return services;
+}
+
+const PORT = getServices().runtime.config.port || 3000;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── History DB Helpers ───────────────────────────────────────────────────────
+// --- History DB Helpers -------------------------------------------------------
 
 function readHistory() {
-  try {
-    if (fs.existsSync(HISTORY_FILE)) {
-      return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-    }
-  } catch (e) { /* ignore corrupt file */ }
-  return { movies: {}, tvShows: {} };
+  return getServices().historyStore.read();
 }
 
 function writeHistory(data) {
-  fs.writeFileSync(HISTORY_FILE, JSON.stringify(data, null, 2), 'utf8');
+  getServices().historyStore.write(data);
 }
 
-// ─── TMDB Helper ──────────────────────────────────────────────────────────────
+function getRecommendationService() {
+  return getServices().recommendationService;
+}
+
+// --- TMDB Helper --------------------------------------------------------------
 
 async function tmdb(endpoint, params = {}) {
-  const res = await axios.get(`${TMDB_BASE}${endpoint}`, {
-    params: { api_key: TMDB_API_KEY, ...params },
-    timeout: 15000,
-  });
-  return res.data;
+  return getServices().tmdbClient.get(endpoint, params);
 }
 
-// ─── API Routes ───────────────────────────────────────────────────────────────
+// --- API Routes ---------------------------------------------------------------
 
-// Trending — type: all | movie | tv, window: day | week
+// Trending ? type: all | movie | tv, window: day | week
 app.get('/api/trending', async (req, res) => {
   try {
     const type = ['all', 'movie', 'tv'].includes(req.query.type) ? req.query.type : 'all';
@@ -55,7 +74,7 @@ app.get('/api/trending', async (req, res) => {
   }
 });
 
-// Search — q, type: multi | movie | tv, page
+// Search ? q, type: multi | movie | tv, page
 app.get('/api/search', async (req, res) => {
   try {
     const q = req.query.q || '';
@@ -69,7 +88,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Detail — type: movie | tv, id
+// Detail ? type: movie | tv, id
 app.get('/api/detail/:type/:id', async (req, res) => {
   try {
     const { type, id } = req.params;
@@ -194,7 +213,7 @@ app.get('/api/now-playing', async (req, res) => {
   }
 });
 
-// ─── History Routes ───────────────────────────────────────────────────────────
+// --- History Routes -----------------------------------------------------------
 
 app.get('/api/history', (req, res) => {
   res.json(readHistory());
@@ -202,18 +221,29 @@ app.get('/api/history', (req, res) => {
 
 app.post('/api/history', (req, res) => {
   try {
-    const { type, item } = req.body;
-    if (!type || !item || !item.tmdbId) return res.status(400).json({ error: 'Missing type or item' });
-    const db = readHistory();
-    if (type === 'movie') {
-      db.movies[String(item.tmdbId)] = { ...item, watchedAt: new Date().toISOString() };
-    } else if (type === 'tv') {
-      db.tvShows[String(item.tmdbId)] = { ...item, watchedAt: new Date().toISOString() };
-    } else {
-      return res.status(400).json({ error: 'type must be movie or tv' });
+    const { type, item } = req.body || {};
+    const tmdbId = item && (item.tmdbId || item.id);
+    if (!type || !item || !tmdbId) {
+      return res.status(400).json({ error: 'Missing type or item' });
     }
-    writeHistory(db);
-    res.json({ ok: true });
+
+    const normalizedItem = {
+      ...item,
+      tmdbId,
+      title: item.title || item.name || item.original_title || item.original_name || 'Unknown',
+    };
+
+    const db = getServices().historyStore.markWatched(type, normalizedItem);
+    try {
+      getRecommendationService().buildAndPersistProfile();
+    } catch (profileError) {
+      console.warn('Failed to refresh recommendation profile after history save:', profileError.message);
+    }
+    const savedItem = type === 'movie'
+      ? db.movies[String(tmdbId)]
+      : db.tvShows[String(tmdbId)];
+
+    res.json({ ok: true, item: savedItem });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -222,11 +252,86 @@ app.post('/api/history', (req, res) => {
 app.delete('/api/history/:type/:id', (req, res) => {
   try {
     const { type, id } = req.params;
-    const db = readHistory();
-    if (type === 'movie') delete db.movies[id];
-    else if (type === 'tv') delete db.tvShows[id];
-    writeHistory(db);
+    getServices().historyStore.remove(type, id);
+    try {
+      getRecommendationService().buildAndPersistProfile();
+    } catch (profileError) {
+      console.warn('Failed to refresh recommendation profile after history delete:', profileError.message);
+    }
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/watchlist', (req, res) => {
+  try {
+    res.json(getRecommendationService().getWatchlist());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/watchlist', async (req, res) => {
+  try {
+    const { type, tmdbId, item, metadata } = req.body || {};
+    const resolvedType = type === 'tv' ? 'tv' : type === 'movie' ? 'movie' : null;
+    const resolvedId = tmdbId || item?.tmdbId || item?.id || metadata?.tmdbId || metadata?.id;
+    if (!resolvedType || !resolvedId) {
+      return res.status(400).json({ error: 'type and tmdbId are required' });
+    }
+
+    const saved = await getRecommendationService().addWatchlist({
+      type: resolvedType,
+      tmdbId: resolvedId,
+      item,
+      metadata,
+    });
+    res.json({
+      ok: true,
+      item: saved.item,
+      profile: getRecommendationService().summarizeProfile(saved.profile),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/watchlist/:type/:id', (req, res) => {
+  try {
+    const { type, id } = req.params;
+    if (!['movie', 'tv'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid type' });
+    }
+    const removed = getRecommendationService().removeWatchlist(type, id);
+    res.json({
+      ok: true,
+      removed: !!removed.removed,
+      item: removed.item || null,
+      profile: getRecommendationService().summarizeProfile(removed.profile || {}),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/recommendations/event', async (req, res) => {
+  try {
+    const { eventType, type, tmdbId, metadata } = req.body || {};
+    if (!eventType || !['movie', 'tv'].includes(type) || !tmdbId) {
+      return res.status(400).json({ error: 'eventType, type, and tmdbId are required' });
+    }
+    const recorded = await getRecommendationService().recordEvent({
+      eventType,
+      type,
+      tmdbId,
+      metadata,
+    });
+    res.json({
+      ok: true,
+      interaction: recorded.interaction,
+      profile: getRecommendationService().summarizeProfile(recorded.profile),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -280,98 +385,26 @@ app.get('/api/newEpisodes', async (req, res) => {
 // Personalised recommendations based on watch history
 app.get('/api/recommendations', async (req, res) => {
   try {
-    const db = readHistory();
-    const type = req.query.type; // movie | tv | undefined (both)
-    const page = parseInt(req.query.page) || 1;
-
-    const movieIds = Object.keys(db.movies);
-    const tvIds = Object.keys(db.tvShows);
-
-    // Pick up to 5 seeds from history (most recently watched first)
-    const movieSeeds = Object.values(db.movies)
-      .sort((a, b) => new Date(b.watchedAt) - new Date(a.watchedAt))
-      .slice(0, 5)
-      .map((m) => ({ id: m.tmdbId, type: 'movie' }));
-
-    const tvSeeds = Object.values(db.tvShows)
-      .sort((a, b) => new Date(b.watchedAt) - new Date(a.watchedAt))
-      .slice(0, 5)
-      .map((s) => ({ id: s.tmdbId, type: 'tv' }));
-
-    let seeds = [];
-    if (type === 'movie') seeds = movieSeeds;
-    else if (type === 'tv') seeds = tvSeeds;
-    else seeds = [...movieSeeds, ...tvSeeds];
-
-    if (seeds.length === 0) {
-      // Fallback: trending
-      const fallback = await tmdb(`/trending/${type || 'all'}/week`, { page });
-      return res.json({ results: fallback.results, total_pages: fallback.total_pages, source: 'trending' });
-    }
-
-    // Fetch recommendations from each seed in parallel
-    const allRecs = await Promise.all(
-      seeds.map(async (seed) => {
-        try {
-          const d = await tmdb(`/${seed.type}/${seed.id}/recommendations`, { page: 1 });
-          return (d.results || []).map((r) => ({ ...r, media_type: seed.type }));
-        } catch (e) {
-          return [];
-        }
-      })
-    );
-
-    // Flatten, deduplicate, remove already-watched
-    const seen = new Set([...movieIds, ...tvIds]);
-    const unique = new Map();
-    for (const list of allRecs) {
-      for (const item of list) {
-        const key = `${item.media_type}-${item.id}`;
-        if (!seen.has(String(item.id)) && !unique.has(key)) {
-          unique.set(key, item);
-        }
-      }
-    }
-
-    let results = Array.from(unique.values());
-
-    // Apply optional filters
-    if (req.query.genre) {
-      const g = parseInt(req.query.genre);
-      results = results.filter((r) => (r.genre_ids || []).includes(g));
-    }
-    if (req.query.minRating) {
-      results = results.filter((r) => r.vote_average >= parseFloat(req.query.minRating));
-    }
-    if (req.query.yearFrom) {
-      results = results.filter((r) => {
-        const yr = parseInt((r.release_date || r.first_air_date || '').slice(0, 4));
-        return yr >= parseInt(req.query.yearFrom);
-      });
-    }
-    if (req.query.yearTo) {
-      results = results.filter((r) => {
-        const yr = parseInt((r.release_date || r.first_air_date || '').slice(0, 4));
-        return yr <= parseInt(req.query.yearTo);
-      });
-    }
-
-    // Sort by vote_average desc, then paginate
-    results.sort((a, b) => b.vote_average - a.vote_average);
-    const perPage = 20;
-    const totalPages = Math.ceil(results.length / perPage);
-    const paged = results.slice((page - 1) * perPage, page * perPage);
-
-    res.json({ results: paged, total_pages: totalPages, source: 'history' });
+    const filters = {
+      type: ['movie', 'tv'].includes(req.query.type) ? req.query.type : '',
+      genre: req.query.genre ? String(req.query.genre) : '',
+      minRating: req.query.minRating ? String(req.query.minRating) : '',
+      yearFrom: req.query.yearFrom ? String(req.query.yearFrom) : '',
+      yearTo: req.query.yearTo ? String(req.query.yearTo) : '',
+    };
+    const data = await getRecommendationService().getRecommendations(filters);
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ─── Streaming Session Store ──────────────────────────────────────────────────
+// --- Streaming Session Store --------------------------------------------------
 
 const streamSessions = new Map();
 let sessionCounter = 0;
+const STREAM_CLEANUP_DELAY_MS = 15000;
+const LEGACY_STREAM_FIELDS = ['subtitlePath', 'playerMode', 'noSubtitles'];
 
 function broadcastToSession(sessionId, event, data) {
   const session = streamSessions.get(sessionId);
@@ -384,14 +417,163 @@ function broadcastToSession(sessionId, event, data) {
   if (session.buffer.length > 500) session.buffer.shift();
 }
 
-// ─── Torrent Search ───────────────────────────────────────────────────────────
+function createStreamSession() {
+  const sessionId = `stream_${++sessionCounter}_${Date.now()}`;
+  const session = {
+    id: sessionId,
+    streamManager: null,
+    clients: [],
+    buffer: [],
+    started: Date.now(),
+    mode: PLAYER_MODE,
+    destroyPromise: null,
+    cleanupTimer: null,
+    exitedAt: null,
+    history: null,
+    historySaved: false,
+  };
+  session.lifecycle = new StreamLifecycleState((event, data) => {
+    broadcastToSession(sessionId, event, data);
+  });
+  return session;
+}
+
+function scheduleSessionCleanup(sessionId, delayMs = STREAM_CLEANUP_DELAY_MS) {
+  const session = streamSessions.get(sessionId);
+  if (!session) return;
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  session.cleanupTimer = setTimeout(() => {
+    const current = streamSessions.get(sessionId);
+    if (current && current.lifecycle && current.lifecycle.exited) {
+      streamSessions.delete(sessionId);
+    }
+  }, delayMs);
+}
+
+function failStartRequest(res, message) {
+  return res.status(400).json({ error: message });
+}
+
+function validateStreamStartBody(body) {
+  if (!body || typeof body !== 'object') {
+    return { error: 'Invalid request body' };
+  }
+
+  const legacyFieldsUsed = LEGACY_STREAM_FIELDS.filter((field) =>
+    Object.prototype.hasOwnProperty.call(body, field)
+  );
+  if (legacyFieldsUsed.length > 0) {
+    return {
+      error: `Legacy fields are not supported: ${legacyFieldsUsed.join(', ')}`,
+    };
+  }
+
+  if (!body.magnet || !String(body.magnet).trim()) {
+    return { error: 'magnet required' };
+  }
+
+  if (
+    typeof body.subtitleToken !== 'undefined' &&
+    body.subtitleToken !== null &&
+    typeof body.subtitleToken !== 'string'
+  ) {
+    return { error: 'subtitleToken must be a string' };
+  }
+
+  let history = null;
+  if (typeof body.history !== 'undefined' && body.history !== null) {
+    const historyType = body.history.type;
+    const historyItem = body.history.item;
+    const historyTmdbId = historyItem && (historyItem.tmdbId || historyItem.id);
+
+    if (!['movie', 'tv'].includes(historyType)) {
+      return { error: 'history.type must be movie or tv' };
+    }
+
+    if (!historyItem || !historyTmdbId) {
+      return { error: 'history.item.tmdbId is required' };
+    }
+
+    history = {
+      type: historyType,
+      item: {
+        ...historyItem,
+        tmdbId: historyTmdbId,
+        title: historyItem.title || historyItem.name || historyItem.original_title || historyItem.original_name || 'Unknown',
+      },
+    };
+  }
+
+  return {
+    magnet: String(body.magnet),
+    subtitleToken: body.subtitleToken ? String(body.subtitleToken) : null,
+    history,
+  };
+}
+
+function persistSessionHistory(session) {
+  if (!session || session.historySaved || !session.history) return null;
+  const { type, item } = session.history;
+  const db = getServices().historyStore.markWatched(type, item);
+  try {
+    getRecommendationService().buildAndPersistProfile();
+  } catch (profileError) {
+    console.warn('Failed to refresh recommendation profile after stream history save:', profileError.message);
+  }
+  session.historySaved = true;
+  return type === 'movie'
+    ? db.movies[String(item.tmdbId)]
+    : db.tvShows[String(item.tmdbId)];
+}
+
+async function destroySession(sessionId, code = 0) {
+  const session = streamSessions.get(sessionId);
+  if (!session) return false;
+  if (session.destroyPromise) {
+    await session.destroyPromise;
+    return true;
+  }
+
+  session.destroyPromise = (async () => {
+    if (session.cleanupTimer) {
+      clearTimeout(session.cleanupTimer);
+      session.cleanupTimer = null;
+    }
+
+    const sm = session.streamManager;
+    session.streamManager = null;
+    if (sm) {
+      try {
+        await sm.destroy();
+      } catch (e) {
+        // Ignore teardown failures so API stop remains reliable.
+      }
+    }
+
+    session.lifecycle.exit(code);
+    session.exitedAt = Date.now();
+    streamSessions.delete(sessionId);
+  })();
+
+  await session.destroyPromise;
+  return true;
+}
+
+async function destroyAllSessions(code = 0) {
+  const ids = Array.from(streamSessions.keys());
+  for (const id of ids) {
+    await destroySession(id, code);
+  }
+}
+
+// --- Torrent Search -----------------------------------------------------------
 
 app.post('/api/torrents/search', async (req, res) => {
   try {
     const { title, type, season, episode } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
 
-    const scraper = new TorrentScraper();
+    const scraper = getServices().createTorrentScraper();
     const results = await scraper.searchAllSources(
       title,
       null,
@@ -416,7 +598,7 @@ app.post('/api/torrents/magnet', async (req, res) => {
   try {
     const { torrent } = req.body;
     if (!torrent) return res.status(400).json({ error: 'torrent required' });
-    const scraper = new TorrentScraper();
+    const scraper = getServices().createTorrentScraper();
     const magnet = await scraper.getMagnetLink(torrent);
     if (!magnet) return res.status(404).json({ error: 'Could not resolve magnet link' });
     res.json({ magnet });
@@ -425,7 +607,7 @@ app.post('/api/torrents/magnet', async (req, res) => {
   }
 });
 
-// ─── Subtitle Routes ──────────────────────────────────────────────────────────
+// --- Subtitle Routes ----------------------------------------------------------
 
 const SUBTITLE_LANGUAGES = [
   { code: 'en', label: 'English' },
@@ -450,7 +632,7 @@ app.post('/api/subtitles/search', async (req, res) => {
     const { title, type, season, episode, year, tmdbId, language } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
 
-    const manager = new SubtitleManager();
+    const manager = getServices().createSubtitleManager();
     const results = await manager.searchSubtitles(
       title,
       language || 'en',
@@ -478,91 +660,113 @@ app.post('/api/subtitles/download', async (req, res) => {
     const filename = `sub_${Date.now()}${ext}`;
     const outputPath = path.join(tmpDir, filename);
 
-    const manager = new SubtitleManager();
+    const manager = getServices().createSubtitleManager();
+    const subtitleId = subtitle.fileId || subtitle.id;
     const ok = await manager.downloadSubtitle(
-      subtitle.id,
+      subtitleId,
       outputPath,
       subtitle.source,
-      subtitle.downloadUrl || subtitle.attributes?.subsplease_url || null
+      subtitle.downloadUrl || subtitle.attributes?.subsplease_url || subtitle.attributes?.addic7ed_url || null
     );
 
     if (!ok || !fs.existsSync(outputPath)) {
       return res.status(500).json({ error: 'Subtitle download failed' });
     }
 
-    res.json({ path: outputPath, filename });
+    const tokenMeta = getServices().subtitleTokenStore.issueWithMetadata(outputPath);
+    res.json({
+      filename,
+      subtitleToken: tokenMeta.token,
+      tokenExpiresAt: tokenMeta.expiresAt,
+      tokenTtlMs: tokenMeta.ttlMs,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ─── Stream Management ────────────────────────────────────────────────────────
+// --- Stream Management --------------------------------------------------------
 
-// Start a new stream session — runs StreamManager in-process (no child process spawn)
+// Start a new stream session ? runs StreamManager in-process (no child process spawn)
 app.post('/api/stream/start', async (req, res) => {
   try {
-    const { magnet, subtitlePath, noSubtitles } = req.body;
-    if (!magnet) return res.status(400).json({ error: 'magnet required' });
+    const parsed = validateStreamStartBody(req.body);
+    if (parsed.error) return failStartRequest(res, parsed.error);
 
-    // Destroy any existing stream sessions
-    for (const [id, session] of streamSessions.entries()) {
-      if (session.streamManager) {
-        try { await session.streamManager.destroy(); } catch (e) { /* ignore */ }
+    let resolvedSubtitlePath = null;
+    if (parsed.subtitleToken) {
+      const byToken = getServices().subtitleTokenStore.resolve(parsed.subtitleToken);
+      if (!byToken || !fs.existsSync(byToken)) {
+        return failStartRequest(res, 'Invalid or expired subtitle token');
       }
-      streamSessions.delete(id);
+      resolvedSubtitlePath = byToken;
     }
 
-    const sessionId = `stream_${++sessionCounter}_${Date.now()}`;
-    const session = {
-      id: sessionId,
-      streamManager: null,
-      clients: [],
-      buffer: [],
-      playerUrl: null,
-      started: Date.now(),
-    };
-    streamSessions.set(sessionId, session);
+    // Single active stream policy: start request replaces any running session.
+    await destroyAllSessions(0);
 
-    // Instantiate StreamManager directly in the same process
-    const sm = new StreamManager();
+    const session = createStreamSession();
+    session.history = parsed.history;
+    if (parsed.history && parsed.history.type && parsed.history.item && parsed.history.item.tmdbId) {
+      try {
+        await getRecommendationService().recordEvent({
+          eventType: 'stream_start',
+          type: parsed.history.type,
+          tmdbId: parsed.history.item.tmdbId,
+          metadata: parsed.history.item,
+        });
+      } catch (eventError) {
+        console.warn('Failed to record stream_start recommendation signal:', eventError.message);
+      }
+    }
+    persistSessionHistory(session);
+    streamSessions.set(session.id, session);
+
+    const sm = getServices().createStreamManager();
     session.streamManager = sm;
 
-    sm.on('line', (data) => broadcastToSession(sessionId, 'line', data));
+    sm.on('line', (data) => {
+      const text = data && data.text ? data.text : '';
+      session.lifecycle.line(text);
+    });
 
-    sm.on('progress', (data) => broadcastToSession(sessionId, 'progress', data));
+    sm.on('progress', (data) => {
+      session.lifecycle.progress(data);
+    });
 
     sm.on('player_ready', (data) => {
-      const s = streamSessions.get(sessionId);
-      if (s && !s.playerUrl) {
-        s.playerUrl = data.url;
-        broadcastToSession(sessionId, 'player_ready', data);
+      const url = data && data.url ? data.url : null;
+      if (url) {
+        persistSessionHistory(session);
+        session.lifecycle.playerReady(url);
       }
     });
 
     sm.on('exit', (data) => {
-      broadcastToSession(sessionId, 'exit', data);
-      streamSessions.delete(sessionId);
+      const code = data && Number.isFinite(Number(data.code)) ? Number(data.code) : 0;
+      session.streamManager = null;
+      session.lifecycle.exit(code);
+      session.exitedAt = Date.now();
+      scheduleSessionCleanup(session.id);
     });
 
-    // Run stream non-blocking — resolves when player server is ready
-    sm.stream(magnet, {
+    sm.stream(parsed.magnet, {
       openPlayer: false,
-      subtitlePath: subtitlePath && fs.existsSync(subtitlePath) ? subtitlePath : null,
-      disableSubtitles: !!noSubtitles,
+      subtitlePath: resolvedSubtitlePath,
     }).then(({ url }) => {
-      // player_ready already emitted via EventEmitter; ensure session has URL
-      const s = streamSessions.get(sessionId);
-      if (s && !s.playerUrl) {
-        s.playerUrl = url;
-        broadcastToSession(sessionId, 'player_ready', { url });
+      if (url) {
+        persistSessionHistory(session);
+        session.lifecycle.playerReady(url);
       }
     }).catch((err) => {
-      broadcastToSession(sessionId, 'line', { text: `Error: ${err.message}` });
-      broadcastToSession(sessionId, 'exit', { code: 1 });
-      streamSessions.delete(sessionId);
+      session.lifecycle.line(`Error: ${err.message}`);
+      session.streamManager = null;
+      session.lifecycle.exit(1);
+      session.exitedAt = Date.now();
+      scheduleSessionCleanup(session.id);
     });
 
-    res.json({ sessionId });
+    res.json({ sessionId: session.id, mode: PLAYER_MODE });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -585,8 +789,9 @@ app.get('/api/stream/output/:sessionId', (req, res) => {
   }
 
   // If player is already ready, send it again
-  if (session.playerUrl) {
-    res.write(`event: player_ready\ndata: ${JSON.stringify({ url: session.playerUrl })}\n\n`);
+  const lifecycleStatus = session.lifecycle ? session.lifecycle.status() : { playerUrl: null };
+  if (lifecycleStatus.playerUrl) {
+    res.write(`event: player_ready\ndata: ${JSON.stringify({ url: lifecycleStatus.playerUrl })}\n\n`);
   }
 
   session.clients.push(res);
@@ -596,30 +801,16 @@ app.get('/api/stream/output/:sessionId', (req, res) => {
   });
 });
 
-// Stop a stream — destroy StreamManager (closes WebTorrent + port 8000 server)
+// Stop a stream ? destroy StreamManager (closes WebTorrent + port 8000 server)
 app.delete('/api/stream/stop/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
-  const session = streamSessions.get(sessionId);
-  if (session) {
-    if (session.streamManager) {
-      try { await session.streamManager.destroy(); } catch (e) { /* ignore */ }
-      session.streamManager = null;
-    }
-    broadcastToSession(sessionId, 'exit', { code: 0 });
-    streamSessions.delete(sessionId);
-  }
+  await destroySession(sessionId, 0);
   res.json({ ok: true });
 });
 
 // Stop all streams
 app.delete('/api/stream/kill-all', async (req, res) => {
-  for (const [id, session] of streamSessions.entries()) {
-    if (session.streamManager) {
-      try { await session.streamManager.destroy(); } catch (e) { /* ignore */ }
-    }
-    broadcastToSession(id, 'exit', { code: 0 });
-  }
-  streamSessions.clear();
+  await destroyAllSessions(0);
   res.json({ ok: true });
 });
 
@@ -627,26 +818,92 @@ app.delete('/api/stream/kill-all', async (req, res) => {
 app.get('/api/stream/status', (req, res) => {
   const active = [];
   for (const [id, session] of streamSessions.entries()) {
+    const lifecycleStatus = session.lifecycle ? session.lifecycle.status() : { playerUrl: null, exited: false };
     active.push({
       id,
-      running: !!session.streamManager,
-      playerUrl: session.playerUrl,
+      running: !!session.streamManager && !lifecycleStatus.exited,
+      playerUrl: lifecycleStatus.playerUrl,
       started: session.started,
+      mode: session.mode || PLAYER_MODE,
+      exited: !!lifecycleStatus.exited,
+      exitedAt: session.exitedAt,
     });
   }
   res.json(active);
 });
 
-// ─── SPA Catch-all ────────────────────────────────────────────────────────────
+// --- SPA Catch-all ------------------------------------------------------------
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// --- Start --------------------------------------------------------------------
 
-app.listen(PORT, () => {
-  console.log(`\n  Uplayer Web GUI running at http://localhost:${PORT}\n`);
-});
+let activeServer = null;
+
+function getServerUrl(server = activeServer) {
+  if (!server || !server.listening) return null;
+  const addr = server.address();
+  const resolvedPort = addr && typeof addr === 'object' ? addr.port : PORT;
+  return buildAccessibleUrls(resolvedPort).preferred;
+}
+
+function startServer(port = PORT) {
+  if (activeServer && activeServer.listening) {
+    const addr = activeServer.address();
+    const activePort = addr && typeof addr === 'object' ? addr.port : port;
+    if (port === activePort) {
+      return activeServer;
+    }
+    throw new Error(`Uplayer web server is already running on port ${activePort}`);
+  }
+
+  const server = app.listen(port, buildAccessibleUrls(port).bindHost);
+  activeServer = server;
+
+  server.once('listening', () => {
+    const resolvedUrl = getServerUrl(server);
+    console.log(`\n  Uplayer Web GUI running at ${resolvedUrl}\n`);
+  });
+
+  server.once('close', () => {
+    if (activeServer === server) {
+      activeServer = null;
+    }
+  });
+
+  server.once('error', () => {
+    if (activeServer === server) {
+      activeServer = null;
+    }
+  });
+
+  return server;
+}
+
+async function stopServer() {
+  if (!activeServer) return;
+  const server = activeServer;
+  await destroyAllSessions(0);
+  await new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+if (require.main === module) {
+  startServer(PORT);
+}
 
 module.exports = app;
+module.exports.app = app;
+module.exports.startServer = startServer;
+module.exports.stopServer = stopServer;
+module.exports.getServerUrl = getServerUrl;
+

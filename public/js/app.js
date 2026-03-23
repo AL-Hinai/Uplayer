@@ -1,12 +1,12 @@
 'use strict';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// --- Constants ----------------------------------------------------------------
 const IMG_BASE = 'https://image.tmdb.org/t/p';
 const POSTER = (p) => p ? `${IMG_BASE}/w342${p}` : null;
 const BACKDROP = (p) => p ? `${IMG_BASE}/w1280${p}` : null;
 const AVATAR = (p) => p ? `${IMG_BASE}/w185${p}` : null;
 
-// ─── State ────────────────────────────────────────────────────────────────────
+// --- State --------------------------------------------------------------------
 const state = {
   genres: { movie: [], tv: [] },
   newEpisodes: [],
@@ -14,18 +14,29 @@ const state = {
   heroItems: [],
   heroIndex: 0,
   heroTimer: null,
+  watchlist: { movie: {}, tv: {} },
+  watchlistLoaded: false,
 };
 
-// ─── API Client ───────────────────────────────────────────────────────────────
+// --- API Client ---------------------------------------------------------------
 async function api(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`API error ${res.status}`);
   return res.json();
 }
 
-// ─── Toast ────────────────────────────────────────────────────────────────────
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+// --- Toast --------------------------------------------------------------------
 function toast(msg, type = 'info', duration = 3000) {
-  const icons = { success: '✓', error: '✕', info: 'ℹ' };
+  const icons = { success: 'OK', error: '!', info: 'i' };
   const el = document.createElement('div');
   el.className = `toast toast-${type}`;
   el.innerHTML = `<span>${icons[type]}</span><span>${msg}</span>`;
@@ -33,26 +44,188 @@ function toast(msg, type = 'info', duration = 3000) {
   setTimeout(() => el.remove(), duration);
 }
 
-// ─── History Helpers ──────────────────────────────────────────────────────────
+// --- History Helpers ----------------------------------------------------------
 async function getHistory() {
   return api('/api/history');
 }
 
-async function markWatched(type, item) {
-  await fetch('/api/history', {
+function stripUndefinedFields(obj) {
+  return Object.fromEntries(
+    Object.entries(obj || {}).filter(([, value]) => value !== undefined)
+  );
+}
+
+function normalizeHistoryItem(type, item = {}) {
+  const tmdbId = item.tmdbId || item.id;
+  return stripUndefinedFields({
+    ...item,
+    tmdbId,
+    title: item.title || item.name || item.original_title || item.original_name || 'Unknown',
+    name: item.name || item.title || item.original_name || item.original_title,
+  });
+}
+
+function applyHistoryUpdate(type, item) {
+  if (!window._historyDB || !item || !item.tmdbId) return;
+  if (type === 'movie') {
+    window._historyDB.movies = window._historyDB.movies || {};
+    window._historyDB.movies[String(item.tmdbId)] = item;
+  } else if (type === 'tv') {
+    window._historyDB.tvShows = window._historyDB.tvShows || {};
+    window._historyDB.tvShows[String(item.tmdbId)] = item;
+  }
+}
+
+function applyHistoryRemoval(type, id) {
+  if (!window._historyDB) return;
+  if (type === 'movie' && window._historyDB.movies) {
+    delete window._historyDB.movies[String(id)];
+  } else if (type === 'tv' && window._historyDB.tvShows) {
+    delete window._historyDB.tvShows[String(id)];
+  }
+}
+
+function refreshHistoryViews() {
+  if (state.currentPage !== 'history' || !window._historyDB) return;
+  renderHistMovies(window._historyDB);
+  renderHistTV(window._historyDB);
+}
+
+function normalizeMediaPayload(type, item = {}) {
+  const tmdbId = item.tmdbId || item.id;
+  return stripUndefinedFields({
+    ...item,
+    tmdbId,
+    id: tmdbId,
+    type,
+    media_type: type,
+    title: item.title || item.name || item.original_title || item.original_name || 'Unknown',
+    name: item.name || item.title || item.original_name || item.original_title || 'Unknown',
+  });
+}
+
+async function ensureWatchlistLoaded(force = false) {
+  if (state.watchlistLoaded && !force) return state.watchlist;
+  try {
+    const data = await fetchJson('/api/watchlist');
+    state.watchlist = data.watchlist || { movie: {}, tv: {} };
+    state.watchlistLoaded = true;
+  } catch (e) {
+    console.warn('Failed to load watchlist:', e);
+    if (force) throw e;
+  }
+  return state.watchlist;
+}
+
+function isSavedToWatchlist(type, tmdbId) {
+  return !!(((state.watchlist || {})[type] || {})[String(tmdbId)]);
+}
+
+async function trackRecommendationEvent(eventType, type, tmdbId, metadata = {}, options = {}) {
+  try {
+    const res = await fetch('/api/recommendations/event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        eventType,
+        type,
+        tmdbId,
+        metadata: normalizeMediaPayload(type, metadata),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to record recommendation signal');
+    }
+    return data;
+  } catch (e) {
+    if (!options.silent) {
+      console.warn(`Failed to track recommendation event ${eventType}:`, e);
+    }
+    return null;
+  }
+}
+
+async function toggleWatchlistItem(type, item, options = {}) {
+  const payload = normalizeMediaPayload(type, item);
+  if (!payload.tmdbId) {
+    throw new Error('Missing TMDB id');
+  }
+
+  await ensureWatchlistLoaded();
+  const saved = isSavedToWatchlist(type, payload.tmdbId);
+
+  if (saved) {
+    const res = await fetch(`/api/watchlist/${type}/${payload.tmdbId}`, { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to remove from watchlist');
+    }
+    if (state.watchlist[type]) {
+      delete state.watchlist[type][String(payload.tmdbId)];
+    }
+    if (!options.silent) toast('Removed from watchlist', 'info');
+    return { saved: false, data };
+  }
+
+  const res = await fetch('/api/watchlist', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type, item }),
+    body: JSON.stringify({
+      type,
+      tmdbId: payload.tmdbId,
+      item: payload,
+    }),
   });
-  toast(`Marked as watched`, 'success');
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to save to watchlist');
+  }
+  state.watchlist[type] = state.watchlist[type] || {};
+  state.watchlist[type][String(payload.tmdbId)] = data.item || payload;
+  if (!options.silent) toast('Saved to watchlist', 'success');
+  return { saved: true, data };
+}
+
+async function markWatched(type, item, options = {}) {
+  const normalized = normalizeHistoryItem(type, item);
+  try {
+    const res = await fetch('/api/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, item: normalized }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to save watch history');
+    }
+    applyHistoryUpdate(type, data.item || normalized);
+    refreshHistoryViews();
+    if (!options.silent) toast('Marked as watched', 'success');
+    return data.item || normalized;
+  } catch (e) {
+    if (!options.silent) toast(e.message || 'Failed to save watch history', 'error');
+    throw e;
+  }
 }
 
 async function removeHistory(type, id) {
-  await fetch(`/api/history/${type}/${id}`, { method: 'DELETE' });
-  toast('Removed from history', 'info');
+  try {
+    const res = await fetch(`/api/history/${type}/${id}`, { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to remove history item');
+    }
+    applyHistoryRemoval(type, id);
+    refreshHistoryViews();
+    toast('Removed from history', 'info');
+  } catch (e) {
+    toast(e.message || 'Failed to remove history item', 'error');
+    throw e;
+  }
 }
 
-// ─── Utility ──────────────────────────────────────────────────────────────────
+// --- Utility ------------------------------------------------------------------
 function year(item) {
   const d = item.release_date || item.first_air_date || '';
   return d ? d.slice(0, 4) : '';
@@ -67,7 +240,7 @@ function mediaType(item) {
 }
 
 function rating(item) {
-  return item.vote_average ? item.vote_average.toFixed(1) : '—';
+  return item.vote_average ? item.vote_average.toFixed(1) : '?';
 }
 
 function formatDate(str) {
@@ -79,7 +252,7 @@ function escape(str) {
   return String(str || '').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// ─── Card Builder ─────────────────────────────────────────────────────────────
+// --- Card Builder -------------------------------------------------------------
 function buildCard(item, opts = {}) {
   const t = title(item);
   const y = year(item);
@@ -87,10 +260,12 @@ function buildCard(item, opts = {}) {
   const mt = opts.mediaType || mediaType(item);
   const poster = POSTER(item.poster_path);
   const id = item.tmdbId || item.id;
+  const reasonLabel = opts.reasonLabel || '';
+  const saved = typeof opts.saved === 'boolean' ? opts.saved : isSavedToWatchlist(mt, id);
 
   const posterHTML = poster
     ? `<img src="${escape(poster)}" alt="${escape(t)}" loading="lazy" />`
-    : `<div class="card-poster-placeholder">🎬</div>`;
+    : `<div class="card-poster-placeholder">MEDIA</div>`;
 
   const typeBadge = opts.showTypeBadge !== false
     ? `<span class="card-type-badge ${mt === 'tv' ? 'tv' : ''}">${mt === 'tv' ? 'TV' : 'Film'}</span>`
@@ -99,11 +274,11 @@ function buildCard(item, opts = {}) {
   const badges = opts.badges || '';
 
   const watchedBadge = opts.watched
-    ? `<span class="badge badge-watched" style="position:absolute;bottom:.4rem;left:.4rem">✓ Watched</span>`
+    ? `<span class="badge badge-watched" style="position:absolute;bottom:.4rem;left:.4rem">Watched</span>`
     : '';
 
   const newEpBadge = opts.newEp
-    ? `<span class="badge badge-new" style="position:absolute;bottom:.4rem;left:.4rem">● New Ep</span>`
+    ? `<span class="badge badge-new" style="position:absolute;bottom:.4rem;left:.4rem">New Ep</span>`
     : '';
 
   const progressHTML = opts.progress
@@ -111,24 +286,33 @@ function buildCard(item, opts = {}) {
        <div class="progress-bar"><div class="progress-fill" style="width:${opts.progress.pct}%"></div></div>`
     : '';
 
+  const saveButton = opts.showSaveButton
+    ? `<button class="card-save-btn ${saved ? 'saved' : ''}" onclick="event.stopPropagation();toggleWatchlistFromCard(event,'${mt}',${id})">${saved ? 'Saved' : 'Save'}</button>`
+    : '';
+
+  const reasonHTML = reasonLabel
+    ? `<div class="card-reason">${escape(reasonLabel)}</div>`
+    : '';
+
   return `
     <div class="card" data-id="${id}" data-type="${mt}" onclick="openDetail('${mt}',${id})">
       <div class="card-poster">
         ${posterHTML}
-        <div class="card-rating">★ ${r}</div>
+        <div class="card-rating">Rating ${r}</div>
         ${typeBadge}
         ${watchedBadge}${newEpBadge}${badges}
-        <button class="play-btn-card" onclick="event.stopPropagation();openStreamWizard('${mt}',${id},'${escape(t)}')" title="Stream this">▶</button>
+        ${saveButton}
+        <button class="play-btn-card" onclick="event.stopPropagation();openStreamWizard('${mt}',${id},'${escape(t)}')" title="Stream this">Play</button>
         <div class="card-overlay">
           <div class="card-quick-actions">
             <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();openDetail('${mt}',${id})">Details</button>
-            <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();openStreamWizard('${mt}',${id},'${escape(t)}')">▶ Play</button>
           </div>
         </div>
       </div>
       <div class="card-body">
         <div class="card-title">${escape(t)}</div>
         <div class="card-year">${y}</div>
+        ${reasonHTML}
         ${progressHTML}
       </div>
     </div>`;
@@ -145,7 +329,7 @@ function skeletonCards(n = 8) {
     </div>`).join('');
 }
 
-// ─── Pagination ───────────────────────────────────────────────────────────────
+// --- Pagination ---------------------------------------------------------------
 function buildPagination(currentPage, totalPages, onPageClick) {
   if (totalPages <= 1) return '';
   const maxVisible = 5;
@@ -162,18 +346,18 @@ function buildPagination(currentPage, totalPages, onPageClick) {
   }
 
   const btns = pages.map((p) => {
-    if (p === '...') return `<button disabled>…</button>`;
+    if (p === '...') return `<button disabled>...</button>`;
     return `<button class="${p === currentPage ? 'active' : ''}" onclick="(${onPageClick})(${p})">${p}</button>`;
   }).join('');
 
   return `<div class="pagination">
-    <button ${currentPage <= 1 ? 'disabled' : ''} onclick="(${onPageClick})(${currentPage - 1})">‹</button>
+    <button ${currentPage <= 1 ? 'disabled' : ''} onclick="(${onPageClick})(${currentPage - 1})">Prev</button>
     ${btns}
-    <button ${currentPage >= totalPages ? 'disabled' : ''} onclick="(${onPageClick})(${currentPage + 1})">›</button>
+    <button ${currentPage >= totalPages ? 'disabled' : ''} onclick="(${onPageClick})(${currentPage + 1})">Next</button>
   </div>`;
 }
 
-// ─── Hero ─────────────────────────────────────────────────────────────────────
+// --- Hero ---------------------------------------------------------------------
 function renderHero(items) {
   if (!items || items.length === 0) return '';
   state.heroItems = items.slice(0, 6);
@@ -198,17 +382,15 @@ function buildHeroSlide() {
       <div class="hero-bg" id="heroBg" style="background-image:url('${escape(backdrop || '')}')"></div>
       <div class="hero-gradient"></div>
       <div class="hero-content">
-        <div class="hero-badge">${mt === 'tv' ? '📺 TV Show' : '🎬 Movie'} · Trending</div>
+        <div class="hero-badge">${mt === 'tv' ? 'TV Show' : 'Movie'} - Trending</div>
         <h1 class="hero-title">${escape(title(item))}</h1>
         <div class="hero-meta">
-          <span class="hero-rating">★ ${rating(item)}</span>
+          <span class="hero-rating">Rating ${rating(item)}</span>
           <span>${year(item)}</span>
         </div>
         <p class="hero-overview">${escape(item.overview || '')}</p>
         <div class="hero-actions">
-          <button class="btn btn-primary" onclick="openDetail('${mt}',${item.id})">
-            ▶ Details
-          </button>
+          <button class="btn btn-primary" onclick="openDetail('${mt}',${item.id})">Details</button>
           <button class="btn btn-secondary" onclick="heroMarkWatched(${item.id},'${mt}')">
             + Watched
           </button>
@@ -250,14 +432,14 @@ function heroMarkWatched(id, type) {
 window.goHeroSlide = goHeroSlide;
 window.heroMarkWatched = heroMarkWatched;
 
-// ─── Genre Select Builder ─────────────────────────────────────────────────────
+// --- Genre Select Builder -----------------------------------------------------
 function buildGenreOptions(type) {
   const genres = state.genres[type] || [];
   return `<option value="">All Genres</option>` +
     genres.map((g) => `<option value="${g.id}">${g.name}</option>`).join('');
 }
 
-// ─── Router ───────────────────────────────────────────────────────────────────
+// --- Router -------------------------------------------------------------------
 const routes = {
   '/': renderHome,
   '/movies': renderMovies,
@@ -289,6 +471,12 @@ function route() {
   const path = getHash();
   const fn = routes[path] || renderHome;
 
+  if (state.currentPage === 'stream' && path !== '/stream') {
+    if (wizard.sseSource) { wizard.sseSource.close(); wizard.sseSource = null; }
+    clearWaitingTimer();
+    clearStreamStatusPolling();
+  }
+
   // Update active nav link
   document.querySelectorAll('.nav-link').forEach((el) => {
     el.classList.toggle('active',
@@ -304,7 +492,7 @@ function route() {
   fn();
 }
 
-// ─── Home Page ────────────────────────────────────────────────────────────────
+// --- Home Page ----------------------------------------------------------------
 async function renderHome() {
   state.currentPage = 'home';
   const app = document.getElementById('app');
@@ -335,21 +523,21 @@ async function renderHome() {
       <div class="section">
         <div class="section-header">
           <h2 class="section-title">Trending This Week</h2>
-          <a href="#/search" class="section-link">See all →</a>
+          <a href="#/search" class="section-link">See all -></a>
         </div>
         <div class="scroll-row">${trendingAllRow}</div>
       </div>
       <div class="section" style="background:var(--bg-2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)">
         <div class="section-header">
-          <h2 class="section-title">🎬 Trending Movies</h2>
-          <a href="#/movies" class="section-link">All Movies →</a>
+          <h2 class="section-title">Trending Movies</h2>
+          <a href="#/movies" class="section-link">All Movies -></a>
         </div>
         <div class="scroll-row">${moviesRow}</div>
       </div>
       <div class="section">
         <div class="section-header">
-          <h2 class="section-title">📺 Trending TV Shows</h2>
-          <a href="#/tv" class="section-link">All TV Shows →</a>
+          <h2 class="section-title">Trending TV Shows</h2>
+          <a href="#/tv" class="section-link">All TV Shows -></a>
         </div>
         <div class="scroll-row">${tvRow}</div>
       </div>`;
@@ -358,7 +546,7 @@ async function renderHome() {
   }
 }
 
-// ─── Movies Page ──────────────────────────────────────────────────────────────
+// --- Movies Page --------------------------------------------------------------
 async function renderMovies(page = 1, filters = {}) {
   state.currentPage = 'movies';
   const app = document.getElementById('app');
@@ -378,7 +566,7 @@ async function renderMovies(page = 1, filters = {}) {
       ${buildDiscoverSidebar('movie', filters, `renderMovies`)}
       <div class="page-content" id="moviesContent">
         <div class="page-header">
-          <h1 class="page-title">🎬 Movies</h1>
+          <h1 class="page-title">Movies</h1>
           <p class="page-subtitle">Discover films from every genre</p>
         </div>
         <div class="tabs">
@@ -417,7 +605,7 @@ async function renderMovies(page = 1, filters = {}) {
   }
 }
 
-// ─── TV Shows Page ────────────────────────────────────────────────────────────
+// --- TV Shows Page ------------------------------------------------------------
 async function renderTV(page = 1, filters = {}) {
   state.currentPage = 'tv';
   const app = document.getElementById('app');
@@ -437,7 +625,7 @@ async function renderTV(page = 1, filters = {}) {
       ${buildDiscoverSidebar('tv', filters, `renderTV`)}
       <div class="page-content">
         <div class="page-header">
-          <h1 class="page-title">📺 TV Shows</h1>
+          <h1 class="page-title">TV Shows</h1>
           <p class="page-subtitle">Browse series, anime, documentaries and more</p>
         </div>
         <div class="tabs">
@@ -476,7 +664,7 @@ async function renderTV(page = 1, filters = {}) {
   }
 }
 
-// ─── Discover Sidebar ─────────────────────────────────────────────────────────
+// --- Discover Sidebar ---------------------------------------------------------
 function buildDiscoverSidebar(type, filters, renderFn) {
   const sortOptions = [
     { v: 'popularity.desc', l: 'Most Popular' },
@@ -511,7 +699,7 @@ function buildDiscoverSidebar(type, filters, renderFn) {
         <div class="year-range">
           <input type="number" id="yearFrom_${type}" placeholder="From" min="1900" max="2030"
             value="${filters.yearFrom || ''}" onchange="applyFilters('${type}','${renderFn}')" />
-          <span>–</span>
+          <span>?</span>
           <input type="number" id="yearTo_${type}" placeholder="To" min="1900" max="2030"
             value="${filters.yearTo || ''}" onchange="applyFilters('${type}','${renderFn}')" />
         </div>
@@ -555,7 +743,7 @@ function applyFilters(type, renderFn) {
   else if (renderFn === 'renderRecommendations') renderRecommendations(1, filters);
 }
 
-// ─── Search Page ──────────────────────────────────────────────────────────────
+// --- Search Page --------------------------------------------------------------
 let searchDebounce = null;
 
 async function renderSearch(initialQuery = '') {
@@ -623,7 +811,7 @@ async function execSearch(page = 1, overrideQuery) {
     if (!data.results || data.results.length === 0) {
       resultsEl.innerHTML = `
         <div class="empty-state">
-          <div class="empty-icon">🔍</div>
+          <div class="empty-icon">No</div>
           <h3>No results for "${escape(q)}"</h3>
           <p>Try different keywords or check the spelling.</p>
         </div>`;
@@ -651,27 +839,79 @@ async function execSearch(page = 1, overrideQuery) {
 function buildSearchEmpty() {
   return `
     <div class="empty-state">
-      <div class="empty-icon">🎬</div>
+      <div class="empty-icon">Go</div>
       <h3>Search for anything</h3>
       <p>Type a movie title, TV show name, or actor to get started.</p>
     </div>`;
 }
 
-// ─── Recommendations Page ─────────────────────────────────────────────────────
+function buildRecommendationSummary(data = {}) {
+  const personalization = data.personalization || {};
+  const status = !personalization.meaningful
+    ? 'Warming up'
+    : personalization.fullyPersonalized
+      ? 'Tuned to your taste'
+      : 'Learning your pattern';
+  const topGenres = (personalization.topGenres || [])
+    .slice(0, 3)
+    .map((genre) => genre.label || genre.key)
+    .filter(Boolean);
+
+  return `
+    <div class="recs-summary-card">
+      <div>
+        <div class="recs-summary-kicker">${escape(status)}</div>
+        <h2 class="recs-summary-title">Personalized with multiple taste signals</h2>
+        <p class="recs-summary-text">
+          We combine watch history, stream starts, detail clicks, saved titles, genres, people, language, era, and quality preference into one ranking model.
+        </p>
+      </div>
+      <div class="recs-stat-row">
+        <span class="recs-stat-pill">Signals ${Math.round(personalization.positiveSignalWeight || 0)}</span>
+        <span class="recs-stat-pill">Watchlist ${data.watchlist?.total || 0}</span>
+        <span class="recs-stat-pill">Quality floor ${personalization.qualityFloor ? personalization.qualityFloor.toFixed(1) : '6.2'}+</span>
+      </div>
+      ${topGenres.length ? `<div class="recs-summary-tags">${topGenres.map((genre) => `<span class="genre-chip">${escape(genre)}</span>`).join('')}</div>` : ''}
+    </div>`;
+}
+
+function buildRecommendationSection(section) {
+  return `
+    <section class="recs-section">
+      <div class="recs-section-header">
+        <div>
+          <h2 class="recs-section-title">${escape(section.title || 'Recommendations')}</h2>
+          <p class="recs-section-subtitle">${escape(section.subtitle || '')}</p>
+        </div>
+      </div>
+      <div class="grid grid-lg">
+        ${(section.items || []).map((item) => buildCard(item, {
+          showTypeBadge: true,
+          mediaType: item.type || mediaType(item),
+          reasonLabel: item.reasonLabel,
+          showSaveButton: true,
+          saved: !!item.isSaved,
+        })).join('')}
+      </div>
+    </section>`;
+}
+
+// --- Recommendations Page -----------------------------------------------------
 async function renderRecommendations(page = 1, filters = {}) {
   state.currentPage = 'recommendations';
   const app = document.getElementById('app');
+  await ensureWatchlistLoaded();
 
   app.innerHTML = `
     <div class="page-layout">
       ${buildRecommendationsSidebar(filters)}
       <div class="page-content">
         <div class="page-header">
-          <h1 class="page-title">✨ For You</h1>
-          <p class="page-subtitle">Recommendations based on your watch history</p>
+          <h1 class="page-title">For You</h1>
+          <p class="page-subtitle">Ranked by your watch behavior, saved titles, recurring tastes, and discovery balance</p>
         </div>
-        <div class="grid grid-lg" id="recsGrid">${skeletonCards(12)}</div>
-        <div id="recsPagination"></div>
+        <div id="recsSummary">${skeletonCards(1)}</div>
+        <div id="recsGrid">${skeletonCards(12)}</div>
       </div>
     </div>`;
 
@@ -687,34 +927,24 @@ async function renderRecommendations(page = 1, filters = {}) {
   try {
     const data = await api(`/api/recommendations?${params}`);
     const grid = document.getElementById('recsGrid');
-    const pag = document.getElementById('recsPagination');
+    const summary = document.getElementById('recsSummary');
+    const sidebarMeta = document.getElementById('recsSidebarMeta');
     if (!grid) return;
+    if (summary) summary.innerHTML = buildRecommendationSummary(data);
+    if (sidebarMeta) sidebarMeta.innerHTML = buildRecommendationsSidebarMeta(data);
 
-    if (!data.results || data.results.length === 0) {
+    if (!data.sections || data.sections.length === 0) {
       grid.innerHTML = `
         <div class="empty-state" style="grid-column:1/-1">
-          <div class="empty-icon">🎯</div>
+          <div class="empty-icon">New</div>
           <h3>No recommendations yet</h3>
-          <p>Start watching some movies or TV shows and they'll appear here.<br/>
+          <p>Start watching, saving, and opening a few titles so the ranking model can learn your taste.<br/>
           Browse <a href="#/movies" style="color:var(--accent)">Movies</a> or <a href="#/tv" style="color:var(--accent)">TV Shows</a> to get started.</p>
         </div>`;
       return;
     }
 
-    grid.innerHTML = data.results.map((item) =>
-      buildCard(item, { showTypeBadge: true })
-    ).join('');
-
-    if (data.source === 'trending') {
-      const notice = document.createElement('p');
-      notice.className = 'text-muted';
-      notice.style.cssText = 'font-size:.8rem;margin-bottom:1rem';
-      notice.textContent = 'Showing trending content — add more to your history for personalised picks.';
-      grid.before(notice);
-    }
-
-    pag.innerHTML = buildPagination(page, data.total_pages,
-      `(p) => renderRecommendations(p, window._recsFilters || {})`);
+    grid.innerHTML = data.sections.map((section) => buildRecommendationSection(section)).join('');
 
     window._recsFilters = filters;
     window._currentFilters_recs = filters;
@@ -722,6 +952,29 @@ async function renderRecommendations(page = 1, filters = {}) {
     const grid = document.getElementById('recsGrid');
     if (grid) grid.innerHTML = errorState(e);
   }
+}
+
+function buildRecommendationsSidebarMeta(data = {}) {
+  const personalization = data.personalization || {};
+  const topGenres = (personalization.topGenres || [])
+    .slice(0, 4)
+    .map((genre) => genre.label || genre.key)
+    .filter(Boolean);
+  const status = !personalization.meaningful
+    ? 'Cold start'
+    : personalization.fullyPersonalized
+      ? 'High-confidence profile'
+      : 'Hybrid profile';
+
+  return `
+    <div class="sidebar-group">
+      <label class="sidebar-label">Profile</label>
+      <div class="recs-profile-box">
+        <div class="recs-profile-title">${escape(status)}</div>
+        <div class="recs-profile-text">Signals ${Math.round(personalization.positiveSignalWeight || 0)} • Watchlist ${data.watchlist?.total || 0}</div>
+        ${topGenres.length ? `<div class="recs-profile-tags">${topGenres.map((genre) => `<span class="genre-chip">${escape(genre)}</span>`).join('')}</div>` : '<div class="recs-profile-text">Open details, save titles, and stream more to sharpen results.</div>'}
+      </div>
+    </div>`;
 }
 
 function buildRecommendationsSidebar(filters) {
@@ -733,6 +986,13 @@ function buildRecommendationsSidebar(filters) {
   return `
     <aside class="sidebar">
       <div class="sidebar-title">Filters</div>
+      <div class="sidebar-group">
+        <label class="sidebar-label">How This Works</label>
+        <div class="recs-profile-box">
+          <div class="recs-profile-text">Filters refine your personalized pool. They do not replace the recommendation model.</div>
+        </div>
+      </div>
+      <div id="recsSidebarMeta"></div>
 
       <div class="sidebar-group">
         <label class="sidebar-label">Type</label>
@@ -755,7 +1015,7 @@ function buildRecommendationsSidebar(filters) {
         <div class="year-range">
           <input type="number" id="yearFrom_recs" placeholder="From" min="1900" max="2030"
             value="${filters.yearFrom || ''}" onchange="applyRecsFilters()" />
-          <span>–</span>
+          <span>?</span>
           <input type="number" id="yearTo_recs" placeholder="To" min="1900" max="2030"
             value="${filters.yearTo || ''}" onchange="applyRecsFilters()" />
         </div>
@@ -796,7 +1056,7 @@ function applyRecsFilters() {
   });
 }
 
-// ─── History Page ─────────────────────────────────────────────────────────────
+// --- History Page -------------------------------------------------------------
 async function renderHistory() {
   state.currentPage = 'history';
   const app = document.getElementById('app');
@@ -804,7 +1064,7 @@ async function renderHistory() {
   app.innerHTML = `
     <div class="history-header">
       <div class="page-header" style="margin-bottom:0">
-        <h1 class="page-title">📋 Watch History</h1>
+        <h1 class="page-title">Watch History</h1>
         <p class="page-subtitle">Everything you've marked as watched</p>
       </div>
     </div>
@@ -833,7 +1093,7 @@ async function renderHistory() {
           <div class="new-ep-info">
             <div class="new-ep-title">${escape(ep.title)}</div>
             <div class="new-ep-detail">
-              You watched S${ep.lastWatchedSeason}E${ep.lastWatchedEpisode} —
+              You watched S${ep.lastWatchedSeason}E${ep.lastWatchedEpisode} -
               New: S${ep.latestSeason}E${ep.latestEpisode} "${escape(ep.latestEpisodeName || '')}"
               ${ep.latestAirDate ? `(${formatDate(ep.latestAirDate)})` : ''}
             </div>
@@ -843,7 +1103,7 @@ async function renderHistory() {
 
       document.getElementById('newEpsBanner').innerHTML = `
         <div class="new-episodes-banner">
-          <h3>🔔 New Episodes Available (${newEps.length})</h3>
+          <h3>New Episodes Available (${newEps.length})</h3>
           <div class="new-ep-list">${items}</div>
         </div>`;
     }
@@ -866,7 +1126,7 @@ function renderHistMovies(db) {
   if (movies.length === 0) {
     el.innerHTML = `
       <div class="empty-state">
-        <div class="empty-icon">🎬</div>
+        <div class="empty-icon">0</div>
         <h3>No movies in history</h3>
         <p>Browse <a href="#/movies" style="color:var(--accent)">Movies</a> and mark them as watched.</p>
       </div>`;
@@ -891,7 +1151,7 @@ function renderHistTV(db) {
   if (shows.length === 0) {
     el.innerHTML = `
       <div class="empty-state">
-        <div class="empty-icon">📺</div>
+        <div class="empty-icon">0</div>
         <h3>No TV shows in history</h3>
         <p>Browse <a href="#/tv" style="color:var(--accent)">TV Shows</a> and track your episodes.</p>
       </div>`;
@@ -915,7 +1175,7 @@ function renderHistTV(db) {
 }
 
 function buildRemoveBtn(type, id) {
-  // Not directly in card HTML — handled via modal
+  // Not directly in card HTML ? handled via modal
   return '';
 }
 
@@ -928,7 +1188,7 @@ function switchHistTab(tab) {
   if (tvEl) tvEl.style.display = tab === 'tv' ? '' : 'none';
 }
 
-// ─── Detail Modal ─────────────────────────────────────────────────────────────
+// --- Detail Modal -------------------------------------------------------------
 async function openDetail(type, id) {
   const overlay = document.getElementById('modalOverlay');
   const content = document.getElementById('modalContent');
@@ -938,15 +1198,18 @@ async function openDetail(type, id) {
   content.innerHTML = `<div class="page-loader"><div class="spinner"></div></div>`;
 
   try {
+    await ensureWatchlistLoaded();
     const item = await api(`/api/detail/${type}/${id}`);
+    trackRecommendationEvent('detail_click', type, id, item, { silent: true });
     const t = item.title || item.name;
     const backdrop = BACKDROP(item.backdrop_path);
     const poster = POSTER(item.poster_path);
-    const r = item.vote_average ? item.vote_average.toFixed(1) : '—';
+    const r = item.vote_average ? item.vote_average.toFixed(1) : '?';
     const genres = (item.genres || []).map((g) => `<span class="genre-chip">${g.name}</span>`).join('');
     const runtime = item.runtime ? `${item.runtime} min` :
       (item.episode_run_time && item.episode_run_time[0] ? `${item.episode_run_time[0]} min/ep` : '');
     const cast = (item.credits?.cast || []).slice(0, 12);
+    const savedToWatchlist = isSavedToWatchlist(type, id);
 
     const castHTML = cast.length ? `
       <h3 class="modal-section-title">Cast</h3>
@@ -954,7 +1217,7 @@ async function openDetail(type, id) {
         ${cast.map((c) => {
           const photo = c.profile_path
             ? `<img class="cast-photo" src="${AVATAR(c.profile_path)}" alt="${escape(c.name)}" loading="lazy" />`
-            : `<div class="cast-photo" style="display:flex;align-items:center;justify-content:center;font-size:1.5rem;background:var(--bg-3)">👤</div>`;
+            : `<div class="cast-photo" style="display:flex;align-items:center;justify-content:center;font-size:1.5rem;background:var(--bg-3)">Cast</div>`;
           return `<div class="cast-card">${photo}<div class="cast-name">${escape(c.name)}</div><div class="cast-character">${escape(c.character || '')}</div></div>`;
         }).join('')}
       </div>` : '';
@@ -970,7 +1233,7 @@ async function openDetail(type, id) {
             <div class="season-item">
               <div class="season-header" onclick="toggleSeason(this, ${item.id}, ${s.season_number})">
                 <h4>${escape(s.name)}</h4>
-                <span>${s.episode_count} episodes · ${s.air_date ? s.air_date.slice(0,4) : ''}</span>
+                <span>${s.episode_count} episodes - ${s.air_date ? s.air_date.slice(0,4) : ''}</span>
               </div>
               <div class="season-episodes" id="season-${item.id}-${s.season_number}">
                 <div class="page-loader" style="min-height:60px"><div class="spinner" style="width:24px;height:24px"></div></div>
@@ -986,6 +1249,19 @@ async function openDetail(type, id) {
         tmdbId: id,
         title: t,
         poster_path: item.poster_path,
+        backdrop_path: item.backdrop_path,
+        release_date: item.release_date,
+        first_air_date: item.first_air_date,
+        genres: item.genres,
+        genre_ids: (item.genres || []).map((genre) => genre.id),
+        vote_average: item.vote_average,
+        popularity: item.popularity,
+        original_language: item.original_language,
+        runtime: item.runtime,
+        episode_run_time: item.episode_run_time,
+        credits: item.credits,
+        belongs_to_collection: item.belongs_to_collection,
+        created_by: item.created_by,
         ...(type === 'tv' && { totalSeasons: item.number_of_seasons }),
       },
     };
@@ -998,29 +1274,32 @@ async function openDetail(type, id) {
           <h2 class="modal-title">${escape(t)}</h2>
           ${item.tagline ? `<p class="modal-tagline">"${escape(item.tagline)}"</p>` : ''}
           <div class="modal-meta">
-            <span class="modal-meta-item"><span class="rating">★ ${r}</span> / 10</span>
-            ${year(item) ? `<span class="modal-meta-item">📅 ${year(item)}</span>` : ''}
-            ${runtime ? `<span class="modal-meta-item">⏱ ${runtime}</span>` : ''}
-            ${item.status ? `<span class="modal-meta-item">● ${item.status}</span>` : ''}
-            ${item.number_of_seasons ? `<span class="modal-meta-item">📺 ${item.number_of_seasons} season${item.number_of_seasons > 1 ? 's' : ''}</span>` : ''}
+            <span class="modal-meta-item"><span class="rating">Rating ${r}</span> / 10</span>
+            ${year(item) ? `<span class="modal-meta-item">Year ${year(item)}</span>` : ''}
+            ${runtime ? `<span class="modal-meta-item">Runtime ${runtime}</span>` : ''}
+            ${item.status ? `<span class="modal-meta-item">Status ${item.status}</span>` : ''}
+            ${item.number_of_seasons ? `<span class="modal-meta-item">Seasons ${item.number_of_seasons}</span>` : ''}
             ${item.number_of_episodes ? `<span class="modal-meta-item">${item.number_of_episodes} episodes</span>` : ''}
-            ${item.original_language ? `<span class="modal-meta-item">🌐 ${item.original_language.toUpperCase()}</span>` : ''}
+            ${item.original_language ? `<span class="modal-meta-item">Lang ${item.original_language.toUpperCase()}</span>` : ''}
           </div>
           <div class="modal-genres">${genres}</div>
           <p class="modal-overview">${escape(item.overview || 'No overview available.')}</p>
           <div class="modal-actions">
             <button class="btn btn-primary" style="font-size:1rem;padding:.7rem 1.6rem" onclick="closeModal();openStreamWizard('${type}',${id},'${escape(t)}')">
-              ▶ Stream
+              Stream
+            </button>
+            <button class="btn btn-outline" id="modalWatchlistBtn" onclick="toggleCurrentModalWatchlist()">
+              ${savedToWatchlist ? 'Saved' : 'Save'}
             </button>
             <button class="btn btn-secondary" onclick="markCurrentModalItem()">
-              ✓ Watched
+              Mark Watched
             </button>
             <button class="btn btn-danger btn-sm" onclick="removeHistoryFromModal('${type}',${id})">
               Remove
             </button>
           </div>
           <div class="cli-hint">
-            💡 CLI: <code>uplayer "${escape(t)}"</code>
+            CLI: <code>uplayer "${escape(t)}"</code>
           </div>
         </div>
       </div>
@@ -1054,7 +1333,7 @@ async function toggleSeason(headerEl, showId, seasonNum) {
             <div class="ep-date">${ep.air_date ? formatDate(ep.air_date) : 'TBA'}</div>
           </div>
           <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();markEpWatched(${showId}, '${escape(data.name || '')}', ${ep.season_number}, ${ep.episode_number}, event)">
-            ✓
+            Mark
           </button>
         </div>`).join('');
       episodesEl.innerHTML = eps || '<p class="text-muted" style="padding:.5rem;font-size:.8rem">No episodes found</p>';
@@ -1081,6 +1360,31 @@ async function markCurrentModalItem() {
   await markWatched(m.type, m.item);
 }
 
+async function toggleCurrentModalWatchlist() {
+  const modal = window._modalItem;
+  if (!modal) return;
+  const result = await toggleWatchlistItem(modal.type, modal.item);
+  const btn = document.getElementById('modalWatchlistBtn');
+  if (btn) {
+    btn.textContent = result.saved ? 'Saved' : 'Save';
+  }
+  if (state.currentPage === 'recommendations') {
+    renderRecommendations(1, window._recsFilters || {});
+  }
+}
+
+async function toggleWatchlistFromCard(event, type, id) {
+  if (event) event.stopPropagation();
+  const item = {
+    tmdbId: id,
+    title: event?.currentTarget?.closest('.card')?.querySelector('.card-title')?.textContent || 'Unknown',
+  };
+  await toggleWatchlistItem(type, item);
+  if (state.currentPage === 'recommendations') {
+    renderRecommendations(1, window._recsFilters || {});
+  }
+}
+
 async function markWatchedFromDetail(type, item) {
   await markWatched(type, item);
 }
@@ -1090,7 +1394,7 @@ async function removeHistoryFromModal(type, id) {
   closeModal();
 }
 
-// ─── Close Modal ──────────────────────────────────────────────────────────────
+// --- Close Modal --------------------------------------------------------------
 function closeModal() {
   const overlay = document.getElementById('modalOverlay');
   overlay.classList.remove('open');
@@ -1105,7 +1409,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeModal();
 });
 
-// ─── Nav Search ───────────────────────────────────────────────────────────────
+// --- Nav Search ---------------------------------------------------------------
 function doNavSearch() {
   const q = document.getElementById('navSearchInput').value.trim();
   if (!q) return;
@@ -1118,22 +1422,22 @@ document.getElementById('navSearchInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') doNavSearch();
 });
 
-// ─── Hamburger ────────────────────────────────────────────────────────────────
+// --- Hamburger ----------------------------------------------------------------
 document.getElementById('hamburger').addEventListener('click', () => {
   document.getElementById('navLinks').classList.toggle('open');
 });
 
-// ─── Navbar scroll effect ─────────────────────────────────────────────────────
+// --- Navbar scroll effect -----------------------------------------------------
 window.addEventListener('scroll', () => {
   document.getElementById('navbar').style.background =
     window.scrollY > 50 ? 'rgba(11,12,15,0.97)' : 'rgba(11,12,15,0.85)';
 }, { passive: true });
 
-// ─── Error / Empty helpers ────────────────────────────────────────────────────
+// --- Error / Empty helpers ----------------------------------------------------
 function errorState(e) {
   return `
     <div class="empty-state">
-      <div class="empty-icon">⚠️</div>
+      <div class="empty-icon">!</div>
       <h3>Something went wrong</h3>
       <p>${escape(e.message || 'Unknown error')}</p>
     </div>`;
@@ -1142,13 +1446,13 @@ function errorState(e) {
 function emptyCards() {
   return `
     <div class="empty-state" style="grid-column:1/-1">
-      <div class="empty-icon">🎬</div>
+      <div class="empty-icon">0</div>
       <h3>No results found</h3>
       <p>Try adjusting your filters.</p>
     </div>`;
 }
 
-// ─── Streaming Wizard ─────────────────────────────────────────────────────────
+// --- Streaming Wizard ---------------------------------------------------------
 
 const wizard = {
   type: null,      // 'movie' | 'tv'
@@ -1170,29 +1474,205 @@ const wizard = {
   selectedLang: 'en',
   subtitles: [],
   selectedSubtitle: null,
-  subtitlePath: null,
+  subtitleToken: null,
+  subtitleTokenExpiresAt: null,
   skipSubtitles: false,
-  useLightweightPlayer: false, // opt-in: only use lightweight player when explicitly checked
   // Stream
   sessionId: null,
   sseSource: null,
   playerUrl: null,
+  detail: null,
+  historySaved: false,
   // Step
   step: 1, // 1=episode(TV)/torrent(movie), 2=torrents, 3=subtitles, 4=streaming
 };
+
+const WIZARD_STORAGE_KEY = 'uplayer.stream.wizard.v2';
+const WIZARD_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+function getWizardSnapshot() {
+  return {
+    type: wizard.type,
+    tmdbId: wizard.tmdbId,
+    titleText: wizard.titleText,
+    tmdbYear: wizard.tmdbYear,
+    selectedSeason: wizard.selectedSeason,
+    selectedEpisode: wizard.selectedEpisode,
+    selectedLang: wizard.selectedLang,
+    selectedTorrent: wizard.selectedTorrent,
+    resolvedMagnet: wizard.resolvedMagnet,
+    subtitleToken: wizard.subtitleToken,
+    subtitleTokenExpiresAt: wizard.subtitleTokenExpiresAt,
+    skipSubtitles: wizard.skipSubtitles,
+    sessionId: wizard.sessionId,
+    playerUrl: wizard.playerUrl,
+    step: wizard.step,
+    savedAt: Date.now(),
+  };
+}
+
+function persistWizardState() {
+  try {
+    if (!wizard.type || !wizard.tmdbId) return;
+    sessionStorage.setItem(WIZARD_STORAGE_KEY, JSON.stringify(getWizardSnapshot()));
+  } catch (e) {
+    // Ignore storage write failures.
+  }
+}
+
+function clearWizardState() {
+  try {
+    sessionStorage.removeItem(WIZARD_STORAGE_KEY);
+  } catch (e) {
+    // Ignore storage delete failures.
+  }
+}
+
+function loadWizardState(expectedType, expectedId) {
+  try {
+    const raw = sessionStorage.getItem(WIZARD_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.savedAt) return null;
+    if (Date.now() - parsed.savedAt > WIZARD_MAX_AGE_MS) return null;
+    if (parsed.type !== expectedType) return null;
+    if (Number(parsed.tmdbId) !== Number(expectedId)) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function loadAnyWizardState() {
+  try {
+    const raw = sessionStorage.getItem(WIZARD_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.savedAt) return null;
+    if (Date.now() - parsed.savedAt > WIZARD_MAX_AGE_MS) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
 
 function openStreamWizard(type, tmdbId, titleText) {
   // Navigate to the stream page with parameters
   navigate(`/stream?type=${type}&id=${tmdbId}&title=${encodeURIComponent(titleText)}`);
 }
 
+function buildWizardHistoryItem() {
+  const detail = wizard.detail || {};
+  const item = {
+    tmdbId: wizard.tmdbId,
+    title: wizard.titleText || title(detail),
+    poster_path: detail.poster_path,
+    backdrop_path: detail.backdrop_path,
+    release_date: detail.release_date,
+    first_air_date: detail.first_air_date,
+  };
+
+  if (wizard.type === 'tv') {
+    item.totalSeasons = detail.number_of_seasons || wizard.seasons.length || undefined;
+    if (wizard.selectedSeason) item.lastSeason = wizard.selectedSeason;
+    if (wizard.selectedEpisode) item.lastEpisode = wizard.selectedEpisode;
+  }
+
+  return normalizeHistoryItem(wizard.type, item);
+}
+
+async function saveWizardHistoryIfNeeded() {
+  if (wizard.historySaved || !wizard.type || !wizard.tmdbId) return;
+  const item = buildWizardHistoryItem();
+  if (!item.tmdbId) return;
+  try {
+    await markWatched(wizard.type, item, { silent: true });
+    wizard.historySaved = true;
+  } catch (e) {
+    console.warn('Failed to save watch history:', e);
+  }
+}
+
+async function resolveActivePlayerUrl(fallbackUrl) {
+  const normalizedFallback = fallbackUrl && fallbackUrl !== '#' ? fallbackUrl : null;
+  try {
+    const active = await fetchJson('/api/stream/status');
+    const running = active.find((session) => session.playerUrl && (session.running || !session.exited))
+      || active.find((session) => session.playerUrl);
+    if (running && running.playerUrl) {
+      return running.playerUrl;
+    }
+  } catch (e) {
+    // Ignore polling errors and fall back to the rendered URL.
+  }
+  return normalizedFallback || wizard.playerUrl || null;
+}
+
+function openActivePlayer(event, fallbackUrl) {
+  if (event) event.preventDefault();
+  let popup = null;
+  try {
+    popup = window.open('', '_blank');
+    if (popup) {
+      popup.opener = null;
+    }
+  } catch (e) {
+    popup = null;
+  }
+
+  resolveActivePlayerUrl(fallbackUrl).then((url) => {
+    if (url) {
+      if (popup && !popup.closed) popup.location.replace(url);
+      else window.open(url, '_blank', 'noopener');
+      return;
+    }
+
+    if (popup && !popup.closed) popup.close();
+    if (state.currentPage !== 'stream') navigate('/stream');
+    toast('Player is still starting', 'info');
+  }).catch(() => {
+    if (popup && !popup.closed) popup.close();
+    toast('Could not open the active player', 'error');
+  });
+
+  return false;
+}
+
+function goBackFromWizard() {
+  const fallback = wizard.type === 'tv' ? '/tv' : '/movies';
+  try {
+    const hasHistory = window.history.length > 1;
+    const sameOriginReferrer = document.referrer && new URL(document.referrer).origin === window.location.origin;
+    if (hasHistory && sameOriginReferrer) {
+      window.history.back();
+      return;
+    }
+  } catch (e) {
+    // Ignore referrer parsing issues and use the fallback route.
+  }
+  navigate(fallback);
+}
+
 // Entry point called by route()
 async function renderStreamPage() {
   state.currentPage = 'stream';
   const params = getHashParams();
-  const type = params.get('type') || 'movie';
-  const tmdbId = params.get('id');
-  const titleText = params.get('title') || '';
+  const routeType = params.get('type');
+  const routeTmdbId = params.get('id');
+  const routeTitleText = params.get('title') || '';
+  const restoredAny = loadAnyWizardState();
+
+  let activeSessions = [];
+  try {
+    activeSessions = await fetchJson('/api/stream/status');
+  } catch (e) {
+    activeSessions = [];
+  }
+  const runningSession = activeSessions.find((session) => session.running || !session.exited) || null;
+
+  const type = routeType || restoredAny?.type || 'movie';
+  const tmdbId = routeTmdbId || (restoredAny?.tmdbId != null ? String(restoredAny.tmdbId) : '');
+  const titleText = routeTitleText || restoredAny?.titleText || (runningSession ? 'Active Stream' : '');
 
   // Reset wizard state
   Object.assign(wizard, {
@@ -1202,8 +1682,9 @@ async function renderStreamPage() {
     episodes: [], selectedEpisode: null,
     torrents: [], selectedTorrent: null, resolvedMagnet: null,
     subtitleLangs: [], selectedLang: 'en',
-    subtitles: [], selectedSubtitle: null, subtitlePath: null, skipSubtitles: false, useLightweightPlayer: false,
+    subtitles: [], selectedSubtitle: null, subtitleToken: null, subtitleTokenExpiresAt: null, skipSubtitles: false,
     sessionId: null, playerUrl: null,
+    detail: null, historySaved: false,
     step: type === 'tv' ? 1 : 2,
   });
 
@@ -1214,6 +1695,7 @@ async function renderStreamPage() {
   if (tmdbId) {
     try {
       const detail = await api(`/api/detail/${type}/${tmdbId}`);
+      wizard.detail = detail;
       wizard.tmdbYear = year(detail);
       if (type === 'tv') {
         wizard.seasons = (detail.seasons || []).filter((s) => s.season_number > 0);
@@ -1228,7 +1710,116 @@ async function renderStreamPage() {
     wizard.subtitleLangs = [{ code: 'en', label: 'English' }];
   }
 
+  const restored = tmdbId ? loadWizardState(type, tmdbId) : restoredAny;
+  if (restored) {
+    Object.assign(wizard, {
+      selectedSeason: restored.selectedSeason || null,
+      selectedEpisode: restored.selectedEpisode || null,
+      selectedLang: restored.selectedLang || 'en',
+      selectedTorrent: restored.selectedTorrent || null,
+      resolvedMagnet: restored.resolvedMagnet || null,
+      subtitleToken: restored.subtitleToken || null,
+      subtitleTokenExpiresAt: restored.subtitleTokenExpiresAt || null,
+      skipSubtitles: !!restored.skipSubtitles,
+      sessionId: restored.sessionId || null,
+      playerUrl: restored.playerUrl || null,
+      step: restored.step || (type === 'tv' ? 1 : 2),
+    });
+  }
+
+  if (runningSession) {
+    wizard.sessionId = runningSession.id;
+    wizard.playerUrl = runningSession.playerUrl || wizard.playerUrl || null;
+    wizard.step = 4;
+    if (!wizard.titleText) {
+      wizard.titleText = restored?.titleText || 'Active Stream';
+    }
+  }
+
+  if (!tmdbId && !restored && !runningSession) {
+    renderEmptyStreamPage();
+    clearWizardState();
+    updateNavStreamIndicator(false);
+    return;
+  }
+
   renderWizardUI();
+  persistWizardState();
+
+  if (wizard.step === 4) {
+    await resumeStreamSession();
+  }
+}
+
+function renderEmptyStreamPage() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="page-layout" style="display:block">
+      <div class="page-content" style="max-width:900px;margin:0 auto;padding-top:2rem">
+        <div class="page-header">
+          <h1 class="page-title">Stream</h1>
+          <p class="page-subtitle">No active stream session is attached right now.</p>
+        </div>
+        <div class="empty-state">
+          <div class="empty-icon">0</div>
+          <h3>No active stream</h3>
+          <p>Start a movie or TV stream from the library and this page will show the live session, player link, and runtime status.</p>
+          <div style="display:flex;gap:.75rem;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="navigate('/movies')">Browse Movies</button>
+            <button class="btn btn-outline" onclick="navigate('/tv')">Browse TV Shows</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function resumeStreamSession() {
+  let active = [];
+  try {
+    active = await fetchJson('/api/stream/status');
+  } catch (e) {
+    return false;
+  }
+
+  const session = active.find((s) => s.id === wizard.sessionId)
+    || active.find((s) => s.running || !s.exited)
+    || null;
+
+  if (!session) {
+    updateNavStreamIndicator(false);
+    return false;
+  }
+
+  wizard.sessionId = session.id;
+  wizard.playerUrl = session.playerUrl || wizard.playerUrl || null;
+  wizard.step = 4;
+  persistWizardState();
+
+  const badge = document.getElementById('streamStatusBadge');
+  const directLink = document.getElementById('directPlayerLink');
+
+  if (wizard.playerUrl) {
+    showPlayerBanner(wizard.playerUrl);
+    updateNavStreamIndicator(true, wizard.playerUrl);
+    if (directLink) {
+      directLink.href = wizard.playerUrl;
+      directLink.style.display = '';
+    }
+    if (badge) {
+      badge.innerHTML = '<span style="color:var(--green)">Live</span>';
+    }
+    clearWaitingTimer();
+  } else {
+    updateNavStreamIndicator(true);
+    if (badge) {
+      badge.innerHTML = '<span style="color:var(--text-muted)">Reconnecting...</span>';
+    }
+    startWaitingTimer();
+  }
+
+  connectStreamSSE(session.id);
+  startStreamStatusPolling();
+  return true;
 }
 
 function renderWizardUI() {
@@ -1254,22 +1845,22 @@ function renderWizardUI() {
       : '';
     return `
       <div class="wizard-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}">
-        <div class="wizard-step-dot">${isDone ? '✓' : s.n}</div>
+        <div class="wizard-step-dot">${isDone ? 'OK' : s.n}</div>
         <span class="wizard-step-label">${s.label}</span>
       </div>${lineAfter}`;
   }).join('');
 
-  const typeLabel = wizard.type === 'tv' ? '📺' : '🎬';
+  const typeBadgeText = wizard.type === 'tv' ? 'TV Show' : 'Movie';
   const epSuffix = (wizard.type === 'tv' && wizard.selectedSeason && wizard.selectedEpisode)
-    ? ` — S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`
+    ? ` - S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`
     : '';
 
   app.innerHTML = `
     <div class="wizard-page">
       <div class="wizard-header">
         <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:.5rem">
-          <button class="btn btn-outline btn-sm" onclick="history.back()">← Back</button>
-          <span class="badge badge-episode" style="font-size:.8rem">${typeLabel} ${wizard.type === 'tv' ? 'TV Show' : 'Movie'}</span>
+          <button class="btn btn-outline btn-sm" onclick="goBackFromWizard()">Back</button>
+          <span class="badge badge-episode" style="font-size:.8rem">${typeBadgeText}</span>
         </div>
         <h1 class="wizard-title">${escape(wizard.titleText)}${epSuffix}</h1>
         <p class="wizard-subtitle">Follow the steps to search and stream</p>
@@ -1290,7 +1881,7 @@ function renderWizardStep() {
   else if (wizard.step === 4) renderWizardStep4(panel);
 }
 
-// ── Step 1: Season & Episode picker (TV only) ─────────────────────────────────
+// -- Step 1: Season & Episode picker (TV only) ---------------------------------
 function renderWizardStep1(panel) {
   const seasons = wizard.seasons;
 
@@ -1306,7 +1897,7 @@ function renderWizardStep1(panel) {
 
   panel.innerHTML = `
     <div class="wizard-panel">
-      <div class="wizard-panel-title">📺 Select Season & Episode</div>
+      <div class="wizard-panel-title">Select Season and Episode</div>
       <div class="season-tabs" id="seasonTabs">${seasonTabsHTML}</div>
       <div id="episodeGrid" class="episode-grid">
         <div class="page-loader" style="grid-column:1/-1;min-height:80px"><div class="spinner"></div></div>
@@ -1315,12 +1906,12 @@ function renderWizardStep1(panel) {
         <span class="text-muted" style="font-size:.8rem" id="epSelection">
           ${wizard.selectedSeason && wizard.selectedEpisode
             ? `Selected: S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`
-            : 'No episode selected yet'}
+            : 'Select an episode to enable torrent search'}
         </span>
         <div class="wizard-nav-right">
           <button class="btn btn-primary" onclick="wizardStep1Next()" id="step1Next"
             ${wizard.selectedEpisode ? '' : 'disabled'}>
-            Search Torrents →
+            Search Torrents
           </button>
         </div>
       </div>
@@ -1332,6 +1923,7 @@ function renderWizardStep1(panel) {
 async function wizardSelectSeason(n) {
   wizard.selectedSeason = n;
   wizard.selectedEpisode = null;
+  persistWizardState();
   document.querySelectorAll('.season-tab').forEach((t, i) => {
     t.classList.toggle('active', wizard.seasons[i]?.season_number === n);
   });
@@ -1369,18 +1961,20 @@ function wizardSelectEpisode(n) {
   if (btn) btn.disabled = false;
   // Update wizard title
   const h1 = document.querySelector('.wizard-title');
-  if (h1) h1.textContent = `${wizard.titleText} — S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`;
+  if (h1) h1.textContent = `${wizard.titleText} - S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`;
+  persistWizardState();
 }
 
 function wizardStep1Next() {
   if (!wizard.selectedEpisode) return;
   wizard.step = 2;
+  persistWizardState();
   renderWizardUI();
   // Auto-start torrent search
   setTimeout(() => wizardSearchTorrents(), 100);
 }
 
-// ── Step 2: Torrent search & selection ───────────────────────────────────────
+// -- Step 2: Torrent search & selection ---------------------------------------
 function renderWizardStep2(panel) {
   const searchLabel = wizard.type === 'tv' && wizard.selectedSeason && wizard.selectedEpisode
     ? `${wizard.titleText} S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`
@@ -1388,23 +1982,23 @@ function renderWizardStep2(panel) {
 
   panel.innerHTML = `
     <div class="wizard-panel">
-      <div class="wizard-panel-title">🔍 Find Torrents
+      <div class="wizard-panel-title">Find Torrents
         <span style="font-size:.75rem;font-weight:400;color:var(--text-muted);margin-left:.5rem">${escape(searchLabel)}</span>
       </div>
       <div id="torrentSearchStatus" style="font-size:.85rem;color:var(--text-muted);margin-bottom:.75rem;display:flex;align-items:center;gap:.5rem">
         <div class="spinner" style="width:16px;height:16px;border-width:2px"></div>
-        Searching 4 sources (1337x, YTS, PirateBay, Nyaa)…
+        Searching 4 sources (1337x, YTS, PirateBay, Nyaa)...
       </div>
       <div class="torrent-list" id="torrentList">
         ${wizard.torrents.length > 0 ? renderTorrentItems() : ''}
       </div>
       <div class="wizard-nav">
-        ${wizard.type === 'tv' ? `<button class="btn btn-outline btn-sm" onclick="wizardGoStep(1)">← Back</button>` : `<button class="btn btn-outline btn-sm" onclick="history.back()">← Back</button>`}
+        ${wizard.type === 'tv' ? `<button class="btn btn-outline btn-sm" onclick="wizardGoStep(1)">Back</button>` : `<button class="btn btn-outline btn-sm" onclick="history.back()">Back</button>`}
         <div class="wizard-nav-right">
-          <button class="btn btn-outline btn-sm" onclick="wizardSearchTorrents()">↺ Re-search</button>
+          <button class="btn btn-outline btn-sm" onclick="wizardSearchTorrents()">Search Again</button>
           <button class="btn btn-primary" onclick="wizardStep2Next()" id="step2Next"
             ${wizard.selectedTorrent ? '' : 'disabled'}>
-            Next: Subtitles →
+            Next: Subtitles
           </button>
         </div>
       </div>
@@ -1421,7 +2015,7 @@ function renderWizardStep2(panel) {
 async function wizardSearchTorrents() {
   const statusEl = document.getElementById('torrentSearchStatus');
   const listEl = document.getElementById('torrentList');
-  if (statusEl) statusEl.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Searching 4 sources…`;
+  if (statusEl) statusEl.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Searching 4 sources...`;
   if (listEl) listEl.innerHTML = skeletonCards(4).replace(/class="card"/g, 'style="height:60px;border-radius:8px"');
 
   try {
@@ -1436,14 +2030,15 @@ async function wizardSearchTorrents() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }).then((r) => r.json());
+    persistWizardState();
 
     if (statusEl) statusEl.innerHTML = wizard.torrents.length > 0
-      ? `Found <strong>${wizard.torrents.length}</strong> results — pick one to stream`
+      ? `Found <strong>${wizard.torrents.length}</strong> results - pick one to stream`
       : `<span style="color:var(--red)">No torrents found. Try a different search.</span>`;
 
     if (listEl) listEl.innerHTML = wizard.torrents.length > 0
       ? renderTorrentItems()
-      : `<div class="empty-state"><div class="empty-icon">🔎</div><h3>No torrents found</h3><p>The scrapers could not find any results. Check your connection or try later.</p></div>`;
+      : `<div class="empty-state"><div class="empty-icon">0</div><h3>No torrents found</h3><p>The scrapers could not find any results. Check your connection or try later.</p></div>`;
   } catch (e) {
     if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">Search failed: ${escape(e.message)}</span>`;
   }
@@ -1466,8 +2061,8 @@ function renderTorrentItems() {
         <span class="torrent-source ${srcClass}">${escape(t.source || '?')}</span>
         <span class="torrent-name" title="${escape(t.name)}">${escape(t.name)}</span>
         <div class="torrent-meta">
-          <span class="torrent-seeds">▲ ${seeds}</span>
-          <span class="torrent-leech">▼ ${leech}</span>
+          <span class="torrent-seeds">Seeds ${seeds}</span>
+          <span class="torrent-leech">Leech ${leech}</span>
           ${t.size ? `<span class="torrent-size">${escape(t.size)}</span>` : ''}
         </div>
       </div>`;
@@ -1476,6 +2071,7 @@ function renderTorrentItems() {
 
 function wizardSelectTorrent(idx) {
   wizard.selectedTorrent = { ...wizard.torrents[idx], _idx: idx };
+  persistWizardState();
   // Re-render list to update selection
   const listEl = document.getElementById('torrentList');
   if (listEl) listEl.innerHTML = renderTorrentItems();
@@ -1487,7 +2083,7 @@ async function wizardStep2Next() {
   if (!wizard.selectedTorrent) return;
   // Resolve magnet
   const btn = document.getElementById('step2Next');
-  if (btn) { btn.disabled = true; btn.textContent = 'Resolving…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Resolving...'; }
 
   try {
     const data = await fetch('/api/torrents/magnet', {
@@ -1499,14 +2095,15 @@ async function wizardStep2Next() {
     if (!data.magnet) throw new Error(data.error || 'No magnet returned');
     wizard.resolvedMagnet = data.magnet;
     wizard.step = 3;
+    persistWizardState();
     renderWizardUI();
   } catch (e) {
     toast(`Failed to resolve magnet: ${e.message}`, 'error', 5000);
-    if (btn) { btn.disabled = false; btn.textContent = 'Next: Subtitles →'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Next: Subtitles'; }
   }
 }
 
-// ── Step 3: Subtitle selection ────────────────────────────────────────────────
+// -- Step 3: Subtitle selection ------------------------------------------------
 function renderWizardStep3(panel) {
   const langHTML = (wizard.subtitleLangs || []).map((l) => `
     <button class="lang-btn ${wizard.selectedLang === l.code ? 'active' : ''}"
@@ -1514,37 +2111,27 @@ function renderWizardStep3(panel) {
 
   const subListHTML = wizard.subtitles.length > 0
     ? renderSubtitleItems()
-    : `<div class="empty-state"><div class="empty-icon">💬</div><h3>No subtitles loaded</h3><p>Select a language and click Search.</p></div>`;
+    : `<div class="empty-state"><div class="empty-icon">CC</div><h3>No subtitles loaded</h3><p>Select a language and click Search.</p></div>`;
 
   panel.innerHTML = `
     <div class="wizard-panel">
-      <div class="wizard-panel-title">💬 Subtitles <span style="font-size:.75rem;font-weight:400;color:var(--text-muted)">(optional)</span></div>
+      <div class="wizard-panel-title">Subtitles <span style="font-size:.75rem;font-weight:400;color:var(--text-muted)">(optional)</span></div>
       <div class="sidebar-group">
         <label class="sidebar-label">Language</label>
         <div class="lang-grid" id="langGrid">${langHTML}</div>
       </div>
       <div style="display:flex;gap:.5rem;margin-bottom:1rem">
-        <button class="btn btn-outline btn-sm" onclick="wizardSearchSubtitles()" id="subSearchBtn">
-          🔍 Search Subtitles
-        </button>
+        <button class="btn btn-outline btn-sm" onclick="wizardSearchSubtitles()" id="subSearchBtn">Search Subtitles</button>
         <span id="subStatus" style="font-size:.8rem;color:var(--text-muted);align-self:center"></span>
       </div>
       <div class="subtitle-list" id="subtitleList">${subListHTML}</div>
-      <div class="wizard-option" style="margin-top:1rem;padding:.75rem;background:var(--bg-2);border-radius:8px;">
-        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:.9rem;">
-          <input type="checkbox" id="wizardLightweightPlayer" ${wizard.useLightweightPlayer ? 'checked' : ''}
-            onchange="wizard.useLightweightPlayer=this.checked">
-          Use lightweight player for maximum performance (no subtitles in player)
-        </label>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-top:.35rem;margin-left:1.5rem">Uncheck to use the full player by default.</div>
-      </div>
       <div class="wizard-nav">
-        <button class="btn btn-outline btn-sm" onclick="wizardGoStep(2)">← Back</button>
+        <button class="btn btn-outline btn-sm" onclick="wizardGoStep(2)">Back</button>
         <div class="wizard-nav-right">
           <button class="btn btn-outline" onclick="wizardSkipSubtitles()">Skip Subtitles</button>
           <button class="btn btn-primary" onclick="wizardStep3Next()" id="step3Next"
             ${wizard.selectedSubtitle ? '' : 'disabled'}>
-            Start Streaming →
+            Start Streaming
           </button>
         </div>
       </div>
@@ -1553,6 +2140,7 @@ function renderWizardStep3(panel) {
 
 function wizardSetLang(code) {
   wizard.selectedLang = code;
+  persistWizardState();
   document.querySelectorAll('.lang-btn').forEach((b) => {
     b.classList.toggle('active', b.textContent === (wizard.subtitleLangs.find((l) => l.code === code)?.label || code));
   });
@@ -1562,7 +2150,7 @@ async function wizardSearchSubtitles() {
   const btn = document.getElementById('subSearchBtn');
   const status = document.getElementById('subStatus');
   const listEl = document.getElementById('subtitleList');
-  if (btn) { btn.disabled = true; btn.textContent = '🔍 Searching…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Searching...'; }
   if (status) status.textContent = '';
 
   try {
@@ -1587,11 +2175,11 @@ async function wizardSearchSubtitles() {
 
     if (listEl) listEl.innerHTML = wizard.subtitles.length > 0
       ? renderSubtitleItems()
-      : `<div class="empty-state"><div class="empty-icon">💬</div><h3>No subtitles found</h3><p>Try a different language or skip.</p></div>`;
+      : `<div class="empty-state"><div class="empty-icon">CC</div><h3>No subtitles found</h3><p>Try a different language or skip.</p></div>`;
   } catch (e) {
     if (status) status.innerHTML = `<span style="color:var(--red)">${escape(e.message)}</span>`;
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '🔍 Search Subtitles'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Search Subtitles'; }
   }
 }
 
@@ -1604,13 +2192,14 @@ function renderSubtitleItems() {
       <div class="subtitle-item ${isSelected ? 'selected' : ''}" onclick="wizardSelectSubtitle(${i})">
         <span class="subtitle-source-badge">${escape(s.source || 'OS')}</span>
         <span class="subtitle-name" title="${escape(relName)}">${escape(relName)}</span>
-        ${dlCount ? `<span class="subtitle-downloads">↓ ${dlCount.toLocaleString()}</span>` : ''}
+        ${dlCount ? `<span class="subtitle-downloads">${dlCount.toLocaleString()} downloads</span>` : ''}
       </div>`;
   }).join('');
 }
 
 function wizardSelectSubtitle(idx) {
   wizard.selectedSubtitle = { ...wizard.subtitles[idx], _idx: idx };
+  persistWizardState();
   const listEl = document.getElementById('subtitleList');
   if (listEl) listEl.innerHTML = renderSubtitleItems();
   const btn = document.getElementById('step3Next');
@@ -1620,8 +2209,10 @@ function wizardSelectSubtitle(idx) {
 function wizardSkipSubtitles() {
   wizard.skipSubtitles = true;
   wizard.selectedSubtitle = null;
-  wizard.subtitlePath = null;
+  wizard.subtitleToken = null;
+  wizard.subtitleTokenExpiresAt = null;
   wizard.step = 4;
+  persistWizardState();
   renderWizardUI();
   setTimeout(() => wizardStartStream(), 100);
 }
@@ -1629,41 +2220,43 @@ function wizardSkipSubtitles() {
 async function wizardStep3Next() {
   if (!wizard.selectedSubtitle) return;
   const btn = document.getElementById('step3Next');
-  if (btn) { btn.disabled = true; btn.textContent = 'Downloading subtitle…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Downloading subtitle...'; }
 
   try {
-    const data = await fetch('/api/subtitles/download', {
+    const data = await fetchJson('/api/subtitles/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ subtitle: wizard.selectedSubtitle }),
-    }).then((r) => r.json());
+    });
 
-    if (!data.path) throw new Error(data.error || 'Download failed');
-    wizard.subtitlePath = data.path;
-    toast('Subtitle downloaded ✓', 'success');
+    if (!data.subtitleToken) throw new Error(data.error || 'Download failed');
+    wizard.subtitleToken = data.subtitleToken;
+    wizard.subtitleTokenExpiresAt = data.tokenExpiresAt || null;
+    toast('Subtitle downloaded', 'success');
     wizard.step = 4;
+    persistWizardState();
     renderWizardUI();
     setTimeout(() => wizardStartStream(), 100);
   } catch (e) {
     toast(`Subtitle download failed: ${e.message}`, 'error', 5000);
-    if (btn) { btn.disabled = false; btn.textContent = 'Start Streaming →'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Start Streaming'; }
   }
 }
 
-// ── Step 4: Streaming ────────────────────────────────────────────────────────
+// -- Step 4: Streaming --------------------------------------------------------
 function renderWizardStep4(panel) {
   const torrentName = wizard.selectedTorrent ? wizard.selectedTorrent.name : wizard.titleText;
   panel.innerHTML = `
     <div class="wizard-panel">
       <div id="playerBanner"></div>
-      <div class="wizard-panel-title">📡 Streaming
-        <span id="streamStatusBadge" style="font-size:.75rem;font-weight:500;color:var(--text-muted);margin-left:.5rem">Starting…</span>
+      <div class="wizard-panel-title">Streaming
+        <span id="streamStatusBadge" style="font-size:.75rem;font-weight:500;color:var(--text-muted);margin-left:.5rem">Starting...</span>
       </div>
 
       <!-- Progress bar (hidden until progress events arrive) -->
       <div id="streamProgressWrap" style="display:none;margin-bottom:.75rem">
         <div style="display:flex;justify-content:space-between;font-size:.78rem;color:var(--text-muted);margin-bottom:.3rem">
-          <span id="streamProgressLabel">Downloading…</span>
+          <span id="streamProgressLabel">Downloading...</span>
           <span id="streamProgressSpeed"></span>
         </div>
         <div style="height:6px;background:var(--bg-3);border-radius:3px;overflow:hidden">
@@ -1673,19 +2266,20 @@ function renderWizardStep4(panel) {
 
       <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.4rem">
         Torrent: <span style="color:var(--text)">${escape((torrentName || '').slice(0, 80))}</span>
-        ${wizard.subtitlePath ? `<span style="color:var(--green);margin-left:.5rem">● Subtitle loaded</span>` : ''}
+        ${wizard.subtitleToken ? `<span style="color:var(--green);margin-left:.5rem">Subtitle loaded</span>` : ''}
       </div>
 
       <div class="stream-terminal" id="streamTerminal"></div>
 
       <div class="wizard-nav" style="margin-top:1rem">
-        <button class="btn btn-danger btn-sm" onclick="wizardStopStream()">■ Stop Stream</button>
+        <button class="btn btn-danger btn-sm" onclick="wizardStopStream()">Stop Stream</button>
         <div class="wizard-nav-right">
-          <a id="directPlayerLink" href="http://localhost:8000" target="_blank"
+          <button class="btn btn-outline btn-sm" onclick="wizardStartStream()">Retry Start</button>
+          <a id="directPlayerLink" href="#" onclick="return openActivePlayer(event, this.getAttribute('href'))"
              class="btn btn-primary" style="display:none">
-            ▶ Open Player (port 8000)
+            Open Player
           </a>
-          <button class="btn btn-outline btn-sm" onclick="wizardGoStep(2)">← Change Torrent</button>
+          <button class="btn btn-outline btn-sm" onclick="wizardGoStep(2)">Change Torrent</button>
         </div>
       </div>
     </div>`;
@@ -1696,15 +2290,28 @@ async function wizardStartStream() {
 
   // Check if there's already an active session with a player URL (e.g. page was refreshed)
   try {
-    const active = await fetch('/api/stream/status').then((r) => r.json());
-    const running = active.find((s) => s.running && s.playerUrl);
+    const active = await fetchJson('/api/stream/status');
+    const running = active.find((s) => s.id === wizard.sessionId) || active.find((s) => s.running);
     if (running) {
       wizard.sessionId = running.id;
       wizard.playerUrl = running.playerUrl;
-      showPlayerBanner(running.playerUrl);
-      updateNavStreamIndicator(true, running.playerUrl);
+      persistWizardState();
+      if (running.playerUrl) {
+        showPlayerBanner(running.playerUrl);
+        saveWizardHistoryIfNeeded();
+      }
+      updateNavStreamIndicator(true, running.playerUrl || null);
       const badge = document.getElementById('streamStatusBadge');
-      if (badge) badge.innerHTML = `<span style="color:var(--green)">● Live</span>`;
+      const directLink = document.getElementById('directPlayerLink');
+      if (directLink && running.playerUrl) {
+        directLink.href = running.playerUrl;
+        directLink.style.display = '';
+      }
+      if (badge) {
+        badge.innerHTML = running.playerUrl
+          ? `<span style="color:var(--green)">Live</span>`
+          : `<span style="color:var(--text-muted)">Waiting for player...</span>`;
+      }
       connectStreamSSE(running.id);
       if (!running.playerUrl) startWaitingTimer();
       startStreamStatusPolling();
@@ -1713,18 +2320,23 @@ async function wizardStartStream() {
   } catch (e) { /* ignore, proceed to start */ }
 
   try {
-    const data = await fetch('/api/stream/start', {
+    const data = await fetchJson('/api/stream/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         magnet: wizard.resolvedMagnet,
-        subtitlePath: wizard.subtitlePath || null,
-        noSubtitles: wizard.useLightweightPlayer && !wizard.subtitlePath,
+        subtitleToken: wizard.subtitleToken || null,
+        history: {
+          type: wizard.type,
+          item: buildWizardHistoryItem(),
+        },
       }),
-    }).then((r) => r.json());
+    });
 
     if (!data.sessionId) throw new Error(data.error || 'Failed to start');
     wizard.sessionId = data.sessionId;
+    wizard.historySaved = true;
+    persistWizardState();
 
     // Update navbar stream indicator
     updateNavStreamIndicator(true);
@@ -1734,6 +2346,8 @@ async function wizardStartStream() {
     startStreamStatusPolling();
   } catch (e) {
     appendTerminalLine(`Error: ${e.message}`, 'error');
+    const badge = document.getElementById('streamStatusBadge');
+    if (badge) badge.innerHTML = '<span style="color:var(--red)">Failed to start</span>';
   }
 }
 
@@ -1742,18 +2356,27 @@ function startStreamStatusPolling() {
   wizard.statusPollId = setInterval(async () => {
     if (state.currentPage !== 'stream' || wizard.step !== 4) return;
     try {
-      const active = await fetch('/api/stream/status').then((r) => r.json());
+      const active = await fetchJson('/api/stream/status');
       const ours = active.find((s) => s.id === wizard.sessionId);
       if (!ours && wizard.sessionId) {
         clearStreamStatusPolling();
         updateNavStreamIndicator(false);
         const badge = document.getElementById('streamStatusBadge');
         if (badge) badge.innerHTML = '<span style="color:var(--red)">Stopped</span>';
+        clearWizardState();
+      } else if (ours && ours.exited) {
+        clearStreamStatusPolling();
+        updateNavStreamIndicator(false);
+        const badge = document.getElementById('streamStatusBadge');
+        if (badge) badge.innerHTML = '<span style="color:var(--red)">Stopped</span>';
+        clearWizardState();
       } else if (ours && ours.playerUrl && !wizard.playerUrl) {
         wizard.playerUrl = ours.playerUrl;
         clearWaitingTimer();
         showPlayerBanner(ours.playerUrl);
         updateNavStreamIndicator(true, ours.playerUrl);
+        saveWizardHistoryIfNeeded();
+        persistWizardState();
       }
     } catch (e) { /* ignore */ }
   }, 3000);
@@ -1771,9 +2394,9 @@ function startWaitingTimer() {
     const b = document.getElementById('streamStatusBadge');
     if (!b) { clearWaitingTimer(); return; }
     secs++;
-    if (secs < 30) b.textContent = `Connecting to peers… ${secs}s`;
-    else if (secs < 90) b.textContent = `Buffering… ${secs}s (finding seeders)`;
-    else b.textContent = `Still waiting… ${secs}s — try a torrent with more seeders`;
+    if (secs < 30) b.textContent = `Connecting to peers... ${secs}s`;
+    else if (secs < 90) b.textContent = `Buffering... ${secs}s (finding seeders)`;
+    else b.textContent = `Still waiting... ${secs}s - try a torrent with more seeders`;
   }, 1000);
 }
 
@@ -1808,8 +2431,10 @@ function connectStreamSSE(sessionId) {
       clearWaitingTimer(); // Stop timer immediately so it can't overwrite the badge
       showPlayerBanner(url);
       updateNavStreamIndicator(true, url);
+      persistWizardState();
+      saveWizardHistoryIfNeeded();
       const badge = document.getElementById('streamStatusBadge');
-      if (badge) badge.innerHTML = `<span style="color:var(--green)">● Live</span>`;
+      if (badge) badge.innerHTML = `<span style="color:var(--green)">Live</span>`;
       const wrap = document.getElementById('streamProgressWrap');
       if (wrap) wrap.style.display = 'none';
       const directLink = document.getElementById('directPlayerLink');
@@ -1820,9 +2445,14 @@ function connectStreamSSE(sessionId) {
       clearWaitingTimer();
       appendTerminalLine(`[Process exited with code ${code}]`, code === 0 ? 'success' : 'error');
       updateNavStreamIndicator(false);
+      wizard.playerUrl = null;
+      wizard.sessionId = null;
       const badge = document.getElementById('streamStatusBadge');
+      const directLink = document.getElementById('directPlayerLink');
+      if (directLink) directLink.style.display = 'none';
       if (badge) badge.innerHTML = `<span style="color:${code === 0 ? 'var(--green)' : 'var(--red)'}">Stopped (${code})</span>`;
       if (wizard.sseSource) { wizard.sseSource.close(); wizard.sseSource = null; }
+      clearWizardState();
     });
 }
 
@@ -1832,10 +2462,10 @@ function appendTerminalLine(text, type) {
 
   const t = text || '';
   const lineType = type || (
-    /❌|error|failed|✗|exception/i.test(t) ? 'error' :
-    /warning|⚠️|⚠|taking longer/i.test(t) ? 'warning' :
-    /✅|✓|success|ready|streaming|player|connected|added|torrent/i.test(t) ? 'success' :
-    /🔍|📡|📥|💾|💡|📊|👥|🔒|🔑|ℹ|adding|searching|connecting|isolation/i.test(t) ? 'info' : ''
+    /error|failed|exception|unable|refused/i.test(t) ? 'error' :
+    /warning|taking longer|timeout|stalled/i.test(t) ? 'warning' :
+    /success|ready|streaming|player|connected|added|started|live/i.test(t) ? 'success' :
+    /adding|searching|connecting|isolation|subtitle|download|buffer/i.test(t) ? 'info' : ''
   );
 
   const span = document.createElement('span');
@@ -1854,11 +2484,11 @@ function showPlayerBanner(url) {
   banner.innerHTML = `
     <div class="stream-player-banner">
       <div>
-        <h3>🎬 Player Ready!</h3>
-        <p>Your stream is live — click to open the player</p>
+        <h3>Player Ready!</h3>
+        <p>Your stream is live - click to open the player</p>
       </div>
-      <a href="${escape(url)}" target="_blank" class="btn btn-primary" style="font-size:1rem;padding:.7rem 1.5rem">
-        ▶ Open Player
+      <a href="${escape(url)}" onclick="return openActivePlayer(event, this.getAttribute('href'))" class="btn btn-primary" style="font-size:1rem;padding:.7rem 1.5rem">
+        Open Player
       </a>
     </div>`;
 }
@@ -1871,17 +2501,22 @@ async function wizardStopStream() {
     await fetch(`/api/stream/stop/${wizard.sessionId}`, { method: 'DELETE' }).catch(() => {});
     wizard.sessionId = null;
   } else {
-    // No session — call kill-all to free port 8000
+    // No session: call kill-all to ensure the standalone player server is closed.
     await fetch('/api/stream/kill-all', { method: 'DELETE' }).catch(() => {});
   }
   wizard.playerUrl = null;
+  wizard.sessionId = null;
+  const directLink = document.getElementById('directPlayerLink');
+  if (directLink) directLink.style.display = 'none';
   updateNavStreamIndicator(false);
-  toast('Stream stopped — port 8000 freed', 'info');
-  appendTerminalLine('[Stream stopped by user — port 8000 freed]', 'warning');
+  clearWizardState();
+  toast('Stream stopped and player server closed', 'info');
+  appendTerminalLine('[Stream stopped by user - player server closed]', 'warning');
 }
 
 function wizardGoStep(n) {
   wizard.step = n;
+  persistWizardState();
   renderWizardUI();
   if (n === 2 && wizard.torrents.length > 0) {
     // Torrents already loaded, just re-render
@@ -1890,7 +2525,7 @@ function wizardGoStep(n) {
   }
 }
 
-// ── Nav stream indicator ──────────────────────────────────────────────────────
+// -- Nav stream indicator ------------------------------------------------------
 function updateNavStreamIndicator(active, url) {
   let indicator = document.getElementById('navStreamIndicator');
   if (!active) {
@@ -1904,17 +2539,33 @@ function updateNavStreamIndicator(active, url) {
     navLinks.appendChild(indicator);
   }
   indicator.innerHTML = `
-    <a href="${url || '#/stream'}" ${url ? 'target="_blank"' : ''}
+    <a href="${url || '#/stream'}" onclick="return openActivePlayer(event, '${escape(url || '')}')"
        class="nav-stream-indicator" title="${url ? 'Open Player' : 'Streaming active'}">
-      ● Live
+      Live
     </a>`;
 }
 
-// ─── Global window exports (needed for inline onclick handlers) ───────────────
+async function refreshNavStreamIndicator() {
+  try {
+    const active = await fetchJson('/api/stream/status');
+    const running = active.find((s) => s.running);
+    if (running) {
+      updateNavStreamIndicator(true, running.playerUrl || null);
+    } else {
+      updateNavStreamIndicator(false);
+    }
+  } catch (e) {
+    // Ignore polling errors.
+  }
+}
+
+// --- Global window exports (needed for inline onclick handlers) ---------------
 window.openDetail = openDetail;
 window.markWatched = markWatched;
 window.markWatchedFromDetail = markWatchedFromDetail;
 window.markCurrentModalItem = markCurrentModalItem;
+window.toggleCurrentModalWatchlist = toggleCurrentModalWatchlist;
+window.toggleWatchlistFromCard = toggleWatchlistFromCard;
 window.removeHistoryFromModal = removeHistoryFromModal;
 window.toggleSeason = toggleSeason;
 window.markEpWatched = markEpWatched;
@@ -1924,6 +2575,7 @@ window.renderTV = renderTV;
 window.renderSearch = renderSearch;
 window.renderRecommendations = renderRecommendations;
 window.renderHistory = renderHistory;
+window.openActivePlayer = openActivePlayer;
 window.execSearch = execSearch;
 window.setSearchType = setSearchType;
 window.applyFilters = applyFilters;
@@ -1944,12 +2596,13 @@ window.wizardSearchSubtitles = wizardSearchSubtitles;
 window.wizardSelectSubtitle = wizardSelectSubtitle;
 window.wizardSkipSubtitles = wizardSkipSubtitles;
 window.wizardStep3Next = wizardStep3Next;
+window.wizardStartStream = wizardStartStream;
 window.wizardStopStream = wizardStopStream;
 window.wizardGoStep = wizardGoStep;
 window.startWaitingTimer = startWaitingTimer;
 window.connectStreamSSE = connectStreamSSE;
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
+// --- Init ---------------------------------------------------------------------
 async function init() {
   try {
     // Load genres once
@@ -1959,9 +2612,14 @@ async function init() {
     console.warn('Failed to load genres', e);
   }
 
+  ensureWatchlistLoaded().catch((e) => {
+    console.warn('Failed to warm watchlist cache', e);
+  });
+
   // Start routing
   window.addEventListener('hashchange', route);
   route();
+  refreshNavStreamIndicator();
 
   // Hide initial loader
   const loader = document.getElementById('initialLoader');
@@ -1969,3 +2627,5 @@ async function init() {
 }
 
 init();
+
+
