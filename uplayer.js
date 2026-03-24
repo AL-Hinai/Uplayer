@@ -2422,7 +2422,7 @@ class StreamManager extends EventEmitter {
         }
         
         // Start HTTP server for streaming
-        await this.startStreamingServer(videoFile, async (url, urls) => {
+        await this.startStreamingServer(videoFile, async (url, urls, videoPath) => {
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Streaming server started');
           }
@@ -2438,14 +2438,17 @@ class StreamManager extends EventEmitter {
             log(`Local fallback: ${urls.localhost}`);
           }
 
+          // Build full video URL for VLC (root URL + video path)
+          const fullVideoUrl = videoPath ? `${url.replace(/\/$/, '')}${videoPath}` : url;
+
           // WAIT for torrent to have enough data for smooth playback
           // This prevents VLC from connecting before there's data to stream
           const minPiecesWait = 10; // Wait for at least 10 pieces to be downloaded
           const maxWaitTime = 30000; // Max wait time: 30 seconds
           const checkInterval = 500; // Check every 500ms
-          
+
           log(`⏳ Waiting for torrent to buffer (${minPiecesWait} pieces minimum)...`);
-          
+
           const waitForBuffer = new Promise((waitResolve) => {
             const startTime = Date.now();
             
@@ -2482,11 +2485,11 @@ class StreamManager extends EventEmitter {
             const playerReadyData = {
               url,
               urls,
-              // VLC needs network-accessible URL (not localhost)
-              vlcUrl: urls.ip,
-              mediaUrl: urls.ip,
-              // Cast URL for Chromecast
-              castUrl: urls.ip,
+              // VLC needs the full video URL (not just the root URL)
+              vlcUrl: fullVideoUrl,
+              mediaUrl: fullVideoUrl,
+              // Cast URL for Chromecast (also needs full video URL)
+              castUrl: fullVideoUrl,
             };
             this.emit('player_ready', playerReadyData);
           }
@@ -2498,7 +2501,7 @@ class StreamManager extends EventEmitter {
             });
           }
 
-          finish(resolve, { url, urls, torrent, videoFile, subtitlePath: options.subtitlePath });
+          finish(resolve, { url, urls, torrent, videoFile, subtitlePath: options.subtitlePath, videoPath });
         }, options.subtitlePath);
 
         // Show download progress with throttling to prevent terminal spam
@@ -2967,7 +2970,8 @@ class StreamManager extends EventEmitter {
 
     const urls = buildAccessibleUrls(port);
     this.server.listen(port, urls.bindHost, () => {
-      callback(urls.preferred, urls);
+      // Pass the video path so the caller can construct the full video URL
+      callback(urls.preferred, urls, videoUrl);
     });
   }
   

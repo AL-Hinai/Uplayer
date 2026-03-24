@@ -463,10 +463,22 @@ function applySessionPlayerReady(session, payload = {}) {
       // Keep original URL if parsing fails
     }
   }
-  
-  const vlcUrl = payload.vlcUrl
-    ? String(payload.vlcUrl)
-    : (payload.mediaUrl ? String(payload.mediaUrl) : playerUrl);
+
+  // VLC URL should be the full video URL, not the root URL
+  // Priority: payload.vlcUrl > payload.mediaUrl > payload.url + payload.videoPath > payload.url
+  let vlcUrl = null;
+  if (payload.vlcUrl) {
+    vlcUrl = String(payload.vlcUrl);
+  } else if (payload.mediaUrl) {
+    vlcUrl = String(payload.mediaUrl);
+  } else if (payload.videoPath && rawPlayerUrl) {
+    // Construct full video URL from root URL + video path
+    vlcUrl = `${rawPlayerUrl.replace(/\/$/, '')}${payload.videoPath}`;
+  } else if (rawPlayerUrl) {
+    // Use the original full URL, not the root URL
+    vlcUrl = rawPlayerUrl;
+  }
+
   const castUrl = payload.castUrl
     ? String(payload.castUrl)
     : (payload.castUrls && payload.castUrls.preferred ? String(payload.castUrls.preferred) : null);
@@ -495,7 +507,8 @@ function applySessionPlayerReady(session, payload = {}) {
     }
   }
 
-  if (vlcUrl) {
+  // Only update vlcUrl if the new value is better (has video path) or if session.vlcUrl is not set
+  if (vlcUrl && (!session.vlcUrl || vlcUrl !== playerUrl)) {
     session.vlcUrl = vlcUrl;
     session.mediaUrls = payload.mediaUrls || session.mediaUrls || null;
   }
@@ -530,9 +543,17 @@ function getSessionPlayerState(session) {
   const videoFormat = session && session.videoFormat
     ? session.videoFormat
     : (playerReadyData.videoFormat || null);
+  
+  // Get VLC URL with proper fallback priority
+  // Priority: session.vlcUrl > playerReadyData.vlcUrl > playerReadyData.mediaUrl > playerUrl (full URL)
+  let vlcUrl = session && session.vlcUrl ? session.vlcUrl : null;
+  if (!vlcUrl && playerReadyData) {
+    vlcUrl = playerReadyData.vlcUrl || playerReadyData.mediaUrl || playerReadyData.url || playerUrl;
+  }
+  
   return {
     playerUrl,
-    vlcUrl: session && session.vlcUrl ? session.vlcUrl : playerUrl,
+    vlcUrl: vlcUrl || playerUrl,
     castUrl,
     subtitleManifestUrl,
     videoFormat,
@@ -1044,7 +1065,8 @@ app.post('/api/stream/open-vlc', async (req, res) => {
       return res.status(409).json({ error: resolved.error });
     }
 
-    await openStreamInVlc(resolved.vlcUrl || resolved.url);
+    const vlcUrl = resolved.vlcUrl || resolved.url;
+    await openStreamInVlc(vlcUrl);
     res.json({
       ok: true,
       url: resolved.url,
