@@ -2208,7 +2208,7 @@ class StreamManager extends EventEmitter {
       };
 
       log('Adding torrent...');
-      
+
       if (this.memoryTracker) {
         this.memoryTracker.logMemory('Before adding torrent');
       }
@@ -2221,36 +2221,87 @@ class StreamManager extends EventEmitter {
       client.once('error', errorHandler);
       this._cancelPendingStream = cancelPendingStream;
 
-      // Add timeout for torrent connection (60 seconds)
+      // Add extra trackers to help find more peers
+      const extraTrackers = [
+        'udp://tracker.opentrackr.org:1337/announce',
+        'udp://tracker.openbittorrent.com:6969/announce',
+        'udp://tracker.bittor.pw:1337/announce',
+        'udp://tracker.dler.org:6969/announce',
+        'udp://tracker.torrent.eu.org:451/announce',
+        'udp://tracker.skynetcloud.tk:6969/announce',
+        'udp://tracker.internetwarriors.net:1337/announce',
+        'udp://retracker.lanta-net.ru:2710/announce',
+        'udp://exodus.desync.com:6969/announce',
+        'udp://tracker.tiny-vps.com:6969/announce',
+        'udp://tracker.filemail.com:6969/announce',
+        'udp://tracker.leech.ie:1337/announce',
+        'wss://tracker.openwebtorrent.com',
+        'wss://tracker.btorrent.xyz',
+        'wss://tracker.fastcast.nz'
+      ];
+
+      // Parse magnet link and add extra trackers
+      let enhancedMagnet = magnetLink;
+      try {
+        const magnetParts = magnetLink.split('&');
+        const hasTrailer = magnetParts.some(p => p.startsWith('tr='));
+        
+        if (!hasTrailer) {
+          // No trackers in original magnet, add all extra ones
+          extraTrackers.forEach(tracker => {
+            enhancedMagnet += `&tr=${encodeURIComponent(tracker)}`;
+          });
+          log('   Added 15 extra trackers to magnet link');
+        } else {
+          // Add only web trackers (wss://) to existing magnet
+          const webTrackers = extraTrackers.filter(t => t.startsWith('wss://'));
+          webTrackers.forEach(tracker => {
+            enhancedMagnet += `&tr=${encodeURIComponent(tracker)}`;
+          });
+          log('   Added 3 web trackers to existing magnet link');
+        }
+      } catch (e) {
+        log('   Warning: Could not enhance magnet link, using original');
+      }
+
+      // Add timeout for torrent connection (5 minutes)
       connectionTimeout = setTimeout(() => {
-        log('? Timeout: Could not connect to torrent after 60 seconds');
+        const peerCount = client.torrents && client.torrents.length > 0 
+          ? client.torrents[0].numPeers 
+          : 0;
+        log(`? Timeout: Could not connect to torrent after 5 minutes`);
+        log(`   Peers found: ${peerCount}`);
         log('Try:');
         log('   1. Check your internet connection');
         log('   2. Try a different torrent');
         log('   3. Make sure no other torrent client is running');
+        log('   4. Wait longer - some torrents take time to find peers');
         finish(reject, new Error('Torrent connection timeout'));
-      }, 60000);
+      }, 300000);
 
-      // Show connection progress
+      // Show connection progress with peer count
       log('   Connecting to DHT and trackers to find peers...');
       let connectionTimer = 0;
       progressInterval = setInterval(() => {
         connectionTimer += 5;
+        const peerCount = client.torrents && client.torrents.length > 0 
+          ? client.torrents[0].numPeers 
+          : 0;
+        
         if (connectionTimer >= 15 && connectionTimer % 5 === 0) {
           if (connectionTimer === 15) {
             log('Taking longer than expected...');
             log('   This can happen if:');
-            log('   - Torrent has few seeders');
+            log('   - Torrent metadata is being downloaded');
             log('   - DHT/trackers are slow to respond');
             log('   - Network connection issues');
-            log('   Tip: Try using a different torrent source');
-            log('   Please wait...');
+            log('   Please wait - finding peers...');
           }
-          log(`   ? Still connecting... (${connectionTimer}s)`);
+          log(`   ? Still connecting... (${connectionTimer}s) | Peers: ${peerCount}`);
         }
       }, 5000);
 
-      client.add(magnetLink, async (torrent) => {
+      client.add(enhancedMagnet, async (torrent) => {
         clearPendingSetup();
         if (settled) return;
 
@@ -2371,11 +2422,11 @@ class StreamManager extends EventEmitter {
         }
         
         // Start HTTP server for streaming
-        await this.startStreamingServer(videoFile, (url, urls) => {
+        await this.startStreamingServer(videoFile, async (url, urls) => {
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Streaming server started');
           }
-          
+
           // Show subtitle info if available
           if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
             log(`Subtitle available: ${url}/api/subtitles`);
@@ -2386,12 +2437,58 @@ class StreamManager extends EventEmitter {
           if (urls && urls.localhost && urls.localhost !== url) {
             log(`Local fallback: ${urls.localhost}`);
           }
+
+          // WAIT for torrent to have enough data for smooth playback
+          // This prevents VLC from connecting before there's data to stream
+          const minPiecesWait = 10; // Wait for at least 10 pieces to be downloaded
+          const maxWaitTime = 30000; // Max wait time: 30 seconds
+          const checkInterval = 500; // Check every 500ms
+          
+          log(`⏳ Waiting for torrent to buffer (${minPiecesWait} pieces minimum)...`);
+          
+          const waitForBuffer = new Promise((waitResolve) => {
+            const startTime = Date.now();
+            
+            const checkReady = () => {
+              const elapsed = Date.now() - startTime;
+              const downloadedPieces = Math.floor(torrent.downloaded / torrent.pieceLength);
+              
+              if (downloadedPieces >= minPiecesWait) {
+                log(`✅ Buffer ready: ${downloadedPieces} pieces downloaded (${(torrent.downloaded / 1024 / 1024).toFixed(1)} MB)`);
+                waitResolve();
+                return;
+              }
+              
+              if (elapsed >= maxWaitTime) {
+                log(`⚠️  Buffer timeout: Only ${downloadedPieces} pieces after ${maxWaitTime/1000}s (proceeding anyway)`);
+                waitResolve();
+                return;
+              }
+              
+              setTimeout(checkReady, checkInterval);
+            };
+            
+            checkReady();
+          });
+          
+          await waitForBuffer;
+
           log('Opening native JS player...');
           log('   Press Ctrl+C to stop streaming');
 
           // Emit structured player_ready event for server mode
           if (serverMode) {
-            this.emit('player_ready', { url, urls });
+            // Build proper URLs for different players
+            const playerReadyData = {
+              url,
+              urls,
+              // VLC needs network-accessible URL (not localhost)
+              vlcUrl: urls.ip,
+              mediaUrl: urls.ip,
+              // Cast URL for Chromecast
+              castUrl: urls.ip,
+            };
+            this.emit('player_ready', playerReadyData);
           }
 
           // Open in default player (force new tab for better memory management)
