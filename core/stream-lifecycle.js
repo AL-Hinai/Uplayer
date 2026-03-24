@@ -4,6 +4,7 @@ class StreamLifecycleState {
   constructor(onEvent) {
     this.onEvent = typeof onEvent === 'function' ? onEvent : () => {};
     this.playerUrl = null;
+    this.playerReadyData = null;
     this.exited = false;
   }
 
@@ -19,11 +20,19 @@ class StreamLifecycleState {
     return true;
   }
 
-  playerReady(url) {
+  playerReady(payloadOrUrl) {
     if (this.exited) return false;
+    const payload = payloadOrUrl && typeof payloadOrUrl === 'object' && !Array.isArray(payloadOrUrl)
+      ? { ...payloadOrUrl }
+      : { url: payloadOrUrl };
+    const url = payload && payload.url ? String(payload.url) : '';
     if (!url || this.playerUrl) return false;
-    this.playerUrl = String(url);
-    this.onEvent('player_ready', { url: this.playerUrl });
+    this.playerUrl = url;
+    this.playerReadyData = {
+      ...payload,
+      url,
+    };
+    this.onEvent('player_ready', this.playerReadyData);
     return true;
   }
 
@@ -37,6 +46,7 @@ class StreamLifecycleState {
   status() {
     return {
       playerUrl: this.playerUrl,
+      playerReadyData: this.playerReadyData,
       exited: this.exited,
     };
   }

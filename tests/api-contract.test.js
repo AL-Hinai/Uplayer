@@ -82,6 +82,14 @@ async function main() {
       assert.strictEqual(row.mode, 'native-js');
     }
 
+    const openVlc = await requestJson(`${base}/api/stream/open-vlc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.strictEqual(openVlc.status, 409);
+    assert.match(String(openVlc.data.error || ''), /Player is still starting/i);
+
     console.log('api-contract.test.js passed');
   } finally {
     await stopServer();

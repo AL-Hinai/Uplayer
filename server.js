@@ -1,6 +1,7 @@
 'use strict';
 
 const express = require('express');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -36,6 +37,7 @@ function getServices() {
 }
 
 const PORT = getServices().runtime.config.port || 3000;
+const VLC_DOWNLOAD_URL = 'https://www.videolan.org/vlc/';
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -431,11 +433,266 @@ function createStreamSession() {
     exitedAt: null,
     history: null,
     historySaved: false,
+    playerUrl: null,
+    vlcUrl: null,
+    castUrl: null,
+    subtitleManifestUrl: null,
+    playerUrls: null,
+    mediaUrls: null,
+    castUrls: null,
+    subtitleManifestUrls: null,
+    videoFormat: null,
   };
   session.lifecycle = new StreamLifecycleState((event, data) => {
     broadcastToSession(sessionId, event, data);
   });
   return session;
+}
+
+function applySessionPlayerReady(session, payload = {}) {
+  if (!session || !payload || typeof payload !== 'object') return false;
+
+  // Ensure playerUrl is the root URL (strip any path like /video.mp4?compat=1)
+  let rawPlayerUrl = payload.url ? String(payload.url) : null;
+  let playerUrl = rawPlayerUrl;
+  if (rawPlayerUrl) {
+    try {
+      const urlObj = new URL(rawPlayerUrl);
+      playerUrl = urlObj.protocol + '//' + urlObj.host + '/';
+    } catch (e) {
+      // Keep original URL if parsing fails
+    }
+  }
+  
+  const vlcUrl = payload.vlcUrl
+    ? String(payload.vlcUrl)
+    : (payload.mediaUrl ? String(payload.mediaUrl) : playerUrl);
+  const castUrl = payload.castUrl
+    ? String(payload.castUrl)
+    : (payload.castUrls && payload.castUrls.preferred ? String(payload.castUrls.preferred) : null);
+  const subtitleManifestUrl = payload.subtitleManifestUrl
+    ? String(payload.subtitleManifestUrl)
+    : (payload.subtitleManifestUrls && payload.subtitleManifestUrls.preferred
+      ? String(payload.subtitleManifestUrls.preferred)
+      : null);
+  const videoFormat = payload.videoFormat || null;
+
+  if (playerUrl) {
+    session.playerUrl = playerUrl;
+    session.playerUrls = payload.urls || session.playerUrls || null;
+    if (videoFormat) {
+      session.videoFormat = videoFormat;
+    }
+    if (session.lifecycle) {
+      session.lifecycle.playerReady({
+        url: playerUrl,
+        playerUrl,
+        vlcUrl,
+        castUrl,
+        subtitleManifestUrl,
+        videoFormat,
+      });
+    }
+  }
+
+  if (vlcUrl) {
+    session.vlcUrl = vlcUrl;
+    session.mediaUrls = payload.mediaUrls || session.mediaUrls || null;
+  }
+
+  if (castUrl) {
+    session.castUrl = castUrl;
+    session.castUrls = payload.castUrls || session.castUrls || null;
+  }
+
+  if (subtitleManifestUrl) {
+    session.subtitleManifestUrl = subtitleManifestUrl;
+    session.subtitleManifestUrls = payload.subtitleManifestUrls || session.subtitleManifestUrls || null;
+  }
+
+  return !!playerUrl;
+}
+
+function getSessionPlayerState(session) {
+  const lifecycleStatus = session && session.lifecycle
+    ? session.lifecycle.status()
+    : { playerUrl: null, exited: false };
+  const playerReadyData = lifecycleStatus.playerReadyData || {};
+  const playerUrl = session && session.playerUrl
+    ? session.playerUrl
+    : (playerReadyData.url || lifecycleStatus.playerUrl);
+  const castUrl = session && session.castUrl
+    ? session.castUrl
+    : (playerReadyData.castUrl || null);
+  const subtitleManifestUrl = session && session.subtitleManifestUrl
+    ? session.subtitleManifestUrl
+    : (playerReadyData.subtitleManifestUrl || null);
+  const videoFormat = session && session.videoFormat
+    ? session.videoFormat
+    : (playerReadyData.videoFormat || null);
+  return {
+    playerUrl,
+    vlcUrl: session && session.vlcUrl ? session.vlcUrl : playerUrl,
+    castUrl,
+    subtitleManifestUrl,
+    videoFormat,
+    exited: !!lifecycleStatus.exited,
+  };
+}
+
+function resolveOpenableSession(sessionId) {
+  if (sessionId) {
+    const session = streamSessions.get(sessionId);
+    if (!session) return { error: 'Session not found' };
+    const status = getSessionPlayerState(session);
+    if (!status.playerUrl) return { error: 'Player is still starting' };
+    return { session, url: status.playerUrl, vlcUrl: status.vlcUrl || status.playerUrl };
+  }
+
+  for (const session of streamSessions.values()) {
+    const status = getSessionPlayerState(session);
+    if (status.playerUrl && session.streamManager && !status.exited) {
+      return { session, url: status.playerUrl, vlcUrl: status.vlcUrl || status.playerUrl };
+    }
+  }
+
+  for (const session of streamSessions.values()) {
+    const status = getSessionPlayerState(session);
+    if (status.playerUrl) {
+      return { session, url: status.playerUrl, vlcUrl: status.vlcUrl || status.playerUrl };
+    }
+  }
+
+  return { error: 'Player is still starting' };
+}
+
+function buildVlcLaunchAttempts(url) {
+  const target = String(url || '');
+  const attempts = [];
+
+  // VLC on Windows sometimes fails with localhost - try network IP first
+  let networkTarget = target;
+  if (target.includes('localhost') || target.includes('127.0.0.1')) {
+    try {
+      // Get network IP for VLC
+      const { getLocalIPv4Address } = require('./core/network-address');
+      const networkIp = getLocalIPv4Address();
+      if (networkIp && networkIp !== 'localhost') {
+        networkTarget = target.replace(/localhost|127\.0\.0\.1/g, networkIp);
+      }
+    } catch (e) {
+      // Ignore network IP detection errors
+    }
+  }
+
+  if (process.platform === 'win32') {
+    // Try network IP first (more reliable for VLC on Windows)
+    if (networkTarget !== target) {
+      attempts.push({ command: 'vlc.exe', args: [networkTarget] });
+    }
+    // Then try localhost
+    attempts.push(
+      { command: 'vlc.exe', args: [target] },
+      { command: 'vlc', args: [target] }
+    );
+
+    const envPaths = [
+      process.env.ProgramFiles,
+      process.env['ProgramFiles(x86)'],
+      process.env.LOCALAPPDATA,
+    ].filter(Boolean);
+
+    for (const root of envPaths) {
+      attempts.push({
+        command: path.join(root, 'VideoLAN', 'VLC', 'vlc.exe'),
+        args: [target],
+      });
+    }
+  } else if (process.platform === 'darwin') {
+    attempts.push(
+      { command: 'open', args: ['-a', 'VLC', target] },
+      { command: '/Applications/VLC.app/Contents/MacOS/VLC', args: [target] },
+      { command: 'vlc', args: [target] }
+    );
+  } else {
+    attempts.push(
+      { command: 'vlc', args: [target] },
+      { command: '/usr/bin/vlc', args: [target] },
+      { command: '/usr/local/bin/vlc', args: [target] },
+      { command: '/snap/bin/vlc', args: [target] }
+    );
+  }
+
+  const seen = new Set();
+  return attempts.filter((attempt) => {
+    const key = `${attempt.command}\n${attempt.args.join('\n')}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function spawnDetached(command, args) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let readyTimer = null;
+
+    const finishResolve = (child) => {
+      if (settled) return;
+      settled = true;
+      if (readyTimer) clearTimeout(readyTimer);
+      if (child && typeof child.unref === 'function') child.unref();
+      resolve();
+    };
+
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      if (readyTimer) clearTimeout(readyTimer);
+      reject(error);
+    };
+
+    try {
+      const child = spawn(command, args, {
+        shell: false,
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.once('error', (error) => {
+        finishReject(error);
+      });
+      child.once('spawn', () => {
+        readyTimer = setTimeout(() => finishResolve(child), 300);
+      });
+      child.once('exit', (code, signal) => {
+        if (code === 0 || signal) {
+          finishResolve(child);
+          return;
+        }
+        finishReject(new Error(`Command exited with code ${code}`));
+      });
+    } catch (error) {
+      finishReject(error);
+    }
+  });
+}
+
+async function openStreamInVlc(url) {
+  let lastError = null;
+  for (const attempt of buildVlcLaunchAttempts(url)) {
+    try {
+      await spawnDetached(attempt.command, attempt.args);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const message = `VLC is not installed or could not be started. Install it from ${VLC_DOWNLOAD_URL}`;
+  const error = new Error(message);
+  error.cause = lastError;
+  throw error;
 }
 
 function scheduleSessionCleanup(sessionId, delayMs = STREAM_CLEANUP_DELAY_MS) {
@@ -738,7 +995,7 @@ app.post('/api/stream/start', async (req, res) => {
       const url = data && data.url ? data.url : null;
       if (url) {
         persistSessionHistory(session);
-        session.lifecycle.playerReady(url);
+        applySessionPlayerReady(session, data);
       }
     });
 
@@ -753,10 +1010,10 @@ app.post('/api/stream/start', async (req, res) => {
     sm.stream(parsed.magnet, {
       openPlayer: false,
       subtitlePath: resolvedSubtitlePath,
-    }).then(({ url }) => {
-      if (url) {
+    }).then((result) => {
+      if (result && result.url) {
         persistSessionHistory(session);
-        session.lifecycle.playerReady(url);
+        applySessionPlayerReady(session, result);
       }
     }).catch((err) => {
       session.lifecycle.line(`Error: ${err.message}`);
@@ -769,6 +1026,36 @@ app.post('/api/stream/start', async (req, res) => {
     res.json({ sessionId: session.id, mode: PLAYER_MODE });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/stream/open-vlc', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim()
+      ? body.sessionId.trim()
+      : null;
+    const resolved = resolveOpenableSession(sessionId);
+
+    if (resolved.error === 'Session not found') {
+      return res.status(404).json({ error: resolved.error });
+    }
+    if (resolved.error) {
+      return res.status(409).json({ error: resolved.error });
+    }
+
+    await openStreamInVlc(resolved.vlcUrl || resolved.url);
+    res.json({
+      ok: true,
+      url: resolved.url,
+      vlcUrl: resolved.vlcUrl || resolved.url,
+      message: 'Opening stream in VLC',
+    });
+  } catch (e) {
+    res.status(503).json({
+      error: e.message,
+      installUrl: VLC_DOWNLOAD_URL,
+    });
   }
 });
 
@@ -789,9 +1076,15 @@ app.get('/api/stream/output/:sessionId', (req, res) => {
   }
 
   // If player is already ready, send it again
-  const lifecycleStatus = session.lifecycle ? session.lifecycle.status() : { playerUrl: null };
+  const lifecycleStatus = getSessionPlayerState(session);
   if (lifecycleStatus.playerUrl) {
-    res.write(`event: player_ready\ndata: ${JSON.stringify({ url: lifecycleStatus.playerUrl })}\n\n`);
+    res.write(`event: player_ready\ndata: ${JSON.stringify({
+      url: lifecycleStatus.playerUrl,
+      playerUrl: lifecycleStatus.playerUrl,
+      vlcUrl: lifecycleStatus.vlcUrl,
+      castUrl: lifecycleStatus.castUrl,
+      subtitleManifestUrl: lifecycleStatus.subtitleManifestUrl,
+    })}\n\n`);
   }
 
   session.clients.push(res);
@@ -818,11 +1111,15 @@ app.delete('/api/stream/kill-all', async (req, res) => {
 app.get('/api/stream/status', (req, res) => {
   const active = [];
   for (const [id, session] of streamSessions.entries()) {
-    const lifecycleStatus = session.lifecycle ? session.lifecycle.status() : { playerUrl: null, exited: false };
+    const lifecycleStatus = getSessionPlayerState(session);
     active.push({
       id,
       running: !!session.streamManager && !lifecycleStatus.exited,
       playerUrl: lifecycleStatus.playerUrl,
+      vlcUrl: lifecycleStatus.vlcUrl,
+      castUrl: lifecycleStatus.castUrl,
+      subtitleManifestUrl: lifecycleStatus.subtitleManifestUrl,
+      videoFormat: lifecycleStatus.videoFormat,
       started: session.started,
       mode: session.mode || PLAYER_MODE,
       exited: !!lifecycleStatus.exited,
@@ -830,6 +1127,55 @@ app.get('/api/stream/status', (req, res) => {
     });
   }
   res.json(active);
+});
+
+// TV Cast readiness test endpoint
+app.get('/api/cast/test', (req, res) => {
+  const sessions = Array.from(streamSessions.values());
+  const activeSession = sessions.find(s => s.streamManager && !s.lifecycle?.status()?.exited);
+  
+  if (!activeSession) {
+    return res.status(404).json({
+      ready: false,
+      error: 'No active stream session',
+      message: 'Start a stream first, then try casting'
+    });
+  }
+  
+  const lifecycleStatus = getSessionPlayerState(activeSession);
+  const castUrl = lifecycleStatus.castUrl || activeSession.castUrl;
+  const subtitleManifestUrl = lifecycleStatus.subtitleManifestUrl || activeSession.subtitleManifestUrl;
+  
+  // Build test URLs for TV verification
+  const testResults = {
+    ready: !!castUrl,
+    timestamp: Date.now(),
+    sessionId: activeSession.id,
+    castUrl: castUrl || null,
+    subtitleManifestUrl: subtitleManifestUrl || null,
+    playerUrl: lifecycleStatus.playerUrl || null,
+    tests: {
+      castUrlAccessible: castUrl ? !castUrl.includes('localhost') : false,
+      subtitleManifestAccessible: subtitleManifestUrl ? !subtitleManifestUrl.includes('localhost') : false,
+      streamRunning: !!activeSession.streamManager,
+    },
+    recommendations: []
+  };
+  
+  // Add recommendations if there are issues
+  if (!testResults.tests.castUrlAccessible && castUrl) {
+    testResults.recommendations.push(
+      'Cast URL uses localhost. Open Uplayer from your network IP (e.g., http://192.168.x.x:3000) instead of localhost.'
+    );
+  }
+  
+  if (!testResults.tests.castUrlAccessible && !castUrl) {
+    testResults.recommendations.push(
+      'No cast URL available. Make sure the stream has started successfully.'
+    );
+  }
+  
+  res.json(testResults);
 });
 
 // --- SPA Catch-all ------------------------------------------------------------
@@ -846,7 +1192,7 @@ function getServerUrl(server = activeServer) {
   if (!server || !server.listening) return null;
   const addr = server.address();
   const resolvedPort = addr && typeof addr === 'object' ? addr.port : PORT;
-  return buildAccessibleUrls(resolvedPort).preferred;
+  return buildAccessibleUrls(resolvedPort).localhost;
 }
 
 function startServer(port = PORT) {

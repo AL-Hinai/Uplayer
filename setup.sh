@@ -1,126 +1,324 @@
 #!/usr/bin/env bash
 
-# ═══════════════════════════════════════════════════════════════
-#  UPLAYER - Universal One-Command Installer
-#  Works on: Linux, macOS, Windows (WSL/Git Bash)
-#  Result: Global 'uplayer' command ready to use
-# ═══════════════════════════════════════════════════════════════
+set -euo pipefail
 
-set -e
+G='\033[0;32m'
+Y='\033[1;33m'
+B='\033[0;34m'
+C='\033[0;36m'
+R='\033[0;31m'
+N='\033[0m'
 
-# Colors
-G='\033[0;32m' Y='\033[1;33m' B='\033[0;34m' C='\033[0;36m' R='\033[0;31m' N='\033[0m'
-
-clear
-echo -e "${C}╔════════════════════════════════════════╗${N}"
-echo -e "${C}║  UPLAYER - Universal Installer        ║${N}"
-echo -e "${C}║  One command. Works everywhere.        ║${N}"
-echo -e "${C}╚════════════════════════════════════════╝${N}\n"
-
-# Detect OS
-case "$(uname -s)" in
-    Linux*)  OS="linux";;
-    Darwin*) OS="macos";;
-    *) OS="linux";;  # Fallback for WSL/Git Bash
-esac
-
-INSTALL_DIR="$HOME/.local/bin"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${HOME}/.local/bin"
+VLC_COMMAND=""
+VLC_DOWNLOAD_URL="https://www.videolan.org/vlc/"
+VLC_INSTALL_STATUS="not-attempted"
 
-echo -e "${B}→${N} Detected: ${G}$OS${N}"
-echo -e "${B}→${N} Installing to: ${C}$INSTALL_DIR${N}\n"
+print_header() {
+  clear || true
+  echo -e "${C}========================================${N}"
+  echo -e "${C}  UPLAYER - Universal Installer         ${N}"
+  echo -e "${C}========================================${N}"
+  echo
+}
 
-# Step 1: Check/Install Runtime
-echo -e "${C}[1/4]${N} Checking runtime..."
-if command -v bun >/dev/null 2>&1; then
-    echo -e "  ${G}✓${N} Bun found (fastest!)"
-    RUNTIME="bun"
-    INSTALL_CMD="bun install"
-    RUN_CMD="bun run"
-elif command -v node >/dev/null 2>&1; then
-    echo -e "  ${G}✓${N} Node.js found"
-    RUNTIME="node"
-    INSTALL_CMD="npm install"
-    RUN_CMD="node"
-else
-    echo -e "  ${Y}!${N} No runtime found. Installing Bun (fastest)..."
-    if [[ "$OS" == "linux" ]] || [[ "$OS" == "macos" ]]; then
-        curl -fsSL https://bun.sh/install | bash
-        export BUN_INSTALL="$HOME/.bun"
-        export PATH="$BUN_INSTALL/bin:$PATH"
-        RUNTIME="bun"
-        INSTALL_CMD="bun install"
-        RUN_CMD="bun run"
-        echo -e "  ${G}✓${N} Bun installed!"
-    else
-        echo -e "${R}✗${N} Please install Node.js from https://nodejs.org"
-        exit 1
+has_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+resolve_vlc_command() {
+  if has_command vlc; then
+    command -v vlc
+    return 0
+  fi
+
+  if has_command vlc.exe; then
+    command -v vlc.exe
+    return 0
+  fi
+
+  local candidate
+  for candidate in \
+    "/c/Program Files/VideoLAN/VLC/vlc.exe" \
+    "/c/Program Files (x86)/VideoLAN/VLC/vlc.exe" \
+    "/mnt/c/Program Files/VideoLAN/VLC/vlc.exe" \
+    "/mnt/c/Program Files (x86)/VideoLAN/VLC/vlc.exe"
+  do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
     fi
-fi
+  done
 
-# Step 2: Install Dependencies
-echo -e "\n${C}[2/4]${N} Installing dependencies..."
-cd "$SCRIPT_DIR"
-if [[ ! -d "node_modules" ]]; then
-    $INSTALL_CMD > /dev/null 2>&1
-    echo -e "  ${G}✓${N} Dependencies installed"
-else
-    echo -e "  ${G}✓${N} Already installed"
-fi
+  return 1
+}
 
-# Step 3: Create Global Command
-echo -e "\n${C}[3/4]${N} Creating global command..."
-mkdir -p "$INSTALL_DIR"
+detect_os() {
+  case "$(uname -s)" in
+    Linux*) echo "linux" ;;
+    Darwin*) echo "macos" ;;
+    MINGW*|MSYS*|CYGWIN*) echo "windows-shell" ;;
+    *) echo "linux" ;;
+  esac
+}
 
-cat > "$INSTALL_DIR/uplayer" << EOF
+detect_shell_rc() {
+  if [[ -n "${ZSH_VERSION:-}" ]]; then
+    echo "${HOME}/.zshrc"
+  elif [[ -n "${BASH_VERSION:-}" ]]; then
+    echo "${HOME}/.bashrc"
+  else
+    echo "${HOME}/.profile"
+  fi
+}
+
+vlc_exists() {
+  local resolved=""
+  if ! resolved="$(resolve_vlc_command)"; then
+    return 1
+  fi
+
+  if [[ "$resolved" == */* ]]; then
+    export PATH="${PATH}:$(dirname "$resolved")"
+  fi
+
+  return 0
+}
+
+run_install_deps() {
+  "${INSTALL_CMD[@]}" >/dev/null 2>&1
+}
+
+write_launcher() {
+  mkdir -p "$INSTALL_DIR"
+
+  if [[ "$RUNTIME" == "bun" ]]; then
+    cat > "${INSTALL_DIR}/uplayer" <<EOF
 #!/usr/bin/env bash
-exec $RUN_CMD "$SCRIPT_DIR/uplayer.js" "\$@"
+exec bun run "${SCRIPT_DIR}/uplayer.js" "\$@"
 EOF
+  else
+    cat > "${INSTALL_DIR}/uplayer" <<EOF
+#!/usr/bin/env bash
+exec node "${SCRIPT_DIR}/uplayer.js" "\$@"
+EOF
+  fi
 
-chmod +x "$INSTALL_DIR/uplayer"
-echo -e "  ${G}✓${N} Global command created"
+  chmod +x "${INSTALL_DIR}/uplayer"
+}
 
-# Step 4: Add to PATH
-echo -e "\n${C}[4/4]${N} Adding to PATH..."
+ensure_path() {
+  local rc_file
+  rc_file="$(detect_shell_rc)"
 
-# Detect shell config
-if [[ -n "$BASH_VERSION" ]]; then
-    RC="$HOME/.bashrc"
-elif [[ -n "$ZSH_VERSION" ]]; then
-    RC="$HOME/.zshrc"
+  if ! grep -Fq "$INSTALL_DIR" "$rc_file" 2>/dev/null; then
+    {
+      echo
+      echo "# Uplayer"
+      echo "export PATH=\"\$PATH:${INSTALL_DIR}\""
+    } >> "$rc_file"
+    echo -e "  ${G}OK${N} Added ${INSTALL_DIR} to ${rc_file}"
+  else
+    echo -e "  ${G}OK${N} PATH already contains ${INSTALL_DIR}"
+  fi
+
+  export PATH="${PATH}:${INSTALL_DIR}"
+}
+
+print_manual_vlc_help() {
+  echo -e "  ${Y}!${N} VLC was not installed automatically."
+  if [[ -n "$VLC_COMMAND" ]]; then
+    echo -e "  ${Y}!${N} Exact install command:"
+    echo "      ${VLC_COMMAND}"
+  fi
+  echo -e "  ${Y}!${N} Manual download: ${VLC_DOWNLOAD_URL}"
+}
+
+linux_vlc_install() {
+  local -a elevate=()
+  if [[ "$(id -u)" -ne 0 ]]; then
+    if has_command sudo; then
+      elevate=(sudo)
+    else
+      return 1
+    fi
+  fi
+
+  if has_command apt-get; then
+    VLC_COMMAND="${elevate[*]} apt-get update && ${elevate[*]} apt-get install -y vlc"
+    "${elevate[@]}" apt-get update && "${elevate[@]}" apt-get install -y vlc
+    return
+  fi
+
+  if has_command dnf; then
+    VLC_COMMAND="${elevate[*]} dnf install -y vlc"
+    "${elevate[@]}" dnf install -y vlc
+    return
+  fi
+
+  if has_command yum; then
+    VLC_COMMAND="${elevate[*]} yum install -y vlc"
+    "${elevate[@]}" yum install -y vlc
+    return
+  fi
+
+  if has_command pacman; then
+    VLC_COMMAND="${elevate[*]} pacman -Sy --noconfirm vlc"
+    "${elevate[@]}" pacman -Sy --noconfirm vlc
+    return
+  fi
+
+  if has_command zypper; then
+    VLC_COMMAND="${elevate[*]} zypper --non-interactive install vlc"
+    "${elevate[@]}" zypper --non-interactive install vlc
+    return
+  fi
+
+  return 1
+}
+
+macos_vlc_install() {
+  if ! has_command brew; then
+    return 1
+  fi
+
+  VLC_COMMAND="brew install --cask vlc"
+  brew install --cask vlc
+}
+
+windows_shell_vlc_install() {
+  VLC_DOWNLOAD_URL="https://www.videolan.org/vlc/download-windows.html"
+
+  if has_command winget.exe; then
+    VLC_COMMAND="winget.exe install --exact --id VideoLAN.VLC --accept-package-agreements --accept-source-agreements --silent"
+    winget.exe install --exact --id VideoLAN.VLC --accept-package-agreements --accept-source-agreements --silent
+    return
+  fi
+
+  if has_command choco; then
+    VLC_COMMAND="choco install vlc -y"
+    choco install vlc -y
+    return
+  fi
+
+  return 1
+}
+
+install_vlc() {
+  echo -e "\n${C}[5/5]${N} Ensuring VLC is available..."
+
+  if vlc_exists; then
+    echo -e "  ${G}OK${N} VLC already installed"
+    VLC_INSTALL_STATUS="present"
+    return
+  fi
+
+  echo -e "  ${B}->${N} VLC not found. Attempting automatic install..."
+
+  if [[ "$OS" == "macos" ]]; then
+    if macos_vlc_install; then
+      VLC_INSTALL_STATUS="installed"
+    else
+      VLC_INSTALL_STATUS="failed"
+    fi
+  elif [[ "$OS" == "windows-shell" ]]; then
+    if windows_shell_vlc_install; then
+      VLC_INSTALL_STATUS="installed"
+    else
+      VLC_INSTALL_STATUS="failed"
+    fi
+  else
+    if linux_vlc_install; then
+      VLC_INSTALL_STATUS="installed"
+    else
+      VLC_INSTALL_STATUS="failed"
+    fi
+  fi
+
+  if vlc_exists; then
+    echo -e "  ${G}OK${N} VLC is ready"
+    VLC_INSTALL_STATUS="verified"
+  else
+    print_manual_vlc_help
+  fi
+}
+
+print_footer() {
+  echo
+  echo -e "${G}========================================${N}"
+  echo -e "${G}  Uplayer installation complete         ${N}"
+  echo -e "${G}========================================${N}"
+  echo
+  echo -e "${C}Try it now:${N}"
+  echo -e "  ${G}uplayer \"Inception\"${N}"
+  echo
+  if [[ "$VLC_INSTALL_STATUS" == "verified" || "$VLC_INSTALL_STATUS" == "present" ]]; then
+    echo -e "${G}VLC status:${N} ready"
+  else
+    echo -e "${Y}VLC status:${N} manual setup may still be needed"
+  fi
+  echo
+  echo -e "${Y}Note:${N} If the 'uplayer' command is not available yet, restart your shell or run:"
+  echo -e "  ${C}source $(detect_shell_rc)${N}"
+  echo
+}
+
+print_header
+
+OS="$(detect_os)"
+VLC_DOWNLOAD_URL="https://www.videolan.org/vlc/"
+
+if [[ "$OS" == "windows-shell" ]]; then
+  echo -e "${B}->${N} Detected shell environment on Windows"
+  echo -e "${B}->${N} For native PowerShell installation, you can also run: ${C}./setup.ps1${N}"
 else
-    RC="$HOME/.profile"
+  echo -e "${B}->${N} Detected: ${G}${OS}${N}"
+fi
+echo -e "${B}->${N} Installing launcher into: ${C}${INSTALL_DIR}${N}"
+echo
+
+echo -e "${C}[1/5]${N} Checking runtime..."
+if has_command bun; then
+  RUNTIME="bun"
+  INSTALL_CMD=(bun install)
+  echo -e "  ${G}OK${N} Bun found"
+elif has_command node; then
+  RUNTIME="node"
+  INSTALL_CMD=(npm install)
+  echo -e "  ${G}OK${N} Node.js found"
+else
+  echo -e "  ${Y}!${N} No runtime found."
+  if [[ "$OS" == "linux" || "$OS" == "macos" ]]; then
+    curl -fsSL https://bun.sh/install | bash
+    export BUN_INSTALL="${HOME}/.bun"
+    export PATH="${BUN_INSTALL}/bin:${PATH}"
+    RUNTIME="bun"
+    INSTALL_CMD=(bun install)
+    echo -e "  ${G}OK${N} Bun installed"
+  else
+    echo -e "${R}X${N} Install Node.js or Bun first, then rerun setup."
+    echo "    Node.js: https://nodejs.org/"
+    echo "    Bun: https://bun.sh/"
+    exit 1
+  fi
 fi
 
-# Add to PATH if not already there
-if ! grep -q "$INSTALL_DIR" "$RC" 2>/dev/null; then
-    echo "" >> "$RC"
-    echo "# Uplayer" >> "$RC"
-    echo "export PATH=\"\$PATH:$INSTALL_DIR\"" >> "$RC"
-    echo -e "  ${G}✓${N} Added to $RC"
+echo -e "\n${C}[2/5]${N} Installing dependencies..."
+cd "$SCRIPT_DIR"
+if [[ -d node_modules ]]; then
+  echo -e "  ${G}OK${N} node_modules already present"
 else
-    echo -e "  ${G}✓${N} Already in PATH"
+  run_install_deps
+  echo -e "  ${G}OK${N} Dependencies installed"
 fi
 
-# Add to current session
-export PATH="$PATH:$INSTALL_DIR"
+echo -e "\n${C}[3/5]${N} Creating global command..."
+write_launcher
+echo -e "  ${G}OK${N} Created ${INSTALL_DIR}/uplayer"
 
-# Check for media player
-echo -e "\n${B}→${N} Checking for media player..."
-if command -v vlc >/dev/null 2>&1 || command -v mpv >/dev/null 2>&1; then
-    echo -e "  ${G}✓${N} Media player found"
-else
-    echo -e "  ${Y}!${N} No media player found. Install VLC or MPV."
-fi
+echo -e "\n${C}[4/5]${N} Updating PATH..."
+ensure_path
 
-# Success!
-echo -e "\n${G}╔════════════════════════════════════════╗${N}"
-echo -e "${G}║  ✓ Installation Complete!             ║${N}"
-echo -e "${G}╚════════════════════════════════════════╝${N}"
-
-echo -e "\n${C}Try it now:${N}"
-echo -e "  ${G}uplayer \"Inception\"${N}"
-echo -e "\n${Y}Note:${N} If 'uplayer' command not found, run:"
-echo -e "  ${C}source $RC${N}"
-echo -e "  or restart your terminal\n"
-
+install_vlc
+print_footer

@@ -31,6 +31,17 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
       </button>
     </div>
+    <div class="nav-cast-indicator" id="navCastIndicator" onclick="openCastTvModal(event)" title="Cast to TV">
+      <svg class="cast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 10H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"/>
+        <path d="M17 10h2a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-2"/>
+        <path d="M5 10a5 5 0 0 1 5-5h4"/>
+        <path d="M17 10a5 5 0 0 0-5-5"/>
+        <circle cx="19" cy="19" r="2" fill="currentColor"/>
+      </svg>
+      <span class="cast-status-dot"></span>
+      <span class="cast-device-name" id="castDeviceName"></span>
+    </div>
     <button class="hamburger" id="hamburger" aria-label="Menu">
       <span></span><span></span><span></span>
     </button>
@@ -52,6 +63,13 @@
     <div class="modal" id="modal">
       <button class="modal-close" id="modalClose" aria-label="Close">&times;</button>
       <div class="modal-content" id="modalContent"></div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="castModalOverlay" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal cast-modal" id="castModal">
+      <button class="modal-close" id="castModalClose" aria-label="Close">&times;</button>
+      <div class="modal-content cast-modal-content" id="castModalContent"></div>
     </div>
   </div>
 

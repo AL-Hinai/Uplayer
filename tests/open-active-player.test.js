@@ -7,10 +7,10 @@ const vm = require('vm');
 
 function loadPlayerHelpers(overrides = {}) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
-  const start = source.indexOf('async function resolveActivePlayerUrl');
+  const start = source.indexOf('function normalizeActiveStreamMeta');
   const end = source.indexOf('function goBackFromWizard', start);
 
-  assert.notStrictEqual(start, -1, 'resolveActivePlayerUrl not found');
+  assert.notStrictEqual(start, -1, 'normalizeActiveStreamMeta not found');
   assert.notStrictEqual(end, -1, 'openActivePlayer block not found');
 
   const context = {
@@ -18,7 +18,14 @@ function loadPlayerHelpers(overrides = {}) {
     exports: {},
     Promise,
     console,
-    wizard: { playerUrl: null },
+    URL,
+    wizard: {
+      sessionId: null,
+      playerUrl: null,
+      vlcUrl: null,
+      castUrl: null,
+      subtitleManifestUrl: null,
+    },
     state: { currentPage: 'home' },
     navigate: () => {},
     toast: () => {},
@@ -29,7 +36,7 @@ function loadPlayerHelpers(overrides = {}) {
 
   vm.createContext(context);
   vm.runInContext(
-    `${source.slice(start, end)}\nmodule.exports = { resolveActivePlayerUrl, openActivePlayer };`,
+    `${source.slice(start, end)}\nmodule.exports = { resolveActivePlayerUrl, openActivePlayer, openActiveVlc };`,
     context
   );
 
@@ -151,10 +158,44 @@ async function testClosesPlaceholderPopupWhenPlayerIsNotReady() {
   assert.deepStrictEqual(toastArgs, ['Player is still starting', 'info']);
 }
 
+async function testRequestsVlcLaunchForActiveSession() {
+  let request = null;
+  let toastArgs = null;
+
+  const { openActiveVlc } = loadPlayerHelpers({
+    wizard: { playerUrl: 'http://127.0.0.1:8000', sessionId: 'stream_1' },
+    fetchJson: async (url, options) => {
+      request = { url, options };
+      return { ok: true, message: 'Opening stream in VLC' };
+    },
+    toast(message, type) {
+      toastArgs = [message, type];
+    },
+  });
+
+  const event = {
+    defaultPrevented: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+  };
+
+  assert.strictEqual(openActiveVlc(event), false);
+  await flushAsyncWork();
+
+  assert.strictEqual(event.defaultPrevented, true);
+  assert.ok(request, 'expected VLC launch request to be sent');
+  assert.strictEqual(request.url, '/api/stream/open-vlc');
+  assert.strictEqual(request.options.method, 'POST');
+  assert.deepStrictEqual(JSON.parse(request.options.body), { sessionId: 'stream_1' });
+  assert.deepStrictEqual(toastArgs, ['Opening stream in VLC', 'success']);
+}
+
 async function main() {
   await testReusesSinglePopupForResolvedUrl();
   await testFallsBackToDirectOpenWhenPopupBlocked();
   await testClosesPlaceholderPopupWhenPlayerIsNotReady();
+  await testRequestsVlcLaunchForActiveSession();
   console.log('open-active-player.test.js passed');
 }
 

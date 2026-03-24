@@ -1405,8 +1405,18 @@ document.getElementById('modalClose').addEventListener('click', closeModal);
 document.getElementById('modalOverlay').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeModal();
 });
+document.getElementById('castModalClose').addEventListener('click', closeCastTvModal);
+document.getElementById('castModalOverlay').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeCastTvModal();
+});
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeModal();
+  if (e.key !== 'Escape') return;
+  const castOverlay = document.getElementById('castModalOverlay');
+  if (castOverlay && castOverlay.classList.contains('open')) {
+    closeCastTvModal();
+    return;
+  }
+  closeModal();
 });
 
 // --- Nav Search ---------------------------------------------------------------
@@ -1481,11 +1491,38 @@ const wizard = {
   sessionId: null,
   sseSource: null,
   playerUrl: null,
+  vlcUrl: null,
+  castUrl: null,
+  subtitleManifestUrl: null,
+  videoFormat: null,
   detail: null,
   historySaved: false,
   // Step
   step: 1, // 1=episode(TV)/torrent(movie), 2=torrents, 3=subtitles, 4=streaming
 };
+
+const CAST_SENDER_SCRIPT = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
+const LOCAL_QR_SCRIPT = '/vendor/qrcode.min.js';
+const DEFAULT_CAST_RECEIVER_APP_ID = 'CC1AD845';
+const CAST_SESSION_STORAGE_KEY = 'uplayer.cast.session.v1';
+const castTvState = {
+  meta: null,
+  subtitleOptions: [],
+  selectedSubtitleTrackId: '',
+  senderAllowed: false,
+  castSdkReady: false,
+  senderHelperUrl: '',
+  // Cast session state
+  isCasting: false,
+  castSession: null,
+  castDeviceName: '',
+  castVolume: 0.5,
+  isMuted: false,
+};
+const externalScriptPromises = new Map();
+let googleCastSdkPromise = null;
+let googleCastContextReady = false;
+let castStatusUpdateInterval = null;
 
 const WIZARD_STORAGE_KEY = 'uplayer.stream.wizard.v2';
 const WIZARD_MAX_AGE_MS = 6 * 60 * 60 * 1000;
@@ -1506,6 +1543,9 @@ function getWizardSnapshot() {
     skipSubtitles: wizard.skipSubtitles,
     sessionId: wizard.sessionId,
     playerUrl: wizard.playerUrl,
+    vlcUrl: wizard.vlcUrl,
+    castUrl: wizard.castUrl,
+    subtitleManifestUrl: wizard.subtitleManifestUrl,
     step: wizard.step,
     savedAt: Date.now(),
   };
@@ -1525,6 +1565,52 @@ function clearWizardState() {
     sessionStorage.removeItem(WIZARD_STORAGE_KEY);
   } catch (e) {
     // Ignore storage delete failures.
+  }
+}
+
+// --- Cast Session Persistence ---
+
+function saveCastSessionState() {
+  try {
+    if (!castTvState.isCasting) {
+      sessionStorage.removeItem(CAST_SESSION_STORAGE_KEY);
+      return;
+    }
+    const state = {
+      isCasting: castTvState.isCasting,
+      castDeviceName: castTvState.castDeviceName,
+      castVolume: castTvState.castVolume,
+      isMuted: castTvState.isMuted,
+      savedAt: Date.now(),
+    };
+    sessionStorage.setItem(CAST_SESSION_STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    // Ignore storage failures
+  }
+}
+
+function loadCastSessionState() {
+  try {
+    const raw = sessionStorage.getItem(CAST_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.savedAt) return null;
+    // Expire after 5 minutes
+    if (Date.now() - parsed.savedAt > 5 * 60 * 1000) {
+      sessionStorage.removeItem(CAST_SESSION_STORAGE_KEY);
+      return null;
+    }
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearCastSessionState() {
+  try {
+    sessionStorage.removeItem(CAST_SESSION_STORAGE_KEY);
+  } catch (e) {
+    // Ignore storage failures
   }
 }
 
@@ -1593,19 +1679,54 @@ async function saveWizardHistoryIfNeeded() {
   }
 }
 
-async function resolveActivePlayerUrl(fallbackUrl) {
-  const normalizedFallback = fallbackUrl && fallbackUrl !== '#' ? fallbackUrl : null;
+function normalizeActiveStreamMeta(meta = {}) {
+  const source = meta && typeof meta === 'object' ? meta : {};
+  return {
+    sessionId: source.sessionId || source.id || wizard.sessionId || null,
+    playerUrl: source.playerUrl || source.url || wizard.playerUrl || null,
+    vlcUrl: source.vlcUrl || source.mediaUrl || wizard.vlcUrl || null,
+    castUrl: source.castUrl || wizard.castUrl || null,
+    subtitleManifestUrl: source.subtitleManifestUrl || wizard.subtitleManifestUrl || null,
+    videoFormat: source.videoFormat || null,
+  };
+}
+
+function applyActiveStreamMeta(meta, options = {}) {
+  const normalized = normalizeActiveStreamMeta(meta);
+  wizard.sessionId = normalized.sessionId;
+  wizard.playerUrl = normalized.playerUrl;
+  wizard.vlcUrl = normalized.vlcUrl;
+  wizard.castUrl = normalized.castUrl;
+  wizard.subtitleManifestUrl = normalized.subtitleManifestUrl;
+  wizard.videoFormat = normalized.videoFormat || null;
+  if (options.persist) persistWizardState();
+  return normalized;
+}
+
+async function resolveActiveStreamMeta(fallbacks = {}) {
+  const normalizedFallbacks = normalizeActiveStreamMeta({
+    ...fallbacks,
+    playerUrl: fallbacks.playerUrl && fallbacks.playerUrl !== '#' ? fallbacks.playerUrl : null,
+  });
+
   try {
     const active = await fetchJson('/api/stream/status');
-    const running = active.find((session) => session.playerUrl && (session.running || !session.exited))
+    const preferred = active.find((session) => session.id === normalizedFallbacks.sessionId)
+      || active.find((session) => session.playerUrl && (session.running || !session.exited))
       || active.find((session) => session.playerUrl);
-    if (running && running.playerUrl) {
-      return running.playerUrl;
+    if (preferred) {
+      return normalizeActiveStreamMeta(preferred);
     }
   } catch (e) {
-    // Ignore polling errors and fall back to the rendered URL.
+    // Ignore polling errors and fall back to the rendered stream metadata.
   }
-  return normalizedFallback || wizard.playerUrl || null;
+
+  return normalizedFallbacks;
+}
+
+async function resolveActivePlayerUrl(fallbackUrl) {
+  const meta = await resolveActiveStreamMeta({ playerUrl: fallbackUrl });
+  return meta.playerUrl || null;
 }
 
 function openActivePlayer(event, fallbackUrl) {
@@ -1635,6 +1756,832 @@ function openActivePlayer(event, fallbackUrl) {
     toast('Could not open the active player', 'error');
   });
 
+  return false;
+}
+
+function openActiveVlc(event, fallbackSessionId) {
+  if (event) event.preventDefault();
+  const sessionId = fallbackSessionId || wizard.sessionId || null;
+  fetchJson('/api/stream/open-vlc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(sessionId ? { sessionId } : {}),
+  }).then((data) => {
+    toast(data.message || 'Opening stream in VLC', 'success');
+  }).catch((error) => {
+    const message = error && error.message ? String(error.message) : 'Could not open VLC';
+    if (/player is still starting/i.test(message)) {
+      if (state.currentPage !== 'stream') navigate('/stream');
+      toast('Player is still starting', 'info');
+      return;
+    }
+    if (/session not found/i.test(message) && state.currentPage !== 'stream') {
+      navigate('/stream');
+    }
+    toast(message, 'error', 5000);
+  });
+  return false;
+}
+
+function isCastSenderOriginAllowed(locationLike = window.location) {
+  if (!locationLike) return false;
+  const protocol = String(locationLike.protocol || '').toLowerCase();
+  const hostname = String(locationLike.hostname || '').toLowerCase();
+  return protocol === 'https:'
+    || hostname === 'localhost'
+    || hostname === '127.0.0.1'
+    || hostname === '::1'
+    || hostname === '[::1]';
+}
+
+function buildLocalhostSenderUrl(locationLike = window.location) {
+  if (!locationLike) return 'http://localhost/';
+  const port = locationLike.port ? `:${locationLike.port}` : '';
+  const path = locationLike.pathname || '/';
+  const search = locationLike.search || '';
+  const hash = locationLike.hash || '';
+  const protocol = String(locationLike.protocol || '').toLowerCase() === 'https:' ? 'https:' : 'http:';
+  return `${protocol}//localhost${port}${path}${search}${hash}`;
+}
+
+function guessVideoContentType(url) {
+  const pathname = (() => {
+    try {
+      return new URL(url, window.location.href).pathname.toLowerCase();
+    } catch (e) {
+      return String(url || '').toLowerCase();
+    }
+  })();
+
+  if (pathname.endsWith('.mp4')) return 'video/mp4';
+  if (pathname.endsWith('.mkv')) return 'video/x-matroska';
+  if (pathname.endsWith('.webm')) return 'video/webm';
+  if (pathname.endsWith('.mov')) return 'video/quicktime';
+  if (pathname.endsWith('.avi')) return 'video/x-msvideo';
+  if (pathname.endsWith('.m4v')) return 'video/x-m4v';
+  return 'video/mp4';
+}
+
+function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId, displayTitle) {
+  const normalized = normalizeActiveStreamMeta(meta);
+  const castUrl = normalized.castUrl || '';
+
+  // Ensure cast URL uses network IP, not localhost
+  let contentUrl = castUrl;
+  if (castUrl.includes('localhost') || castUrl.includes('127.0.0.1')) {
+    // Try to use the playerUrl which should have network IP, or construct from window.location
+    const networkHost = window.location.hostname !== 'localhost'
+      ? window.location.host
+      : null;
+    if (networkHost) {
+      try {
+        const urlObj = new URL(castUrl);
+        urlObj.host = networkHost;
+        contentUrl = urlObj.href;
+      } catch (e) {
+        // Keep original URL if parsing fails
+      }
+    }
+  }
+
+  const tracks = subtitleOptions.map((track, index) => ({
+    trackId: Number(track.trackId) || index + 1,
+    type: 'TEXT',
+    subtype: 'SUBTITLES',
+    trackContentId: track.trackContentId,
+    trackContentType: track.trackContentType || 'text/vtt',
+    name: track.name || track.label || `Subtitle ${index + 1}`,
+    language: track.language || 'en',
+  }));
+  const fallbackTrackId = tracks.length > 0 ? tracks[0].trackId : null;
+  const activeTrackId = selectedSubtitleTrackId
+    ? Number(selectedSubtitleTrackId)
+    : fallbackTrackId;
+  return {
+    contentId: contentUrl,
+    contentType: 'video/mp4', // Chromecast needs MP4 for best compatibility
+    streamType: 'BUFFERED', // Use BUFFERED for on-demand content (allows seeking, less latency)
+    metadata: {
+      title: displayTitle || wizard.titleText || 'Uplayer Stream',
+    },
+    tracks,
+    activeTrackIds: activeTrackId ? [activeTrackId] : [],
+  };
+}
+
+function renderCastTvModalContent(meta, state = {}) {
+  const normalized = normalizeActiveStreamMeta(meta);
+  const subtitleOptions = Array.isArray(state.subtitleOptions) ? state.subtitleOptions : [];
+  const selectedSubtitleTrackId = state.selectedSubtitleTrackId || '';
+  const senderAllowed = !!state.senderAllowed;
+  const castSdkReady = !!state.castSdkReady;
+  const senderHelperUrl = state.senderHelperUrl || '';
+  const sameNetworkUrl = normalized.playerUrl || '';
+  const isCasting = castTvState.isCasting && castTvState.castSession;
+  const castDeviceName = castTvState.castDeviceName || 'Chromecast';
+  const castVolume = castTvState.castVolume || 0.5;
+  const isMuted = castTvState.isMuted || false;
+
+  const chromecastSection = senderAllowed
+    ? `
+      <div class="cast-modal-card">
+        <div class="cast-modal-card-head">
+          <div>
+            <h3>Chromecast</h3>
+            <p>${isCasting ? `Currently casting to <strong>${escape(castDeviceName)}</strong>` : 'Send the stream from this browser to a Chromecast on the same network.'}</p>
+          </div>
+          <span class="cast-chip ${isCasting ? 'cast-chip-casting' : 'cast-chip-ready'}">${isCasting ? 'Casting' : 'Ready'}</span>
+        </div>
+        ${isCasting ? `
+          <label class="cast-modal-label">Volume</label>
+          <div class="cast-volume-control">
+            <button type="button" class="cast-volume-btn" onclick="return toggleCastMute()" title="${isMuted ? 'Unmute' : 'Mute'}">
+              ${isMuted ? '🔇' : '🔊'}
+            </button>
+            <input type="range" class="cast-volume-slider" min="0" max="100" value="${Math.round(castVolume * 100)}" 
+              onchange="return setCastVolume(this.value / 100)" 
+              onclick="return setCastVolume(this.value / 100)">
+            <span class="cast-volume-value">${Math.round(castVolume * 100)}%</span>
+          </div>
+          ${subtitleOptions.length > 0 ? `
+            <label class="cast-modal-label" for="castSubtitleSelect">Subtitle track</label>
+            <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
+              ${subtitleOptions.map((track) => `
+                <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
+                  ${escape(track.name || `Subtitle ${track.trackId}`)}
+                </option>`).join('')}
+            </select>
+            <p class="cast-modal-note">Changing subtitles may require restarting the cast session.</p>
+          ` : `
+            <p class="cast-modal-note">No subtitles available for this stream.</p>
+          `}
+          <div class="cast-modal-actions">
+            <button type="button" class="btn btn-danger" onclick="return stopChromecastCast(event)">
+              Stop Casting
+            </button>
+          </div>
+        ` : `
+          ${subtitleOptions.length > 0 ? `
+            <label class="cast-modal-label" for="castSubtitleSelect">Subtitle track</label>
+            <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
+              ${subtitleOptions.map((track) => `
+                <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
+                  ${escape(track.name || `Subtitle ${track.trackId}`)}
+                </option>`).join('')}
+            </select>
+            <p class="cast-modal-note">The selected subtitle will be sent with the Chromecast session.</p>
+          ` : `
+            <p class="cast-modal-note">No subtitles available for this stream. Casting will continue without subtitles.</p>
+          `}
+          <div class="cast-modal-actions">
+            <button type="button" class="btn btn-primary" onclick="return startChromecastCast(event)" ${castSdkReady ? '' : 'disabled'}>
+              ${castSdkReady ? 'Choose Chromecast' : 'Preparing Chromecast...'}
+            </button>
+          </div>
+          <p class="cast-modal-note">
+            ${castSdkReady
+              ? 'Choose a Chromecast device and Uplayer will send the stream as soon as the connection starts.'
+              : 'Loading the Chromecast sender tools for this page.'}
+          </p>
+        `}
+      </div>`
+    : `
+      <div class="cast-modal-card cast-modal-card-disabled">
+        <div class="cast-modal-card-head">
+          <div>
+            <h3>Chromecast</h3>
+            <p>Chromecast sending is only enabled from localhost or HTTPS sender pages.</p>
+          </div>
+          <span class="cast-chip">Host PC only</span>
+        </div>
+        <p class="cast-modal-note">Open this same Uplayer page on localhost in Chrome or Edge, then cast from there.</p>
+        <div class="cast-modal-actions">
+          <a class="btn btn-outline" href="${escape(senderHelperUrl)}">
+            Open on localhost for Cast
+          </a>
+        </div>
+      </div>`;
+
+  const tvSection = sameNetworkUrl
+    ? `
+      <div class="cast-modal-card">
+        <div class="cast-modal-card-head">
+          <div>
+            <h3>Open on TV</h3>
+            <p>Use this same-network link on Samsung, LG, Chromecast with Google TV browsers, or any TV browser.</p>
+          </div>
+          <span class="cast-chip">TV browser</span>
+        </div>
+        <label class="cast-modal-label" for="castTvLinkInput">TV link</label>
+        <div class="cast-link-row">
+          <input id="castTvLinkInput" class="cast-link-input" type="text" readonly value="${escape(sameNetworkUrl)}">
+          <button type="button" class="btn btn-outline btn-sm" onclick="return copyCastTvLink(event)">
+            Copy Link
+          </button>
+        </div>
+        <div class="cast-qr-wrap">
+          <div class="cast-qr-box" id="castQrCode">
+            <div class="cast-qr-placeholder">Loading QR...</div>
+          </div>
+          <div class="cast-qr-copy">
+            <p>Scan this QR code from the TV or another device on the same network.</p>
+            <a class="btn btn-outline" href="${escape(sameNetworkUrl)}" target="_blank" rel="noopener">
+              Open TV Link
+            </a>
+          </div>
+        </div>
+        <div style="margin-top:1rem;display:flex;gap:0.5rem;flex-wrap:wrap">
+          <button type="button" class="btn btn-outline btn-sm" onclick="return testTvReadiness(event)">
+            Test TV Readiness
+          </button>
+          <span id="tvReadinessStatus" style="font-size:0.8rem;color:var(--text-muted);align-self:center"></span>
+        </div>
+      </div>`
+    : `
+      <div class="cast-modal-card">
+        <div class="cast-modal-card-head">
+          <div>
+            <h3>Open on TV</h3>
+            <p>The TV-ready link will appear when the stream player is live.</p>
+          </div>
+        </div>
+      </div>`;
+
+  return `
+    <div class="cast-modal-shell">
+      <div class="cast-modal-header">
+        <div>
+          <h2>Cast / TV</h2>
+          <p>Chromecast from this PC browser, or open the same stream directly on a TV browser.</p>
+        </div>
+      </div>
+      <div class="cast-modal-grid">
+        ${chromecastSection}
+        ${tvSection}
+      </div>
+    </div>`;
+}
+
+function loadScriptOnce(src) {
+  if (externalScriptPromises.has(src)) {
+    return externalScriptPromises.get(src);
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    const existing = Array.from(document.getElementsByTagName('script'))
+      .find((script) => script.getAttribute('src') === src);
+    if (existing) {
+      if (existing.dataset.loaded === 'true') {
+        resolve(existing);
+        return;
+      }
+      existing.addEventListener('load', () => resolve(existing), { once: true });
+      existing.addEventListener('error', () => reject(new Error(`Could not load script: ${src}`)), { once: true });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.addEventListener('load', () => {
+      script.dataset.loaded = 'true';
+      resolve(script);
+    }, { once: true });
+    script.addEventListener('error', () => {
+      externalScriptPromises.delete(src);
+      reject(new Error(`Could not load script: ${src}`));
+    }, { once: true });
+    document.head.appendChild(script);
+  });
+
+  externalScriptPromises.set(src, promise);
+  return promise;
+}
+
+function loadQrCodeLibrary() {
+  if (typeof window.qrcode === 'function') return Promise.resolve();
+  return loadScriptOnce(LOCAL_QR_SCRIPT).then(() => {
+    if (typeof window.qrcode !== 'function') {
+      throw new Error('QR generator is unavailable');
+    }
+  });
+}
+
+function loadGoogleCastSenderSdk() {
+  if (window.cast && window.cast.framework && window.chrome && window.chrome.cast) {
+    return Promise.resolve();
+  }
+  if (googleCastSdkPromise) return googleCastSdkPromise;
+
+  googleCastSdkPromise = new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      googleCastSdkPromise = null;
+      reject(new Error('Timed out loading Google Cast sender'));
+    }, 10000);
+
+    const previousCallback = window.__onGCastApiAvailable;
+    window.__onGCastApiAvailable = function onGCastApiAvailable(isAvailable) {
+      if (typeof previousCallback === 'function') {
+        previousCallback(isAvailable);
+      }
+      clearTimeout(timeoutId);
+      if (isAvailable && window.cast && window.cast.framework && window.chrome && window.chrome.cast) {
+        resolve();
+        return;
+      }
+      googleCastSdkPromise = null;
+      reject(new Error('Google Cast sender is unavailable on this page'));
+    };
+
+    loadScriptOnce(CAST_SENDER_SCRIPT).catch((error) => {
+      clearTimeout(timeoutId);
+      googleCastSdkPromise = null;
+      reject(error);
+    });
+  });
+
+  return googleCastSdkPromise;
+}
+
+function getReadyGoogleCastContext() {
+  const castContext = window.cast && window.cast.framework
+    ? window.cast.framework.CastContext.getInstance()
+    : null;
+  if (!castContext) return null;
+  if (!googleCastContextReady) {
+    castContext.setOptions({
+      receiverApplicationId: (window.chrome && window.chrome.cast && window.chrome.cast.media
+        ? window.chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID
+        : null) || DEFAULT_CAST_RECEIVER_APP_ID,
+      autoJoinPolicy: window.chrome && window.chrome.cast
+        ? window.chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+        : 'origin_scoped',
+    });
+    googleCastContextReady = true;
+  }
+  return castContext;
+}
+
+async function ensureGoogleCastContext() {
+  await loadGoogleCastSenderSdk();
+  const castContext = getReadyGoogleCastContext();
+  if (!castContext) {
+    throw new Error('Google Cast sender is unavailable on this page');
+  }
+  return castContext;
+}
+
+async function loadCastSubtitleOptions(subtitleManifestUrl) {
+  if (!subtitleManifestUrl) return [];
+  const data = await fetchJson(subtitleManifestUrl);
+  const subtitles = Array.isArray(data.subtitles) ? data.subtitles : [];
+  return subtitles.map((track, index) => ({
+    trackId: index + 1,
+    name: track.label || `Subtitle ${index + 1}`,
+    language: track.language || 'en',
+    trackContentId: new URL(track.url, subtitleManifestUrl).href,
+    trackContentType: 'text/vtt',
+    source: track.source || 'unknown',
+  }));
+}
+
+function renderCastQrCode(url) {
+  const container = document.getElementById('castQrCode');
+  if (!container) return;
+  if (!url) {
+    container.innerHTML = '<div class="cast-qr-placeholder">Waiting for TV link...</div>';
+    return;
+  }
+
+  container.innerHTML = '<div class="cast-qr-placeholder">Loading QR...</div>';
+  loadQrCodeLibrary().then(() => {
+    if (!document.getElementById('castQrCode')) return;
+    const qr = window.qrcode(0, 'M');
+    qr.addData(url);
+    qr.make();
+    container.innerHTML = qr.createImgTag(4, 6, 'TV Link QR');
+  }).catch(() => {
+    container.innerHTML = '<div class="cast-qr-placeholder">QR unavailable</div>';
+  });
+}
+
+function closeCastTvModal() {
+  const overlay = document.getElementById('castModalOverlay');
+  if (!overlay) return;
+  overlay.classList.remove('open');
+  overlay.setAttribute('aria-hidden', 'true');
+}
+
+function handleCastSubtitleSelection(value) {
+  castTvState.selectedSubtitleTrackId = String(value || '');
+  return false;
+}
+
+function copyCastTvLink(event) {
+  if (event) event.preventDefault();
+  const link = castTvState.meta && castTvState.meta.playerUrl ? castTvState.meta.playerUrl : '';
+  if (!link) {
+    toast('TV link is not ready yet', 'info');
+    return false;
+  }
+
+  const fallbackCopy = () => {
+    const input = document.getElementById('castTvLinkInput');
+    if (!input) return false;
+    input.focus();
+    input.select();
+    try {
+      document.execCommand('copy');
+      toast('TV link copied', 'success');
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(link).then(() => {
+      toast('TV link copied', 'success');
+    }).catch(() => {
+      if (!fallbackCopy()) {
+        toast('Could not copy the TV link', 'error');
+      }
+    });
+  } else if (!fallbackCopy()) {
+    toast('Could not copy the TV link', 'error');
+  }
+
+  return false;
+}
+
+async function testTvReadiness(event) {
+  if (event) event.preventDefault();
+  
+  const statusEl = document.getElementById('tvReadinessStatus');
+  if (statusEl) {
+    statusEl.textContent = 'Testing...';
+    statusEl.style.color = 'var(--text-muted)';
+  }
+  
+  try {
+    const data = await fetchJson('/api/cast/test');
+    
+    if (!data.ready) {
+      if (statusEl) {
+        statusEl.textContent = 'Not ready: ' + (data.message || data.error);
+        statusEl.style.color = 'var(--red)';
+      }
+      toast(data.message || 'TV not ready', 'error', 5000);
+      return false;
+    }
+    
+    // Check test results
+    const issues = [];
+    if (!data.tests.castUrlAccessible) {
+      issues.push('Cast URL not accessible from network');
+    }
+    if (!data.tests.subtitleManifestAccessible && data.subtitleManifestUrl) {
+      issues.push('Subtitle manifest not accessible from network');
+    }
+    if (!data.tests.streamRunning) {
+      issues.push('Stream is not running');
+    }
+    
+    if (issues.length > 0) {
+      if (statusEl) {
+        statusEl.textContent = 'Issues found';
+        statusEl.style.color = 'var(--gold)';
+      }
+      toast('TV readiness issues: ' + issues.join(', '), 'warning', 6000);
+      
+      // Show recommendations
+      if (data.recommendations && data.recommendations.length > 0) {
+        setTimeout(() => {
+          data.recommendations.forEach(rec => toast(rec, 'info', 8000));
+        }, 1000);
+      }
+    } else {
+      if (statusEl) {
+        statusEl.textContent = '✓ TV Ready!';
+        statusEl.style.color = 'var(--green)';
+      }
+      toast('TV is ready to receive the stream!', 'success', 4000);
+      
+      // Auto-open the TV link in a new tab after a short delay
+      setTimeout(() => {
+        if (data.castUrl) {
+          window.open(data.castUrl, '_blank', 'noopener');
+          toast('Opening stream in new tab for testing...', 'info', 3000);
+        }
+      }, 1500);
+    }
+  } catch (error) {
+    if (statusEl) {
+      statusEl.textContent = 'Test failed';
+      statusEl.style.color = 'var(--red)';
+    }
+    toast('TV readiness test failed: ' + error.message, 'error', 5000);
+  }
+  
+  return false;
+}
+
+async function populateCastTvModal(meta) {
+  const content = document.getElementById('castModalContent');
+  if (!content) return;
+
+  const normalized = normalizeActiveStreamMeta(meta);
+  const senderAllowed = isCastSenderOriginAllowed();
+  const senderHelperUrl = senderAllowed ? '' : buildLocalhostSenderUrl();
+  let subtitleOptions = [];
+
+  // Always refresh subtitle options from the server
+  if (normalized.subtitleManifestUrl) {
+    try {
+      subtitleOptions = await loadCastSubtitleOptions(normalized.subtitleManifestUrl);
+    } catch (e) {
+      subtitleOptions = [];
+    }
+  }
+
+  castTvState.meta = normalized;
+  castTvState.subtitleOptions = subtitleOptions;
+  // Preserve selected subtitle track if it still exists, otherwise select first
+  if (subtitleOptions.length > 0) {
+    const currentTrackId = String(castTvState.selectedSubtitleTrackId || '');
+    const selectedStillExists = subtitleOptions.some((track) => String(track.trackId) === currentTrackId);
+    castTvState.selectedSubtitleTrackId = selectedStillExists ? currentTrackId : String(subtitleOptions[0].trackId);
+  } else {
+    castTvState.selectedSubtitleTrackId = '';
+  }
+  castTvState.senderAllowed = senderAllowed;
+  castTvState.castSdkReady = false;
+  castTvState.senderHelperUrl = senderHelperUrl;
+
+  const renderState = () => {
+    content.innerHTML = renderCastTvModalContent(normalized, {
+      senderAllowed,
+      senderHelperUrl,
+      subtitleOptions: castTvState.subtitleOptions,
+      selectedSubtitleTrackId: castTvState.selectedSubtitleTrackId,
+      castSdkReady: castTvState.castSdkReady,
+    });
+    renderCastQrCode(normalized.playerUrl);
+  };
+
+  renderState();
+
+  if (senderAllowed) {
+    try {
+      await ensureGoogleCastContext();
+      castTvState.castSdkReady = true;
+      renderState();
+      // Try to restore cast session if one exists
+      restoreCastSession();
+      startCastStatusUpdates();
+    } catch (error) {
+      castTvState.castSdkReady = false;
+      renderState();
+      // Keep the modal usable for TV browser fallback even if Cast SDK load fails.
+    }
+  } else {
+    updateCastStatusIndicator();
+  }
+}
+
+function openCastTvModal(event) {
+  if (event) event.preventDefault();
+  const overlay = document.getElementById('castModalOverlay');
+  const content = document.getElementById('castModalContent');
+  if (!overlay || !content) return false;
+
+  overlay.setAttribute('aria-hidden', 'false');
+  overlay.classList.add('open');
+  content.innerHTML = '<div class="page-loader"><div class="spinner"></div></div>';
+
+  resolveActiveStreamMeta({
+    sessionId: wizard.sessionId,
+    playerUrl: wizard.playerUrl,
+    vlcUrl: wizard.vlcUrl,
+    castUrl: wizard.castUrl,
+    subtitleManifestUrl: wizard.subtitleManifestUrl,
+  }).then((meta) => {
+    if (!meta.playerUrl) {
+      closeCastTvModal();
+      if (state.currentPage !== 'stream') navigate('/stream');
+      toast('Player is still starting', 'info');
+      return;
+    }
+    applyActiveStreamMeta(meta, { persist: true });
+    return populateCastTvModal(meta);
+  }).catch((error) => {
+    closeCastTvModal();
+    toast(error && error.message ? error.message : 'Could not open Cast / TV', 'error', 5000);
+  });
+
+  return false;
+}
+
+function startChromecastCast(event) {
+  if (event) event.preventDefault();
+  if (!castTvState.senderAllowed) {
+    toast('Open Uplayer on localhost in Chrome or Edge to use Chromecast', 'info', 5000);
+    return false;
+  }
+  if (!castTvState.castSdkReady) {
+    toast('Chromecast is still preparing on this page', 'info');
+    return false;
+  }
+
+  const meta = castTvState.meta || normalizeActiveStreamMeta();
+  if (!meta.castUrl) {
+    toast('Cast stream is not ready yet', 'info');
+    return false;
+  }
+
+  const castContext = getReadyGoogleCastContext();
+  if (!castContext) {
+    toast('Google Cast sender is unavailable on this page', 'error', 5000);
+    return false;
+  }
+
+  let sessionPromise;
+  try {
+    const activeSession = typeof castContext.getCurrentSession === 'function'
+      ? castContext.getCurrentSession()
+      : null;
+    sessionPromise = activeSession || typeof castContext.requestSession !== 'function'
+      ? Promise.resolve(activeSession)
+      : castContext.requestSession();
+  } catch (error) {
+    toast(`Could not start Chromecast: ${error.message}`, 'error', 5000);
+    return false;
+  }
+
+  sessionPromise.then(async (session) => {
+    if (!session || typeof session.loadMedia !== 'function') {
+      throw new Error('Chromecast session is not ready');
+    }
+    let subtitleOptions = castTvState.subtitleOptions;
+    if (meta.subtitleManifestUrl) {
+      try {
+        subtitleOptions = await loadCastSubtitleOptions(meta.subtitleManifestUrl);
+        castTvState.subtitleOptions = subtitleOptions;
+        if (subtitleOptions.length > 0) {
+          const currentTrackId = String(castTvState.selectedSubtitleTrackId || '');
+          const selectedStillExists = subtitleOptions.some((track) => String(track.trackId) === currentTrackId);
+          castTvState.selectedSubtitleTrackId = selectedStillExists
+            ? currentTrackId
+            : String(subtitleOptions[0].trackId);
+        } else {
+          castTvState.selectedSubtitleTrackId = '';
+        }
+      } catch (error) {
+        subtitleOptions = castTvState.subtitleOptions;
+      }
+    }
+
+    if (subtitleOptions.length > 0 && !castTvState.selectedSubtitleTrackId) {
+      toast('Choose a subtitle track before casting', 'info');
+      return;
+    }
+
+    const draft = buildCastMediaDraft(
+      meta,
+      subtitleOptions,
+      castTvState.selectedSubtitleTrackId,
+      wizard.titleText
+    );
+    const mediaInfo = new window.chrome.cast.media.MediaInfo(draft.contentId, draft.contentType);
+    mediaInfo.streamType = window.chrome.cast.media.StreamType.BUFFERED;
+    const metadata = new window.chrome.cast.media.GenericMediaMetadata();
+    metadata.title = draft.metadata.title;
+    mediaInfo.metadata = metadata;
+    if (draft.tracks.length > 0) {
+      mediaInfo.tracks = draft.tracks.map((track) => {
+        const castTrack = new window.chrome.cast.media.Track(track.trackId, window.chrome.cast.media.TrackType.TEXT);
+        castTrack.trackContentId = track.trackContentId;
+        castTrack.trackContentType = track.trackContentType;
+        castTrack.subtype = window.chrome.cast.media.TextTrackType.SUBTITLES;
+        castTrack.name = track.name;
+        castTrack.language = track.language;
+        return castTrack;
+      });
+    }
+    const loadRequest = new window.chrome.cast.media.LoadRequest(mediaInfo);
+    loadRequest.autoplay = true;
+    if (draft.activeTrackIds.length > 0) {
+      loadRequest.activeTrackIds = draft.activeTrackIds;
+    }
+    await session.loadMedia(loadRequest);
+    
+    // Set up session state tracking
+    castTvState.isCasting = true;
+    castTvState.castSession = session;
+    castTvState.castDeviceName = session.getReceiverStatus?.()?.receiver?.friendlyName || 'Chromecast';
+
+    // Get initial volume
+    try {
+      const volume = session.getVolume();
+      castTvState.castVolume = volume;
+      castTvState.isMuted = session.isMuted?.() ?? false;
+    } catch (e) {
+      // Ignore volume read errors
+    }
+
+    saveCastSessionState();
+    updateCastStatusIndicator();
+    toast(`Casting to ${castTvState.castDeviceName}`, 'success');
+    closeCastTvModal();
+  }).catch((error) => {
+    const errorMsg = error.message || 'Unknown error';
+    let userMessage = `Could not start Chromecast: ${errorMsg}`;
+    
+    // Provide specific error recovery suggestions
+    if (errorMsg.includes('timeout') || errorMsg.includes('cancel')) {
+      userMessage = 'Device selection cancelled or timed out. Please try again.';
+    } else if (errorMsg.includes('network') || errorMsg.includes('unavailable')) {
+      userMessage = 'Network error. Make sure your Chromecast is on the same network.';
+    } else if (errorMsg.includes('format') || errorMsg.includes('unsupported')) {
+      userMessage = 'This format may not be supported. Try a different torrent.';
+    }
+    
+    toast(userMessage, 'error', 6000);
+  });
+
+  return false;
+}
+
+function handleCastSessionEnd() {
+  castTvState.isCasting = false;
+  castTvState.castSession = null;
+  castTvState.castDeviceName = '';
+  clearCastSessionState();
+  updateCastStatusIndicator();
+  stopCastStatusUpdates();
+}
+
+function stopChromecastCast(event) {
+  if (event) event.preventDefault();
+  
+  const session = castTvState.castSession;
+  if (!session || typeof session.stop !== 'function') {
+    toast('No active cast session', 'info');
+    handleCastSessionEnd();
+    return false;
+  }
+  
+  session.stop(() => {
+    toast('Casting stopped', 'success');
+    handleCastSessionEnd();
+  }, (error) => {
+    // Force local state reset even if stop fails
+    toast('Stopping cast...', 'info');
+    handleCastSessionEnd();
+  });
+  
+  return false;
+}
+
+function setCastVolume(level) {
+  const session = castTvState.castSession;
+  if (!session || !castTvState.isCasting) return false;
+  
+  try {
+    const volume = new window.chrome.cast.Volume();
+    volume.level = Math.max(0, Math.min(1, level));
+    volume.muted = castTvState.isMuted;
+    session.setVolume(volume, () => {
+      castTvState.castVolume = volume.level;
+      saveCastSessionState();
+      updateCastStatusIndicator();
+    }, (error) => {
+      toast('Failed to change volume', 'error', 3000);
+    });
+  } catch (e) {
+    toast('Volume control unavailable', 'error', 3000);
+  }
+  return false;
+}
+
+function toggleCastMute() {
+  const session = castTvState.castSession;
+  if (!session || !castTvState.isCasting) return false;
+  
+  try {
+    const volume = new window.chrome.cast.Volume();
+    volume.level = castTvState.castVolume;
+    volume.muted = !castTvState.isMuted;
+    session.setVolume(volume, () => {
+      castTvState.isMuted = volume.muted;
+      saveCastSessionState();
+      updateCastStatusIndicator();
+    }, (error) => {
+      toast('Failed to toggle mute', 'error', 3000);
+    });
+  } catch (e) {
+    toast('Mute control unavailable', 'error', 3000);
+  }
   return false;
 }
 
@@ -1683,7 +2630,7 @@ async function renderStreamPage() {
     torrents: [], selectedTorrent: null, resolvedMagnet: null,
     subtitleLangs: [], selectedLang: 'en',
     subtitles: [], selectedSubtitle: null, subtitleToken: null, subtitleTokenExpiresAt: null, skipSubtitles: false,
-    sessionId: null, playerUrl: null,
+    sessionId: null, playerUrl: null, vlcUrl: null, castUrl: null, subtitleManifestUrl: null, videoFormat: null,
     detail: null, historySaved: false,
     step: type === 'tv' ? 1 : 2,
   });
@@ -1723,6 +2670,9 @@ async function renderStreamPage() {
       skipSubtitles: !!restored.skipSubtitles,
       sessionId: restored.sessionId || null,
       playerUrl: restored.playerUrl || null,
+      vlcUrl: restored.vlcUrl || null,
+      castUrl: restored.castUrl || null,
+      subtitleManifestUrl: restored.subtitleManifestUrl || null,
       step: restored.step || (type === 'tv' ? 1 : 2),
     });
   }
@@ -1730,6 +2680,9 @@ async function renderStreamPage() {
   if (runningSession) {
     wizard.sessionId = runningSession.id;
     wizard.playerUrl = runningSession.playerUrl || wizard.playerUrl || null;
+    wizard.vlcUrl = runningSession.vlcUrl || wizard.vlcUrl || null;
+    wizard.castUrl = runningSession.castUrl || wizard.castUrl || null;
+    wizard.subtitleManifestUrl = runningSession.subtitleManifestUrl || wizard.subtitleManifestUrl || null;
     wizard.step = 4;
     if (!wizard.titleText) {
       wizard.titleText = restored?.titleText || 'Active Stream';
@@ -1791,26 +2744,24 @@ async function resumeStreamSession() {
   }
 
   wizard.sessionId = session.id;
-  wizard.playerUrl = session.playerUrl || wizard.playerUrl || null;
+  applyActiveStreamMeta(session);
   wizard.step = 4;
   persistWizardState();
 
   const badge = document.getElementById('streamStatusBadge');
-  const directLink = document.getElementById('directPlayerLink');
 
   if (wizard.playerUrl) {
     showPlayerBanner(wizard.playerUrl);
     updateNavStreamIndicator(true, wizard.playerUrl);
-    if (directLink) {
-      directLink.href = wizard.playerUrl;
-      directLink.style.display = '';
-    }
+    updateStreamReadyActions(session);
     if (badge) {
       badge.innerHTML = '<span style="color:var(--green)">Live</span>';
     }
     clearWaitingTimer();
   } else {
+    clearPlayerBanner();
     updateNavStreamIndicator(true);
+    updateStreamReadyActions(null);
     if (badge) {
       badge.innerHTML = '<span style="color:var(--text-muted)">Reconnecting...</span>';
     }
@@ -2275,14 +3226,31 @@ function renderWizardStep4(panel) {
         <button class="btn btn-danger btn-sm" onclick="wizardStopStream()">Stop Stream</button>
         <div class="wizard-nav-right">
           <button class="btn btn-outline btn-sm" onclick="wizardStartStream()">Retry Start</button>
-          <a id="directPlayerLink" href="#" onclick="return openActivePlayer(event, this.getAttribute('href'))"
-             class="btn btn-primary" style="display:none">
-            Open Player
-          </a>
           <button class="btn btn-outline btn-sm" onclick="wizardGoStep(2)">Change Torrent</button>
         </div>
       </div>
     </div>`;
+}
+
+function updateStreamReadyActions(url) {
+  const meta = typeof url === 'string'
+    ? normalizeActiveStreamMeta({ playerUrl: url })
+    : normalizeActiveStreamMeta(url || {});
+  const directLink = document.getElementById('directPlayerLink');
+  if (directLink) {
+    directLink.href = meta.playerUrl || '#';
+    directLink.style.display = meta.playerUrl ? '' : 'none';
+  }
+
+  const castButton = document.getElementById('castTvButton');
+  if (castButton) {
+    castButton.style.display = meta.playerUrl ? '' : 'none';
+  }
+
+  const vlcButton = document.getElementById('vlcPlayerButton');
+  if (vlcButton) {
+    vlcButton.style.display = meta.playerUrl ? '' : 'none';
+  }
 }
 
 async function wizardStartStream() {
@@ -2293,8 +3261,7 @@ async function wizardStartStream() {
     const active = await fetchJson('/api/stream/status');
     const running = active.find((s) => s.id === wizard.sessionId) || active.find((s) => s.running);
     if (running) {
-      wizard.sessionId = running.id;
-      wizard.playerUrl = running.playerUrl;
+      applyActiveStreamMeta(running);
       persistWizardState();
       if (running.playerUrl) {
         showPlayerBanner(running.playerUrl);
@@ -2302,11 +3269,7 @@ async function wizardStartStream() {
       }
       updateNavStreamIndicator(true, running.playerUrl || null);
       const badge = document.getElementById('streamStatusBadge');
-      const directLink = document.getElementById('directPlayerLink');
-      if (directLink && running.playerUrl) {
-        directLink.href = running.playerUrl;
-        directLink.style.display = '';
-      }
+      updateStreamReadyActions(running.playerUrl || null);
       if (badge) {
         badge.innerHTML = running.playerUrl
           ? `<span style="color:var(--green)">Live</span>`
@@ -2361,22 +3324,43 @@ function startStreamStatusPolling() {
       if (!ours && wizard.sessionId) {
         clearStreamStatusPolling();
         updateNavStreamIndicator(false);
+        clearPlayerBanner();
+        updateStreamReadyActions(null);
         const badge = document.getElementById('streamStatusBadge');
         if (badge) badge.innerHTML = '<span style="color:var(--red)">Stopped</span>';
+        applyActiveStreamMeta({
+          sessionId: null,
+          playerUrl: null,
+          vlcUrl: null,
+          castUrl: null,
+          subtitleManifestUrl: null,
+        });
         clearWizardState();
       } else if (ours && ours.exited) {
         clearStreamStatusPolling();
         updateNavStreamIndicator(false);
+        clearPlayerBanner();
+        updateStreamReadyActions(null);
         const badge = document.getElementById('streamStatusBadge');
         if (badge) badge.innerHTML = '<span style="color:var(--red)">Stopped</span>';
+        applyActiveStreamMeta({
+          sessionId: null,
+          playerUrl: null,
+          vlcUrl: null,
+          castUrl: null,
+          subtitleManifestUrl: null,
+        });
         clearWizardState();
       } else if (ours && ours.playerUrl && !wizard.playerUrl) {
-        wizard.playerUrl = ours.playerUrl;
+        applyActiveStreamMeta(ours);
         clearWaitingTimer();
         showPlayerBanner(ours.playerUrl);
+        updateStreamReadyActions(ours);
         updateNavStreamIndicator(true, ours.playerUrl);
         saveWizardHistoryIfNeeded();
         persistWizardState();
+      } else if (ours) {
+        applyActiveStreamMeta(ours);
       }
     } catch (e) { /* ignore */ }
   }, 3000);
@@ -2426,10 +3410,12 @@ function connectStreamSSE(sessionId) {
       if (speedEl) speedEl.textContent = speed;
     });
     wizard.sseSource.addEventListener('player_ready', (e) => {
-      const { url } = JSON.parse(e.data);
-      wizard.playerUrl = url;
+      const payload = JSON.parse(e.data);
+      const { url } = payload;
+      applyActiveStreamMeta(payload);
       clearWaitingTimer(); // Stop timer immediately so it can't overwrite the badge
       showPlayerBanner(url);
+      updateStreamReadyActions(payload);
       updateNavStreamIndicator(true, url);
       persistWizardState();
       saveWizardHistoryIfNeeded();
@@ -2437,19 +3423,22 @@ function connectStreamSSE(sessionId) {
       if (badge) badge.innerHTML = `<span style="color:var(--green)">Live</span>`;
       const wrap = document.getElementById('streamProgressWrap');
       if (wrap) wrap.style.display = 'none';
-      const directLink = document.getElementById('directPlayerLink');
-      if (directLink) { directLink.href = url; directLink.style.display = ''; }
     });
     wizard.sseSource.addEventListener('exit', (e) => {
       const { code } = JSON.parse(e.data);
       clearWaitingTimer();
       appendTerminalLine(`[Process exited with code ${code}]`, code === 0 ? 'success' : 'error');
       updateNavStreamIndicator(false);
-      wizard.playerUrl = null;
-      wizard.sessionId = null;
+      clearPlayerBanner();
+      applyActiveStreamMeta({
+        sessionId: null,
+        playerUrl: null,
+        vlcUrl: null,
+        castUrl: null,
+        subtitleManifestUrl: null,
+      });
       const badge = document.getElementById('streamStatusBadge');
-      const directLink = document.getElementById('directPlayerLink');
-      if (directLink) directLink.style.display = 'none';
+      updateStreamReadyActions(null);
       if (badge) badge.innerHTML = `<span style="color:${code === 0 ? 'var(--green)' : 'var(--red)'}">Stopped (${code})</span>`;
       if (wizard.sseSource) { wizard.sseSource.close(); wizard.sseSource = null; }
       clearWizardState();
@@ -2478,19 +3467,51 @@ function appendTerminalLine(text, type) {
   if (distFromBottom < 80) terminal.scrollTop = terminal.scrollHeight;
 }
 
+function clearPlayerBanner() {
+  const banner = document.getElementById('playerBanner');
+  if (banner) banner.innerHTML = '';
+}
+
 function showPlayerBanner(url) {
   const banner = document.getElementById('playerBanner');
   if (!banner) return;
+  
+  // Build format info display
+  let formatInfoHtml = '';
+  if (wizard.videoFormat) {
+    const container = (wizard.videoFormat.container || 'Unknown').toUpperCase();
+    const codec = (wizard.videoFormat.codec || 'Unknown').toUpperCase();
+    const needsTranscode = container !== 'MP4' || codec.includes('HEVC') || codec.includes('H265');
+    const transcodeStatus = needsTranscode 
+      ? '<span style="color:var(--yellow)">Transcoding to MP4/H.264</span>'
+      : '<span style="color:var(--green)">Native playback</span>';
+    formatInfoHtml = `
+      <div style="font-size:.75rem;color:var(--text-muted);margin-top:.5rem">
+        Format: ${container} / ${codec} - ${transcodeStatus}
+      </div>`;
+  }
+  
   banner.innerHTML = `
     <div class="stream-player-banner">
-      <div>
+      <div class="stream-player-banner-copy">
+        <span class="stream-player-banner-kicker">Live Stream</span>
         <h3>Player Ready!</h3>
-        <p>Your stream is live - click to open the player</p>
+        <p>Your stream is live - open it in the web player, cast it to a TV, or send it to VLC</p>
+        ${formatInfoHtml}
       </div>
-      <a href="${escape(url)}" onclick="return openActivePlayer(event, this.getAttribute('href'))" class="btn btn-primary" style="font-size:1rem;padding:.7rem 1.5rem">
-        Open Player
-      </a>
+      <div class="stream-player-banner-actions">
+        <a id="directPlayerLink" href="${escape(url)}" onclick="return openActivePlayer(event, this.getAttribute('href'))" class="btn btn-primary">
+          Open in Web Player
+        </a>
+        <button id="castTvButton" type="button" onclick="return openCastTvModal(event)" class="btn btn-outline">
+          Cast / TV
+        </button>
+        <button id="vlcPlayerButton" type="button" onclick="return openActiveVlc(event)" class="btn btn-outline">
+          Open in VLC
+        </button>
+      </div>
     </div>`;
+  updateStreamReadyActions(url);
 }
 
 async function wizardStopStream() {
@@ -2504,10 +3525,15 @@ async function wizardStopStream() {
     // No session: call kill-all to ensure the standalone player server is closed.
     await fetch('/api/stream/kill-all', { method: 'DELETE' }).catch(() => {});
   }
-  wizard.playerUrl = null;
-  wizard.sessionId = null;
-  const directLink = document.getElementById('directPlayerLink');
-  if (directLink) directLink.style.display = 'none';
+  applyActiveStreamMeta({
+    sessionId: null,
+    playerUrl: null,
+    vlcUrl: null,
+    castUrl: null,
+    subtitleManifestUrl: null,
+  });
+  clearPlayerBanner();
+  updateStreamReadyActions(null);
   updateNavStreamIndicator(false);
   clearWizardState();
   toast('Stream stopped and player server closed', 'info');
@@ -2559,6 +3585,95 @@ async function refreshNavStreamIndicator() {
   }
 }
 
+// --- Cast Status Indicator ---
+
+function updateCastStatusIndicator() {
+  const indicator = document.getElementById('navCastIndicator');
+  const deviceNameEl = document.getElementById('castDeviceName');
+  const statusDot = indicator ? indicator.querySelector('.cast-status-dot') : null;
+  
+  if (!indicator) return;
+  
+  // Remove all state classes
+  indicator.classList.remove('casting', 'connecting', 'disconnected');
+  
+  if (castTvState.isCasting && castTvState.castSession) {
+    indicator.classList.add('casting');
+    indicator.title = `Casting to ${castTvState.castDeviceName} - Click to control`;
+    if (deviceNameEl) deviceNameEl.textContent = castTvState.castDeviceName;
+    if (statusDot) statusDot.style.display = 'block';
+  } else if (castTvState.senderAllowed && castTvState.castSdkReady) {
+    indicator.classList.add('disconnected');
+    indicator.title = 'Cast to TV - Click to start';
+    if (deviceNameEl) deviceNameEl.textContent = '';
+    if (statusDot) statusDot.style.display = 'none';
+  } else {
+    indicator.classList.add('disconnected');
+    indicator.title = 'Cast to TV (unavailable on this network)';
+    if (deviceNameEl) deviceNameEl.textContent = '';
+    if (statusDot) statusDot.style.display = 'none';
+  }
+}
+
+function startCastStatusUpdates() {
+  stopCastStatusUpdates();
+  castStatusUpdateInterval = setInterval(() => {
+    // Check if cast session is still active
+    if (castTvState.isCasting && castTvState.castSession) {
+      try {
+        const session = castTvState.castSession;
+        const status = session.getStatus?.();
+        if (status === window.chrome.cast.SessionStatus.CONNECTED) {
+          // Update device name if available
+          const receiverStatus = session.getReceiverStatus?.();
+          if (receiverStatus?.receiver?.friendlyName) {
+            castTvState.castDeviceName = receiverStatus.receiver.friendlyName;
+            saveCastSessionState();
+          }
+        }
+      } catch (e) {
+        // Session may have been lost
+      }
+    }
+    updateCastStatusIndicator();
+  }, 2000);
+}
+
+function stopCastStatusUpdates() {
+  if (castStatusUpdateInterval) {
+    clearInterval(castStatusUpdateInterval);
+    castStatusUpdateInterval = null;
+  }
+}
+
+function restoreCastSession() {
+  // Try to restore cast session from storage on page load
+  const savedState = loadCastSessionState();
+  if (!savedState || !savedState.isCasting) return;
+  
+  // Try to reconnect to existing cast session
+  const castContext = getReadyGoogleCastContext();
+  if (!castContext) return;
+
+  try {
+    const session = castContext.getCurrentSession();
+    if (session && session.getStatus?.() === window.chrome.cast.SessionStatus.CONNECTED) {
+      castTvState.isCasting = true;
+      castTvState.castSession = session;
+      castTvState.castDeviceName = savedState.castDeviceName || 'Chromecast';
+      castTvState.castVolume = savedState.castVolume || 0.5;
+      castTvState.isMuted = savedState.isMuted || false;
+
+      startCastStatusUpdates();
+      updateCastStatusIndicator();
+      console.log('Cast session restored from storage');
+    }
+  } catch (e) {
+    // Session restoration failed, clear state
+    clearCastSessionState();
+  }
+}
+
 // --- Global window exports (needed for inline onclick handlers) ---------------
 window.openDetail = openDetail;
 window.markWatched = markWatched;
@@ -2576,6 +3691,16 @@ window.renderSearch = renderSearch;
 window.renderRecommendations = renderRecommendations;
 window.renderHistory = renderHistory;
 window.openActivePlayer = openActivePlayer;
+window.openActiveVlc = openActiveVlc;
+window.openCastTvModal = openCastTvModal;
+window.startChromecastCast = startChromecastCast;
+window.stopChromecastCast = stopChromecastCast;
+window.handleCastSubtitleSelection = handleCastSubtitleSelection;
+window.copyCastTvLink = copyCastTvLink;
+window.closeCastTvModal = closeCastTvModal;
+window.testTvReadiness = testTvReadiness;
+window.setCastVolume = setCastVolume;
+window.toggleCastMute = toggleCastMute;
 window.execSearch = execSearch;
 window.setSearchType = setSearchType;
 window.applyFilters = applyFilters;

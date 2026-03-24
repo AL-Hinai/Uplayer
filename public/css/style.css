@@ -1000,6 +1000,178 @@ img { display: block; max-width: 100%; }
 
 .modal-content { padding: 1.5rem; }
 
+.cast-modal {
+  max-width: 980px;
+}
+
+.cast-modal-content {
+  padding-top: 0.5rem;
+}
+
+.cast-modal-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.cast-modal-header h2 {
+  font-size: 1.4rem;
+  margin-bottom: 0.35rem;
+}
+
+.cast-modal-header p,
+.cast-modal-card p,
+.cast-modal-note {
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.cast-modal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.cast-modal-card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.02));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.15rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  min-height: 100%;
+}
+
+.cast-modal-card-disabled {
+  border-color: rgba(245,200,66,0.28);
+  background: linear-gradient(180deg, rgba(245,200,66,0.08), rgba(255,255,255,0.02));
+}
+
+.cast-modal-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.cast-modal-card-head h3 {
+  font-size: 1rem;
+  margin-bottom: 0.2rem;
+}
+
+.cast-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.06);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.cast-chip-ready {
+  color: var(--green);
+  background: rgba(60,186,122,0.12);
+  border: 1px solid rgba(60,186,122,0.25);
+}
+
+.cast-modal-label {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.cast-modal-select,
+.cast-link-input {
+  width: 100%;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 0.75rem 0.85rem;
+  font-size: 0.92rem;
+  outline: none;
+}
+
+.cast-link-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.cast-link-input {
+  flex: 1;
+}
+
+.cast-modal-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.cast-qr-wrap {
+  display: grid;
+  grid-template-columns: 164px minmax(0, 1fr);
+  gap: 1rem;
+  align-items: center;
+}
+
+.cast-qr-box {
+  width: 164px;
+  min-height: 164px;
+  border-radius: 14px;
+  background: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 0.75rem;
+}
+
+.cast-qr-box img {
+  width: 100%;
+  height: auto;
+}
+
+.cast-qr-placeholder {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.cast-qr-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+@media (max-width: 900px) {
+  .cast-modal-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .cast-link-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .cast-qr-wrap {
+    grid-template-columns: 1fr;
+  }
+
+  .cast-qr-box {
+    margin: 0 auto;
+  }
+}
+
 .modal-backdrop {
   width: 100%;
   aspect-ratio: 16/7;
@@ -1695,16 +1867,28 @@ img { display: block; max-width: 100%; }
 .stream-terminal .term-line.error { color: #e05260; }
 
 .stream-player-banner {
-  background: linear-gradient(135deg, rgba(108,99,255,0.15), rgba(60,186,122,0.15));
-  border: 1px solid rgba(60,186,122,0.4);
-  border-radius: var(--radius);
-  padding: 1.25rem 1.5rem;
-  display: flex;
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at top right, rgba(255,255,255,0.08), transparent 34%),
+    linear-gradient(135deg, rgba(18,30,32,0.98), rgba(18,22,31,0.98));
+  border: 1px solid rgba(60,186,122,0.28);
+  border-radius: 22px;
+  padding: 1.35rem 1.5rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
+  gap: 1.25rem;
   margin-bottom: 1rem;
-  animation: pulseGreen 2s infinite;
+  box-shadow: 0 18px 42px rgba(0,0,0,0.24);
+}
+
+.stream-player-banner::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(60,186,122,0.16), transparent 45%);
+  pointer-events: none;
 }
 
 @keyframes pulseGreen {
@@ -1712,16 +1896,90 @@ img { display: block; max-width: 100%; }
   50% { box-shadow: 0 0 0 6px rgba(60,186,122,0); }
 }
 
-.stream-player-banner h3 {
-  font-size: 1rem;
+.stream-player-banner-copy,
+.stream-player-banner-actions {
+  position: relative;
+  z-index: 1;
+}
+
+.stream-player-banner-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.6rem;
+  padding: 0.28rem 0.7rem;
+  border-radius: 999px;
+  background: rgba(60,186,122,0.12);
+  border: 1px solid rgba(60,186,122,0.22);
+  color: #a6f0c8;
+  font-size: 0.72rem;
   font-weight: 700;
-  color: var(--green);
-  margin-bottom: 0.2rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.stream-player-banner h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #f2f8f5;
+  margin-bottom: 0.35rem;
 }
 
 .stream-player-banner p {
-  font-size: 0.8rem;
+  font-size: 0.9rem;
   color: var(--text-muted);
+  max-width: 44ch;
+  line-height: 1.55;
+}
+
+.stream-player-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.stream-player-banner-actions .btn {
+  min-height: 48px;
+  padding: 0.75rem 1.2rem;
+  border-radius: 999px;
+  font-size: 0.92rem;
+  font-weight: 700;
+  justify-content: center;
+}
+
+.stream-player-banner-actions .btn-primary {
+  box-shadow: 0 12px 28px rgba(223,85,67,0.25);
+}
+
+.stream-player-banner-actions .btn-outline {
+  background: rgba(255,255,255,0.03);
+  border-color: rgba(255,255,255,0.12);
+}
+
+.stream-player-banner-actions .btn-outline:hover {
+  background: rgba(255,255,255,0.06);
+}
+
+@media (max-width: 860px) {
+  .stream-player-banner {
+    grid-template-columns: 1fr;
+  }
+
+  .stream-player-banner-actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .stream-player-banner {
+    padding: 1.15rem;
+    border-radius: 18px;
+  }
+
+  .stream-player-banner-actions .btn {
+    width: 100%;
+  }
 }
 
 .wizard-nav {
@@ -1736,6 +1994,7 @@ img { display: block; max-width: 100%; }
   display: flex;
   gap: 0.75rem;
   margin-left: auto;
+  flex-wrap: wrap;
 }
 
 /* Stream status indicator in navbar */
@@ -1806,3 +2065,204 @@ img { display: block; max-width: 100%; }
 
 .lang-btn:hover { border-color: var(--accent); color: var(--accent); }
 .lang-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* ─── Cast Status Indicator ─────────────────────────────────────────────────── */
+
+.nav-cast-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: all var(--transition);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin-left: auto;
+}
+
+.nav-cast-indicator:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.cast-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.cast-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  display: none;
+  flex-shrink: 0;
+}
+
+.nav-cast-indicator.casting .cast-status-dot {
+  background: var(--green);
+  animation: pulse-cast 2s infinite;
+}
+
+@keyframes pulse-cast {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.2); }
+}
+
+.cast-device-name {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-cast-indicator.casting .cast-device-name {
+  color: var(--green);
+  font-weight: 500;
+}
+
+/* ─── Cast Modal Volume Controls ───────────────────────────────────────────── */
+
+.cast-volume-control {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1rem 0;
+  padding: 0.75rem;
+  background: var(--bg-2);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.cast-volume-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 1.1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+
+.cast-volume-btn:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.cast-volume-slider {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.cast-volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.cast-volume-slider::-webkit-slider-thumb:hover {
+  background: var(--accent-2);
+  transform: scale(1.1);
+}
+
+.cast-volume-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+  transition: all var(--transition);
+}
+
+.cast-volume-slider::-moz-range-thumb:hover {
+  background: var(--accent-2);
+  transform: scale(1.1);
+}
+
+.cast-volume-value {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  min-width: 40px;
+  text-align: right;
+  font-weight: 500;
+}
+
+/* ─── Cast Modal Chip States ───────────────────────────────────────────────── */
+
+.cast-chip-casting {
+  background: rgba(60, 186, 122, 0.15);
+  color: var(--green);
+  border-color: rgba(60, 186, 122, 0.3);
+  animation: pulse-cast-chip 2s infinite;
+}
+
+@keyframes pulse-cast-chip {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(60, 186, 122, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(60, 186, 122, 0); }
+}
+
+/* ─── Cast Modal Actions ───────────────────────────────────────────────────── */
+
+.btn-danger {
+  background: var(--red);
+  color: #fff;
+  border: 1px solid rgba(224, 82, 96, 0.3);
+}
+
+.btn-danger:hover {
+  background: #c94552;
+  border-color: rgba(224, 82, 96, 0.5);
+}
+
+/* ─── Responsive Cast Indicator ────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  .nav-cast-indicator {
+    padding: 0.4rem;
+  }
+  
+  .cast-device-name {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .cast-volume-control {
+    flex-wrap: wrap;
+  }
+  
+  .cast-volume-slider {
+    order: 3;
+    width: 100%;
+    margin-top: 0.5rem;
+  }
+  
+  .cast-volume-value {
+    order: 3;
+  }
+}
