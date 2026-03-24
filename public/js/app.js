@@ -3244,12 +3244,13 @@ function updateStreamReadyActions(url) {
 
   const castButton = document.getElementById('castTvButton');
   if (castButton) {
-    castButton.style.display = meta.playerUrl ? '' : 'none';
+    castButton.style.display = meta.castUrl || meta.playerUrl ? '' : 'none';
   }
 
   const vlcButton = document.getElementById('vlcPlayerButton');
   if (vlcButton) {
-    vlcButton.style.display = meta.playerUrl ? '' : 'none';
+    // Show VLC button when vlcUrl is available (original file URL for VLC)
+    vlcButton.style.display = meta.vlcUrl || meta.playerUrl ? '' : 'none';
   }
 }
 
@@ -3475,14 +3476,14 @@ function clearPlayerBanner() {
 function showPlayerBanner(url) {
   const banner = document.getElementById('playerBanner');
   if (!banner) return;
-  
+
   // Build format info display
   let formatInfoHtml = '';
   if (wizard.videoFormat) {
     const container = (wizard.videoFormat.container || 'Unknown').toUpperCase();
     const codec = (wizard.videoFormat.codec || 'Unknown').toUpperCase();
     const needsTranscode = container !== 'MP4' || codec.includes('HEVC') || codec.includes('H265');
-    const transcodeStatus = needsTranscode 
+    const transcodeStatus = needsTranscode
       ? '<span style="color:var(--yellow)">Transcoding to MP4/H.264</span>'
       : '<span style="color:var(--green)">Native playback</span>';
     formatInfoHtml = `
@@ -3490,7 +3491,7 @@ function showPlayerBanner(url) {
         Format: ${container} / ${codec} - ${transcodeStatus}
       </div>`;
   }
-  
+
   banner.innerHTML = `
     <div class="stream-player-banner">
       <div class="stream-player-banner-copy">

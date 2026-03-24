@@ -2422,7 +2422,7 @@ class StreamManager extends EventEmitter {
         }
         
         // Start HTTP server for streaming
-        await this.startStreamingServer(videoFile, async (url, urls, videoPath) => {
+        await this.startStreamingServer(videoFile, async (url, urls, videoPath, originalVideoPath) => {
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Streaming server started');
           }
@@ -2438,8 +2438,11 @@ class StreamManager extends EventEmitter {
             log(`Local fallback: ${urls.localhost}`);
           }
 
-          // Build full video URL for VLC (root URL + video path)
+          // Build full video URLs
+          // videoPath is for web player (may be transcoded for HEVC)
+          // originalVideoPath is for VLC (always original format - VLC can play anything)
           const fullVideoUrl = videoPath ? `${url.replace(/\/$/, '')}${videoPath}` : url;
+          const fullOriginalVideoUrl = originalVideoPath ? `${url.replace(/\/$/, '')}${originalVideoPath}` : fullVideoUrl;
 
           // WAIT for torrent to have enough data for smooth playback
           // This prevents VLC from connecting before there's data to stream
@@ -2485,11 +2488,13 @@ class StreamManager extends EventEmitter {
             const playerReadyData = {
               url,
               urls,
-              // VLC needs the full video URL (not just the root URL)
-              vlcUrl: fullVideoUrl,
-              mediaUrl: fullVideoUrl,
-              // Cast URL for Chromecast (also needs full video URL)
-              castUrl: fullVideoUrl,
+              // Web player URL (may be transcoded for HEVC compatibility)
+              playerUrl: fullVideoUrl,
+              // VLC URL - always the original file (VLC can play any format without transcoding)
+              vlcUrl: fullOriginalVideoUrl,
+              mediaUrl: fullOriginalVideoUrl,
+              // Cast URL for Chromecast (uses original file for best quality)
+              castUrl: fullOriginalVideoUrl,
             };
             this.emit('player_ready', playerReadyData);
           }
@@ -2501,7 +2506,7 @@ class StreamManager extends EventEmitter {
             });
           }
 
-          finish(resolve, { url, urls, torrent, videoFile, subtitlePath: options.subtitlePath, videoPath });
+          finish(resolve, { url, urls, torrent, videoFile, subtitlePath: options.subtitlePath, videoPath, originalVideoPath, vlcUrl: fullOriginalVideoUrl, mediaUrl: fullOriginalVideoUrl, castUrl: fullOriginalVideoUrl });
         }, options.subtitlePath);
 
         // Show download progress with throttling to prevent terminal spam
@@ -2685,7 +2690,11 @@ class StreamManager extends EventEmitter {
       this._log('HEVC will be transcoded live on-the-fly when you open the player.');
     }
 
+    // Web player URL (may be transcoded for HEVC)
     const videoUrl = needsTranscode && this.ffmpegPath ? '/video.mp4' : `/video${videoExt}`;
+    // Original file URL for VLC (VLC can play any format, no transcoding needed)
+    // Always use the original file extension, even if transcoding is enabled for web
+    const originalFileUrl = `/video${videoExt}`;
     const videoName = videoFile.name;
     const contentType = (needsTranscode && this.ffmpegPath) ? 'video/mp4' : (
       { '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.webm': 'video/webm',
@@ -2813,46 +2822,54 @@ class StreamManager extends EventEmitter {
         res.end('');
         return;
       }
-        
-        // Handle range requests for video streaming (or transcoding for HEVC)
-        const range = req.headers.range;
-      
-        let stream;
-        
-        const destroyStream = () => {
-          if (!stream) return;
-          this.activeStreams.delete(stream);
-          if (typeof stream.kill === 'function') stream.kill();
-          else if (!stream.destroyed) stream.destroy();
-          stream = null;
-        };
-        
-        // ENHANCED: Handle client disconnect with stream cleanup
-        res.on('close', () => {
-          destroyStream();
-          // Trigger garbage collection hint if available (V8 specific)
-          if (global.gc && this.lowMemoryMode) {
-            setImmediate(() => {
-              try {
-                global.gc();
-              } catch (e) {
-                // GC not exposed, ignore
-              }
-            });
-          }
-        });
-        
-        // Handle response errors
-        res.on('error', (err) => {
-          destroyStream();
-          if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
-            console.error('Response error:', err.message);
-          }
-        });
 
-        // HEVC live on-the-fly transcoding: pipe torrent stream ? ffmpeg ? HTTP (chunked)
-        const forceCompatTranscode = /\bcompat=1\b/.test(req.url || '');
-        if ((serveTranscoded || forceCompatTranscode) && this.ffmpegPath) {
+      // Extract requested video extension
+      const requestedExt = videoPathMatch[1].toLowerCase();
+
+      // Handle range requests for video streaming (or transcoding for HEVC)
+      const range = req.headers.range;
+
+      let stream;
+
+      const destroyStream = () => {
+        if (!stream) return;
+        this.activeStreams.delete(stream);
+        if (typeof stream.kill === 'function') stream.kill();
+        else if (!stream.destroyed) stream.destroy();
+        stream = null;
+      };
+
+      // ENHANCED: Handle client disconnect with stream cleanup
+      res.on('close', () => {
+        destroyStream();
+        // Trigger garbage collection hint if available (V8 specific)
+        if (global.gc && this.lowMemoryMode) {
+          setImmediate(() => {
+            try {
+              global.gc();
+            } catch (e) {
+              // GC not exposed, ignore
+            }
+          });
+        }
+      });
+
+      // Handle response errors
+      res.on('error', (err) => {
+        destroyStream();
+        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+          console.error('Response error:', err.message);
+        }
+      });
+
+      // HEVC live on-the-fly transcoding: pipe torrent stream → ffmpeg → HTTP (chunked)
+      // Only transcode when:
+      // 1. serveTranscoded is true (HEVC detected)
+      // 2. Requested URL is /video.mp4 (transcoded format)
+      // 3. ffmpeg is available
+      const forceCompatTranscode = /\bcompat=1\b/.test(req.url || '');
+      const isTranscodedRequest = requestedExt === 'mp4' && videoExt !== '.mp4';
+      if ((serveTranscoded && isTranscodedRequest || forceCompatTranscode) && this.ffmpegPath) {
           const { spawn } = require('child_process');
           const videoArgs = this._encoderArgs(selectedEncoder);
           const inputStream = videoFile.createReadStream();
@@ -2971,7 +2988,8 @@ class StreamManager extends EventEmitter {
     const urls = buildAccessibleUrls(port);
     this.server.listen(port, urls.bindHost, () => {
       // Pass the video path so the caller can construct the full video URL
-      callback(urls.preferred, urls, videoUrl);
+      // videoUrl is for web player (may be transcoded), originalFileUrl is for VLC (always original format)
+      callback(urls.preferred, urls, videoUrl, originalFileUrl);
     });
   }
   
