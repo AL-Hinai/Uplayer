@@ -1913,24 +1913,26 @@ function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId
     ? StreamType.LIVE
     : (StreamType.BUFFERED || 'BUFFERED');
 
-  let tracks = subtitleOptions.map((track, index) => ({
-    trackId: Number(track.trackId) || index + 1,
-    type: 'TEXT',
-    subtype: 'SUBTITLES',
-    trackContentId: rewriteLocalhostResourceUrlForChromecast(track.trackContentId, normalized),
-    trackContentType: track.trackContentType || 'text/vtt',
-    name: track.name || track.label || `Subtitle ${index + 1}`,
-    language: track.language || 'en',
-  }));
-  tracks = tracks.filter((t) => isChromecastReceiverReachableUrl(t.trackContentId));
+  const wantSubs = selectedSubtitleTrackId != null && String(selectedSubtitleTrackId).trim() !== '';
+  const readyOnly = subtitleOptions.filter((t) => t.ready === true);
 
+  let tracks = [];
   let activeTrackIds = [];
-  if (tracks.length > 0) {
-    const wanted = selectedSubtitleTrackId ? Number(selectedSubtitleTrackId) : NaN;
-    const picked = tracks.some((t) => t.trackId === wanted)
-      ? wanted
-      : tracks[0].trackId;
-    activeTrackIds = [picked];
+  if (wantSubs && readyOnly.length > 0) {
+    tracks = readyOnly.map((track) => ({
+      trackId: Number(track.trackId),
+      type: 'TEXT',
+      subtype: 'SUBTITLES',
+      trackContentId: rewriteLocalhostResourceUrlForChromecast(track.trackContentId, normalized),
+      trackContentType: track.trackContentType || 'text/vtt',
+      name: track.name || track.label || `Subtitle ${track.trackId}`,
+      language: track.language || 'en',
+    }));
+    tracks = tracks.filter((t) => isChromecastReceiverReachableUrl(t.trackContentId));
+    const wanted = Number(selectedSubtitleTrackId);
+    if (Number.isFinite(wanted) && tracks.some((t) => t.trackId === wanted)) {
+      activeTrackIds = [wanted];
+    }
   }
 
   return {
@@ -1982,12 +1984,13 @@ function renderCastTvModalContent(meta, state = {}) {
           ${subtitleOptions.length > 0 ? `
             <label class="cast-modal-label" for="castSubtitleSelect">Subtitle track</label>
             <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
+              <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>No subtitles (video only)</option>
               ${subtitleOptions.map((track) => `
-                <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
-                  ${escape(track.name || `Subtitle ${track.trackId}`)}
+                <option value="${escape(String(track.trackId))}" ${!track.ready ? 'disabled ' : ''}${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
+                  ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
                 </option>`).join('')}
             </select>
-            <p class="cast-modal-note">Changing subtitles may require restarting the cast session.</p>
+            <p class="cast-modal-note">Changing subtitles may require restarting the cast session. Tracks still extracting are disabled until ready.</p>
           ` : `
             <p class="cast-modal-note">No subtitles available for this stream.</p>
           `}
@@ -2000,12 +2003,13 @@ function renderCastTvModalContent(meta, state = {}) {
           ${subtitleOptions.length > 0 ? `
             <label class="cast-modal-label" for="castSubtitleSelect">Subtitle track</label>
             <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
+              <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>No subtitles (video only)</option>
               ${subtitleOptions.map((track) => `
-                <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
-                  ${escape(track.name || `Subtitle ${track.trackId}`)}
+                <option value="${escape(String(track.trackId))}" ${!track.ready ? 'disabled ' : ''}${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
+                  ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
                 </option>`).join('')}
             </select>
-            <p class="cast-modal-note">The selected subtitle will be sent with the Chromecast session.</p>
+            <p class="cast-modal-note">Only tracks marked ready are sent to Chromecast. Embedded subs extract as the torrent buffers — wait for “extracting…” to clear.</p>
           ` : `
             <p class="cast-modal-note">No subtitles available for this stream. Casting will continue without subtitles.</p>
           `}
@@ -2229,6 +2233,7 @@ async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = nul
     const trackContentId = metaForRewrite
       ? rewriteLocalhostResourceUrlForChromecast(absolute, metaForRewrite)
       : absolute;
+    const ready = typeof track.ready === 'boolean' ? track.ready : true;
     return {
       trackId: index + 1,
       name: track.label || `Subtitle ${index + 1}`,
@@ -2236,6 +2241,7 @@ async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = nul
       trackContentId,
       trackContentType: 'text/vtt',
       source: track.source || 'unknown',
+      ready,
     };
   });
 }
@@ -2401,11 +2407,11 @@ async function populateCastTvModal(meta) {
 
   castTvState.meta = normalized;
   castTvState.subtitleOptions = subtitleOptions;
-  // Preserve selected subtitle track if it still exists, otherwise select first
   if (subtitleOptions.length > 0) {
     const currentTrackId = String(castTvState.selectedSubtitleTrackId || '');
-    const selectedStillExists = subtitleOptions.some((track) => String(track.trackId) === currentTrackId);
-    castTvState.selectedSubtitleTrackId = selectedStillExists ? currentTrackId : String(subtitleOptions[0].trackId);
+    const selectedStillExists = currentTrackId === ''
+      || subtitleOptions.some((track) => String(track.trackId) === currentTrackId);
+    castTvState.selectedSubtitleTrackId = selectedStillExists ? currentTrackId : '';
   } else {
     castTvState.selectedSubtitleTrackId = '';
   }
@@ -2426,8 +2432,8 @@ async function populateCastTvModal(meta) {
 
   renderState();
 
-  // Embedded subs are filled in after player_ready; poll briefly so the list appears without reopening.
-  if (normalized.subtitleManifestUrl && subtitleOptions.length === 0) {
+  // Embedded subs fill in after player_ready; poll while manifest is empty or any track is still extracting.
+  if (normalized.subtitleManifestUrl && (subtitleOptions.length === 0 || subtitleOptions.some((t) => t.ready === false))) {
     const manifestUrl = normalized.subtitleManifestUrl;
     const metaSnap = normalized;
     (async () => {
@@ -2440,10 +2446,10 @@ async function populateCastTvModal(meta) {
           if (next.length > 0) {
             castTvState.subtitleOptions = next;
             const cur = String(castTvState.selectedSubtitleTrackId || '');
-            const ok = next.some((t) => String(t.trackId) === cur);
-            castTvState.selectedSubtitleTrackId = ok ? cur : String(next[0].trackId);
+            const ok = cur === '' || next.some((t) => String(t.trackId) === cur);
+            castTvState.selectedSubtitleTrackId = ok ? cur : '';
             renderState();
-            break;
+            if (next.some((t) => t.ready)) break;
           }
         } catch (e) {
           // ignore
@@ -2634,10 +2640,9 @@ function startChromecastCast(event) {
         castTvState.subtitleOptions = subtitleOptions;
         if (subtitleOptions.length > 0) {
           const currentTrackId = String(castTvState.selectedSubtitleTrackId || '');
-          const selectedStillExists = subtitleOptions.some((track) => String(track.trackId) === currentTrackId);
-          castTvState.selectedSubtitleTrackId = selectedStillExists
-            ? currentTrackId
-            : String(subtitleOptions[0].trackId);
+          const selectedStillExists = currentTrackId === ''
+            || subtitleOptions.some((track) => String(track.trackId) === currentTrackId);
+          castTvState.selectedSubtitleTrackId = selectedStillExists ? currentTrackId : '';
         } else {
           castTvState.selectedSubtitleTrackId = '';
         }
@@ -2646,9 +2651,13 @@ function startChromecastCast(event) {
       }
     }
 
-    if (subtitleOptions.length > 0 && !castTvState.selectedSubtitleTrackId) {
-      toast('Choose a subtitle track before casting', 'info');
-      return;
+    const sel = String(castTvState.selectedSubtitleTrackId || '');
+    if (sel) {
+      const picked = subtitleOptions.find((t) => String(t.trackId) === sel);
+      if (!picked || !picked.ready) {
+        toast('This subtitle is still being extracted. Choose “No subtitles” or wait until it is ready (no “extracting…”).', 'info', 7000);
+        return;
+      }
     }
 
     const draft = buildCastMediaDraft(

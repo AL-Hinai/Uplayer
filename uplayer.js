@@ -2757,13 +2757,28 @@ class StreamManager extends EventEmitter {
           'Access-Control-Allow-Origin': '*',
           'Cache-Control': 'no-cache'
         });
-        const subtitleList = this.subtitlePaths.map((sub, index) => ({
-          index: index,
-          url: `/subtitle_${index}.vtt`,
-          language: sub.language || 'en',
-          label: sub.label || `Subtitle ${index + 1}`,
-          source: sub.source || 'unknown'
-        }));
+        const subtitleList = this.subtitlePaths.map((sub, index) => {
+          let ready = false;
+          if (!sub.isPlaceholder && sub.path) {
+            try {
+              if (fs.existsSync(sub.path)) {
+                const st = fs.statSync(sub.path);
+                // Placeholder / not-yet-written files must not look "ready" to Cast (empty WEBVTT breaks subs).
+                ready = st.size > 24;
+              }
+            } catch (e) {
+              ready = false;
+            }
+          }
+          return {
+            index,
+            url: `/subtitle_${index}.vtt`,
+            language: sub.language || 'en',
+            label: sub.label || `Subtitle ${index + 1}`,
+            source: sub.source || 'unknown',
+            ready,
+          };
+        });
         res.end(JSON.stringify({ subtitles: subtitleList, count: subtitleList.length }));
         return;
       }

@@ -87,7 +87,7 @@ vlc_exists() {
 }
 
 run_install_deps() {
-  "${INSTALL_CMD[@]}" >/dev/null 2>&1
+  "${INSTALL_CMD[@]}"
 }
 
 write_launcher() {
@@ -205,6 +205,24 @@ windows_shell_vlc_install() {
   return 1
 }
 
+install_windows_shortcuts() {
+  echo -e "\n${C}[Windows]${N} Creating Desktop and Start Menu shortcuts..."
+  local repo_win create_ps1
+  if has_command cygpath; then
+    repo_win="$(cygpath -w "$SCRIPT_DIR")"
+    create_ps1="$(cygpath -w "$SCRIPT_DIR/scripts/create-windows-shortcuts.ps1")"
+  else
+    repo_win="$SCRIPT_DIR"
+    create_ps1="$SCRIPT_DIR/scripts/create-windows-shortcuts.ps1"
+  fi
+  if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$create_ps1" -RepoRoot "$repo_win"; then
+    echo -e "  ${G}OK${N} Shortcut: Uplayer Web (opens tray + web UI)"
+  else
+    echo -e "  ${Y}!${N} Shortcut creation failed. From PowerShell run:"
+    echo "      powershell -ExecutionPolicy Bypass -File \"$SCRIPT_DIR/scripts/create-windows-shortcuts.ps1\" -RepoRoot \"<full path to repo>\""
+  fi
+}
+
 install_vlc() {
   echo -e "\n${C}[5/5]${N} Ensuring VLC is available..."
 
@@ -262,6 +280,12 @@ print_footer() {
   echo -e "${Y}Note:${N} If the 'uplayer' command is not available yet, restart your shell or run:"
   echo -e "  ${C}source $(detect_shell_rc)${N}"
   echo
+  if [[ "$OS" == "windows-shell" ]]; then
+    echo -e "${C}Windows launcher:${N} Use the ${G}Uplayer Web${N} shortcut on your Desktop or Start Menu."
+    echo -e "  It runs the server in the background and keeps a tray icon until you choose ${G}Quit${N}."
+    echo -e "${Y}SmartScreen:${N} The first launch may prompt to allow ${C}Windows PowerShell${N} for unsigned scripts."
+    echo
+  fi
 }
 
 print_header
@@ -270,8 +294,7 @@ OS="$(detect_os)"
 VLC_DOWNLOAD_URL="https://www.videolan.org/vlc/"
 
 if [[ "$OS" == "windows-shell" ]]; then
-  echo -e "${B}->${N} Detected shell environment on Windows"
-  echo -e "${B}->${N} For native PowerShell installation, you can also run: ${C}./setup.ps1${N}"
+  echo -e "${B}->${N} Detected shell environment on Windows (shortcuts will be created at end of setup)"
 else
   echo -e "${B}->${N} Detected: ${G}${OS}${N}"
 fi
@@ -304,14 +327,11 @@ else
   fi
 fi
 
-echo -e "\n${C}[2/5]${N} Installing dependencies..."
+echo -e "\n${C}[2/5]${N} Installing / updating dependencies..."
 cd "$SCRIPT_DIR"
-if [[ -d node_modules ]]; then
-  echo -e "  ${G}OK${N} node_modules already present"
-else
-  run_install_deps
-  echo -e "  ${G}OK${N} Dependencies installed"
-fi
+echo -e "  ${B}->${N} Running ${INSTALL_CMD[*]} (refreshes on every setup run)"
+run_install_deps
+echo -e "  ${G}OK${N} Dependencies installed / updated"
 
 echo -e "\n${C}[3/5]${N} Creating global command..."
 write_launcher
@@ -321,4 +341,9 @@ echo -e "\n${C}[4/5]${N} Updating PATH..."
 ensure_path
 
 install_vlc
+
+if [[ "$OS" == "windows-shell" ]]; then
+  install_windows_shortcuts
+fi
+
 print_footer

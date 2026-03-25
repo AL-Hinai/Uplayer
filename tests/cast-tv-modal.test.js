@@ -138,8 +138,8 @@ function testBuildCastMediaDraftHonorsSelectedSubtitleTrack() {
   const draft = buildCastMediaDraft(
     { castUrl: 'http://192.168.1.50:8000/video.mp4?compat=1' },
     [
-      { trackId: 1, trackContentId: 'http://192.168.1.50:8000/subtitle_0.vtt', name: 'English', language: 'en' },
-      { trackId: 2, trackContentId: 'http://192.168.1.50:8000/subtitle_1.vtt', name: 'Arabic', language: 'ar' },
+      { trackId: 1, trackContentId: 'http://192.168.1.50:8000/subtitle_0.vtt', name: 'English', language: 'en', ready: true },
+      { trackId: 2, trackContentId: 'http://192.168.1.50:8000/subtitle_1.vtt', name: 'Arabic', language: 'ar', ready: true },
     ],
     '2',
     'Demo Movie'
@@ -150,6 +150,20 @@ function testBuildCastMediaDraftHonorsSelectedSubtitleTrack() {
   assert.strictEqual(draft.streamType, 'LIVE');
   assert.deepStrictEqual(Array.from(draft.activeTrackIds), [2]);
   assert.strictEqual(draft.metadata.title, 'Demo Movie');
+}
+
+function testBuildCastMediaDraftOmitsTracksWhenNoSubtitlesSelected() {
+  const { buildCastMediaDraft } = loadCastHelpers();
+  const draft = buildCastMediaDraft(
+    { castUrl: 'http://192.168.1.50:8000/video.mp4' },
+    [
+      { trackId: 1, trackContentId: 'http://192.168.1.50:8000/subtitle_0.vtt', name: 'English', ready: true },
+    ],
+    '',
+    'Demo'
+  );
+  assert.strictEqual(draft.tracks.length, 0);
+  assert.deepStrictEqual(Array.from(draft.activeTrackIds), []);
 }
 
 function testRenderCastTvModalUsesPlayerUrlForTvLinkOnly() {
@@ -184,8 +198,8 @@ function testRenderCastTvModalShowsSubtitleChooserAndNoSubtitleWarning() {
     {
       senderAllowed: true,
       subtitleOptions: [
-        { trackId: 1, name: 'English' },
-        { trackId: 2, name: 'Arabic' },
+        { trackId: 1, name: 'English', ready: true },
+        { trackId: 2, name: 'Arabic', ready: true },
       ],
       selectedSubtitleTrackId: '2',
     }
@@ -236,7 +250,7 @@ async function testStartChromecastRequestsSessionBeforeSubtitleRefresh() {
       calls.push('fetch');
       return {
         subtitles: [
-          { url: '/subtitle_0.vtt', label: 'English', language: 'en' },
+          { url: '/subtitle_0.vtt', label: 'English', language: 'en', ready: true },
         ],
       };
     },
@@ -369,6 +383,7 @@ function testCastOriginHelpersPreferLocalhostOrHttps() {
 async function main() {
   await testSubtitleManifestTracksBecomeAbsoluteUrls();
   testBuildCastMediaDraftHonorsSelectedSubtitleTrack();
+  testBuildCastMediaDraftOmitsTracksWhenNoSubtitlesSelected();
   testRenderCastTvModalUsesPlayerUrlForTvLinkOnly();
   testRenderCastTvModalShowsSubtitleChooserAndNoSubtitleWarning();
   await testStartChromecastRequestsSessionBeforeSubtitleRefresh();
