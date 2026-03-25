@@ -507,9 +507,7 @@ function applySessionPlayerReady(session, payload = {}) {
     }
   }
 
-  // Only update vlcUrl if the new value is better (has video path) or if session.vlcUrl is not set
-  // CRITICAL: Don't overwrite a good vlcUrl with a worse one (e.g., don't replace original file URL with transcoded URL)
-  if (vlcUrl && (!session.vlcUrl || (vlcUrl !== session.vlcUrl && session.vlcUrl === playerUrl))) {
+  if (vlcUrl) {
     session.vlcUrl = vlcUrl;
     session.mediaUrls = payload.mediaUrls || session.mediaUrls || null;
   }
@@ -1107,6 +1105,7 @@ app.get('/api/stream/output/:sessionId', (req, res) => {
       vlcUrl: lifecycleStatus.vlcUrl,
       castUrl: lifecycleStatus.castUrl,
       subtitleManifestUrl: lifecycleStatus.subtitleManifestUrl,
+      videoFormat: lifecycleStatus.videoFormat,
     })}\n\n`);
   }
 

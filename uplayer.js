@@ -2422,15 +2422,17 @@ class StreamManager extends EventEmitter {
         }
         
         // Start HTTP server for streaming
-        await this.startStreamingServer(videoFile, async (url, urls, videoPath, originalVideoPath) => {
+        await this.startStreamingServer(videoFile, async (url, urls, videoPath, originalVideoPath, streamMeta = {}) => {
           if (this.memoryTracker) {
             this.memoryTracker.logMemory('Streaming server started');
           }
 
-          // Show subtitle info if available
+          const subtitleManifestUrl = `${String(url).replace(/\/$/, '')}/api/subtitles`;
           if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
-            log(`Subtitle available: ${url}/api/subtitles`);
+            log(`Subtitle available: ${subtitleManifestUrl}`);
             log('   Subtitles are available inside the native JS player track menu');
+          } else if (this.ffmpegPath && this.ffprobePath) {
+            log(`Subtitle manifest (embedded / streaming): ${subtitleManifestUrl}`);
           }
           log('Streaming server started!');
           log(`Stream URL: ${url}`);
@@ -2484,17 +2486,17 @@ class StreamManager extends EventEmitter {
 
           // Emit structured player_ready event for server mode
           if (serverMode) {
-            // Build proper URLs for different players
+            const playerRoot = String(url || '').replace(/\/?$/, '/');
+            // Keep playerUrl as the server root so the web app opens the HTML player, not raw video.
             const playerReadyData = {
-              url,
+              url: playerRoot,
               urls,
-              // Web player URL (may be transcoded for HEVC compatibility)
-              playerUrl: fullVideoUrl,
-              // VLC URL - always the original file (VLC can play any format without transcoding)
+              playerUrl: playerRoot,
               vlcUrl: fullOriginalVideoUrl,
               mediaUrl: fullOriginalVideoUrl,
-              // Cast URL for Chromecast (uses original file for best quality)
-              castUrl: fullOriginalVideoUrl,
+              castUrl: fullVideoUrl,
+              subtitleManifestUrl,
+              videoFormat: streamMeta.videoFormat || null,
             };
             this.emit('player_ready', playerReadyData);
           }
@@ -2506,7 +2508,19 @@ class StreamManager extends EventEmitter {
             });
           }
 
-          finish(resolve, { url, urls, torrent, videoFile, subtitlePath: options.subtitlePath, videoPath, originalVideoPath, vlcUrl: fullOriginalVideoUrl, mediaUrl: fullOriginalVideoUrl, castUrl: fullOriginalVideoUrl });
+          finish(resolve, {
+            url,
+            urls,
+            torrent,
+            videoFile,
+            subtitlePath: options.subtitlePath,
+            videoPath,
+            originalVideoPath,
+            vlcUrl: fullOriginalVideoUrl,
+            mediaUrl: fullOriginalVideoUrl,
+            castUrl: fullVideoUrl,
+            subtitleManifestUrl,
+          });
         }, options.subtitlePath);
 
         // Show download progress with throttling to prevent terminal spam
@@ -2826,6 +2840,42 @@ class StreamManager extends EventEmitter {
       // Extract requested video extension
       const requestedExt = videoPathMatch[1].toLowerCase();
 
+      const forceCompatTranscode = /\bcompat=1\b/.test(req.url || '');
+      const isTranscodedRequest = requestedExt === 'mp4' && videoExt !== '.mp4';
+
+      // Chromecast receivers send User-Agent containing CrKey; they need Content-Range on the first
+      // byte fetch so they know the full size. A plain 200 with a short body looks like the whole file
+      // and MP4/Matroska may not have headers in the first 10MB (playback never starts).
+      const chromecastReceiverLike = /\bCrKey\b/i.test(String(req.headers['user-agent'] || ''));
+
+      if (req.method === 'HEAD') {
+        if ((serveTranscoded && isTranscodedRequest || forceCompatTranscode) && this.ffmpegPath) {
+          res.writeHead(200, {
+            'Content-Type': 'video/mp4',
+            'Access-Control-Allow-Origin': '*',
+          });
+        } else {
+          res.writeHead(200, {
+            'Content-Length': videoFile.length,
+            'Accept-Ranges': 'bytes',
+            'Content-Type': contentType,
+            'Access-Control-Allow-Origin': '*',
+          });
+        }
+        res.end();
+        return;
+      }
+
+      if (req.method !== 'GET') {
+        res.writeHead(405, {
+          'Content-Type': 'text/plain',
+          'Allow': 'GET, HEAD',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end('');
+        return;
+      }
+
       // Handle range requests for video streaming (or transcoding for HEVC)
       const range = req.headers.range;
 
@@ -2867,8 +2917,6 @@ class StreamManager extends EventEmitter {
       // 1. serveTranscoded is true (HEVC detected)
       // 2. Requested URL is /video.mp4 (transcoded format)
       // 3. ffmpeg is available
-      const forceCompatTranscode = /\bcompat=1\b/.test(req.url || '');
-      const isTranscodedRequest = requestedExt === 'mp4' && videoExt !== '.mp4';
       if ((serveTranscoded && isTranscodedRequest || forceCompatTranscode) && this.ffmpegPath) {
           const { spawn } = require('child_process');
           const videoArgs = this._encoderArgs(selectedEncoder);
@@ -2904,82 +2952,89 @@ class StreamManager extends EventEmitter {
           res.on('close', () => { inputStream.destroy(); ffmpeg.kill(); });
           return;
         }
-        
-          if (!range) {
-            res.writeHead(200, {
-          'Content-Length': videoFile.length,
+
+      // Without Range: use 200 + Content-Length matching the body (first chunk only).
+      // Browsers/VLC expect 200 for a plain GET; 206 without a client Range breaks many stacks.
+      // Chromecast still gets an honest length (no "wait for full file" hang).
+      // With Range: 206 + Content-Range (standard partial content).
+      const maxChunkSize = 10 * 1024 * 1024; // 10MB chunks for fast streaming
+      let start;
+      let end;
+      let usePartialContent = false;
+      if (!range) {
+        start = 0;
+        const firstByteCap = chromecastReceiverLike
+          ? Math.min(32 * 1024 * 1024, videoFile.length)
+          : maxChunkSize;
+        end = Math.min(firstByteCap - 1, videoFile.length - 1);
+        usePartialContent = chromecastReceiverLike;
+      } else {
+        const positions = range.replace(/bytes=/, '').split('-');
+        start = parseInt(positions[0], 10);
+        const requestedEnd = positions[1]
+          ? parseInt(positions[1], 10)
+          : Math.min(start + maxChunkSize - 1, videoFile.length - 1);
+        end = Math.min(requestedEnd, videoFile.length - 1);
+        usePartialContent = true;
+      }
+      if (
+        !Number.isFinite(start) || !Number.isFinite(end)
+        || start < 0 || end < 0 || start > end || start >= videoFile.length
+      ) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${videoFile.length}`,
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end();
+        return;
+      }
+      end = Math.min(end, videoFile.length - 1);
+      const chunksize = (end - start) + 1;
+
+      if (usePartialContent) {
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${videoFile.length}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunksize,
           'Content-Type': contentType,
-          'Access-Control-Allow-Origin': '*'
+          'Access-Control-Allow-Origin': '*',
         });
-        stream = videoFile.createReadStream({ start: 0, end: Math.min(videoFile.length - 1, 10 * 1024 * 1024) });
-        
-        // Handle stream errors
-        stream.on('error', (err) => {
-          if (!res.destroyed) {
-            destroyStream();
-            // Silently ignore common streaming errors
-            if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ERR_STREAM_DESTROYED') {
-              console.error('Stream error:', err.message);
-            }
-          }
+      } else {
+        res.writeHead(200, {
+          'Content-Length': chunksize,
+          'Accept-Ranges': 'bytes',
+          'Content-Type': contentType,
+          'Access-Control-Allow-Origin': '*',
         });
-        
-        stream.pipe(res);
-            return;
-          }
+      }
 
-          const positions = range.replace(/bytes=/, '').split('-');
-          const start = parseInt(positions[0], 10);
-          
-          // ENHANCED: Large chunk size for maximum streaming speed
-          // No artificial limits - let the browser/player request what it needs
-          const maxChunkSize = 10 * 1024 * 1024; // 10MB chunks for fast streaming
-          
-          const requestedEnd = positions[1] ? parseInt(positions[1], 10) : Math.min(start + maxChunkSize - 1, videoFile.length - 1);
-          const end = Math.min(requestedEnd, videoFile.length - 1);
-          const chunksize = (end - start) + 1;
-
-          res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${videoFile.length}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunksize,
-            'Content-Type': contentType,
-            'Access-Control-Allow-Origin': '*'
-      });
-
-      // ENHANCED: Create stream with large buffer for maximum speed
       stream = videoFile.createReadStream({
-        start, 
+        start,
         end,
-        highWaterMark: 5 * 1024 * 1024 // 5MB buffer for fast streaming
+        highWaterMark: 5 * 1024 * 1024,
       });
-      
-      // Track this stream for memory management
+
       this.activeStreams.add(stream);
-      
-      // ENHANCED: Handle stream errors with proper cleanup
+
       stream.on('error', (err) => {
         if (!res.destroyed) {
           destroyStream();
-          // Silently ignore common streaming errors
           if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ERR_STREAM_DESTROYED') {
             console.error('Stream error:', err.message);
           }
         }
       });
-      
-      // ENHANCED: Handle backpressure to prevent memory buildup
-      // If response buffer is full, pause the stream
+
       stream.on('data', (chunk) => {
         if (!res.write(chunk)) {
           stream.pause();
         }
       });
-      
+
       res.on('drain', () => {
         stream.resume();
       });
-      
+
       stream.on('end', () => {
         res.end();
       });
@@ -2989,7 +3044,12 @@ class StreamManager extends EventEmitter {
     this.server.listen(port, urls.bindHost, () => {
       // Pass the video path so the caller can construct the full video URL
       // videoUrl is for web player (may be transcoded), originalFileUrl is for VLC (always original format)
-      callback(urls.preferred, urls, videoUrl, originalFileUrl);
+      callback(urls.preferred, urls, videoUrl, originalFileUrl, {
+        videoFormat: {
+          container: (videoExt || '').replace(/^\./, '') || 'unknown',
+          codec: codec || null,
+        },
+      });
     });
   }
   

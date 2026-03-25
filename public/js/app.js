@@ -1512,6 +1512,7 @@ const castTvState = {
   senderAllowed: false,
   castSdkReady: false,
   senderHelperUrl: '',
+  pendingAutoStartCast: false,
   // Cast session state
   isCasting: false,
   castSession: null,
@@ -1822,50 +1823,125 @@ function guessVideoContentType(url) {
   return 'video/mp4';
 }
 
-function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId, displayTitle) {
+function rewriteLocalhostResourceUrlForChromecast(absUrl, meta) {
   const normalized = normalizeActiveStreamMeta(meta);
-  const castUrl = normalized.castUrl || '';
+  if (!absUrl || typeof absUrl !== 'string') return absUrl;
+  const needsRewrite = absUrl.includes('localhost') || absUrl.includes('127.0.0.1');
+  if (!needsRewrite) return absUrl;
 
-  // Ensure cast URL uses network IP, not localhost
-  let contentUrl = castUrl;
-  if (castUrl.includes('localhost') || castUrl.includes('127.0.0.1')) {
-    // Try to use the playerUrl which should have network IP, or construct from window.location
-    const networkHost = window.location.hostname !== 'localhost'
-      ? window.location.host
-      : null;
-    if (networkHost) {
-      try {
-        const urlObj = new URL(castUrl);
-        urlObj.host = networkHost;
-        contentUrl = urlObj.href;
-      } catch (e) {
-        // Keep original URL if parsing fails
+  let replacementHost = null;
+  const hn = window.location && window.location.hostname;
+  if (hn && hn !== 'localhost' && hn !== '127.0.0.1') {
+    replacementHost = window.location.host;
+  }
+  if (!replacementHost && normalized.playerUrl) {
+    try {
+      const pu = new URL(normalized.playerUrl);
+      if (pu.hostname && pu.hostname !== 'localhost' && pu.hostname !== '127.0.0.1') {
+        replacementHost = pu.host;
       }
+    } catch (e) {
+      // ignore
     }
   }
+  if (!replacementHost && normalized.castUrl) {
+    try {
+      const cu = new URL(normalized.castUrl);
+      if (cu.hostname && cu.hostname !== 'localhost' && cu.hostname !== '127.0.0.1') {
+        replacementHost = cu.host;
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+  if (!replacementHost) return absUrl;
+  try {
+    const u = new URL(absUrl);
+    u.host = replacementHost;
+    return u.href;
+  } catch (e) {
+    return absUrl;
+  }
+}
 
-  const tracks = subtitleOptions.map((track, index) => ({
+function rewriteCastUrlForChromecastReceiver(castUrl, meta) {
+  return rewriteLocalhostResourceUrlForChromecast(castUrl, meta);
+}
+
+function isChromecastReceiverReachableUrl(href) {
+  if (!href || typeof href !== 'string') return false;
+  if (!/^https?:\/\//i.test(href)) return false;
+  try {
+    const u = new URL(href);
+    if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId, displayTitle) {
+  const normalized = normalizeActiveStreamMeta(meta);
+  let contentUrl = rewriteCastUrlForChromecastReceiver(normalized.castUrl || '', meta);
+
+  const vf = normalized.videoFormat;
+  const codecStr = vf && vf.codec ? String(vf.codec) : '';
+  let pathname = '';
+  try {
+    pathname = new URL(contentUrl, window.location.href).pathname.toLowerCase();
+  } catch (e) {
+    pathname = String(contentUrl || '').toLowerCase();
+  }
+
+  let needsCompat = false;
+  if (!pathname.endsWith('.mp4')) {
+    needsCompat = true;
+  }
+  if (/hevc|h\.?265|x265/i.test(codecStr)) {
+    needsCompat = true;
+  }
+  if (needsCompat && contentUrl && !/\bcompat=1\b/.test(contentUrl)) {
+    contentUrl += (contentUrl.includes('?') ? '&' : '?') + 'compat=1';
+  }
+
+  const usesCompatTranscode = /\bcompat=1\b/.test(contentUrl);
+  const castMedia = window.chrome && window.chrome.cast && window.chrome.cast.media;
+  const StreamType = (castMedia && castMedia.StreamType) || { BUFFERED: 'BUFFERED', LIVE: 'LIVE' };
+  const contentType = usesCompatTranscode ? 'video/mp4' : guessVideoContentType(contentUrl);
+  // Chunked FFmpeg output has no fixed duration; LIVE matches progressive transcode better than BUFFERED.
+  const streamType = usesCompatTranscode && StreamType.LIVE
+    ? StreamType.LIVE
+    : (StreamType.BUFFERED || 'BUFFERED');
+
+  let tracks = subtitleOptions.map((track, index) => ({
     trackId: Number(track.trackId) || index + 1,
     type: 'TEXT',
     subtype: 'SUBTITLES',
-    trackContentId: track.trackContentId,
+    trackContentId: rewriteLocalhostResourceUrlForChromecast(track.trackContentId, normalized),
     trackContentType: track.trackContentType || 'text/vtt',
     name: track.name || track.label || `Subtitle ${index + 1}`,
     language: track.language || 'en',
   }));
-  const fallbackTrackId = tracks.length > 0 ? tracks[0].trackId : null;
-  const activeTrackId = selectedSubtitleTrackId
-    ? Number(selectedSubtitleTrackId)
-    : fallbackTrackId;
+  tracks = tracks.filter((t) => isChromecastReceiverReachableUrl(t.trackContentId));
+
+  let activeTrackIds = [];
+  if (tracks.length > 0) {
+    const wanted = selectedSubtitleTrackId ? Number(selectedSubtitleTrackId) : NaN;
+    const picked = tracks.some((t) => t.trackId === wanted)
+      ? wanted
+      : tracks[0].trackId;
+    activeTrackIds = [picked];
+  }
+
   return {
     contentId: contentUrl,
-    contentType: 'video/mp4', // Chromecast needs MP4 for best compatibility
-    streamType: 'BUFFERED', // Use BUFFERED for on-demand content (allows seeking, less latency)
+    contentType,
+    streamType,
     metadata: {
       title: displayTitle || wizard.titleText || 'Uplayer Stream',
     },
     tracks,
-    activeTrackIds: activeTrackId ? [activeTrackId] : [],
+    activeTrackIds,
   };
 }
 
@@ -2122,6 +2198,19 @@ function getReadyGoogleCastContext() {
   return castContext;
 }
 
+/** Cast Framework's requestSession() resolves with no session; use getCurrentSession() after it settles. */
+function resolveChromecastSessionForLoadMedia(castContext) {
+  if (!castContext || typeof castContext.getCurrentSession !== 'function') return null;
+  const fw = castContext.getCurrentSession();
+  if (!fw) return null;
+  if (typeof fw.loadMedia === 'function') return fw;
+  if (typeof fw.getSessionObj === 'function') {
+    const legacy = fw.getSessionObj();
+    if (legacy && typeof legacy.loadMedia === 'function') return legacy;
+  }
+  return null;
+}
+
 async function ensureGoogleCastContext() {
   await loadGoogleCastSenderSdk();
   const castContext = getReadyGoogleCastContext();
@@ -2131,18 +2220,24 @@ async function ensureGoogleCastContext() {
   return castContext;
 }
 
-async function loadCastSubtitleOptions(subtitleManifestUrl) {
+async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = null) {
   if (!subtitleManifestUrl) return [];
   const data = await fetchJson(subtitleManifestUrl);
   const subtitles = Array.isArray(data.subtitles) ? data.subtitles : [];
-  return subtitles.map((track, index) => ({
-    trackId: index + 1,
-    name: track.label || `Subtitle ${index + 1}`,
-    language: track.language || 'en',
-    trackContentId: new URL(track.url, subtitleManifestUrl).href,
-    trackContentType: 'text/vtt',
-    source: track.source || 'unknown',
-  }));
+  return subtitles.map((track, index) => {
+    const absolute = new URL(track.url, subtitleManifestUrl).href;
+    const trackContentId = metaForRewrite
+      ? rewriteLocalhostResourceUrlForChromecast(absolute, metaForRewrite)
+      : absolute;
+    return {
+      trackId: index + 1,
+      name: track.label || `Subtitle ${index + 1}`,
+      language: track.language || 'en',
+      trackContentId,
+      trackContentType: 'text/vtt',
+      source: track.source || 'unknown',
+    };
+  });
 }
 
 function renderCastQrCode(url) {
@@ -2295,10 +2390,10 @@ async function populateCastTvModal(meta) {
   const senderHelperUrl = senderAllowed ? '' : buildLocalhostSenderUrl();
   let subtitleOptions = [];
 
-  // Always refresh subtitle options from the server
+  // Always refresh subtitle options from the server (rewrite localhost for Chromecast parity)
   if (normalized.subtitleManifestUrl) {
     try {
-      subtitleOptions = await loadCastSubtitleOptions(normalized.subtitleManifestUrl);
+      subtitleOptions = await loadCastSubtitleOptions(normalized.subtitleManifestUrl, normalized);
     } catch (e) {
       subtitleOptions = [];
     }
@@ -2331,6 +2426,32 @@ async function populateCastTvModal(meta) {
 
   renderState();
 
+  // Embedded subs are filled in after player_ready; poll briefly so the list appears without reopening.
+  if (normalized.subtitleManifestUrl && subtitleOptions.length === 0) {
+    const manifestUrl = normalized.subtitleManifestUrl;
+    const metaSnap = normalized;
+    (async () => {
+      const overlay = document.getElementById('castModalOverlay');
+      for (let i = 0; i < 20; i += 1) {
+        await new Promise((r) => setTimeout(r, 600));
+        if (!overlay || !overlay.classList.contains('open')) break;
+        try {
+          const next = await loadCastSubtitleOptions(manifestUrl, metaSnap);
+          if (next.length > 0) {
+            castTvState.subtitleOptions = next;
+            const cur = String(castTvState.selectedSubtitleTrackId || '');
+            const ok = next.some((t) => String(t.trackId) === cur);
+            castTvState.selectedSubtitleTrackId = ok ? cur : String(next[0].trackId);
+            renderState();
+            break;
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+    })();
+  }
+
   if (senderAllowed) {
     try {
       await ensureGoogleCastContext();
@@ -2341,16 +2462,66 @@ async function populateCastTvModal(meta) {
       startCastStatusUpdates();
     } catch (error) {
       castTvState.castSdkReady = false;
+      castTvState.pendingAutoStartCast = false;
       renderState();
       // Keep the modal usable for TV browser fallback even if Cast SDK load fails.
     }
+    if (castTvState.pendingAutoStartCast && castTvState.castSdkReady && castTvState.meta && castTvState.meta.castUrl) {
+      castTvState.pendingAutoStartCast = false;
+      queueMicrotask(() => {
+        try {
+          startChromecastCast(null);
+        } catch (e) {
+          /* ignore */
+        }
+      });
+    }
   } else {
     updateCastStatusIndicator();
+    castTvState.pendingAutoStartCast = false;
   }
 }
 
-function openCastTvModal(event) {
+function openCastFromNav(event) {
   if (event) event.preventDefault();
+  const snapshot = normalizeActiveStreamMeta({
+    sessionId: wizard.sessionId,
+    playerUrl: wizard.playerUrl,
+    vlcUrl: wizard.vlcUrl,
+    castUrl: wizard.castUrl,
+    subtitleManifestUrl: wizard.subtitleManifestUrl,
+  });
+  if (!snapshot.castUrl || !snapshot.playerUrl) {
+    return openCastTvModal(event, {});
+  }
+  castTvState.meta = snapshot;
+  castTvState.senderAllowed = isCastSenderOriginAllowed();
+  if (!castTvState.senderAllowed) {
+    return openCastTvModal(event, {});
+  }
+  if (castTvState.castSdkReady) {
+    startChromecastCast(event);
+    return false;
+  }
+  return openCastTvModal(event, { autoStartChromecast: true });
+}
+
+function maybePreloadCastSenderSdk() {
+  if (!isCastSenderOriginAllowed()) return;
+  if (!wizard.castUrl) return;
+  ensureGoogleCastContext().then(() => {
+    castTvState.castSdkReady = true;
+    updateCastStatusIndicator();
+  }).catch(() => {});
+}
+
+function openCastTvModal(event, options = {}) {
+  if (event) event.preventDefault();
+  if (options && options.autoStartChromecast) {
+    castTvState.pendingAutoStartCast = true;
+  } else {
+    castTvState.pendingAutoStartCast = false;
+  }
   const overlay = document.getElementById('castModalOverlay');
   const content = document.getElementById('castModalContent');
   if (!overlay || !content) return false;
@@ -2382,6 +2553,36 @@ function openCastTvModal(event) {
   return false;
 }
 
+function attachChromecastReceiverErrorHandler(session, onPlaybackError) {
+  const chromeMedia = window.chrome && window.chrome.cast && window.chrome.cast.media;
+  if (!chromeMedia || !chromeMedia.PlayerState || !chromeMedia.IdleReason) return;
+  if (!session || typeof onPlaybackError !== 'function') return;
+
+  const consider = (media) => {
+    if (!media || typeof media.addUpdateListener !== 'function') return;
+    let notified = false;
+    const check = () => {
+      if (notified) return;
+      if (
+        media.playerState === chromeMedia.PlayerState.IDLE
+        && media.idleReason === chromeMedia.IdleReason.ERROR
+      ) {
+        notified = true;
+        onPlaybackError();
+      }
+    };
+    media.addUpdateListener(() => check());
+    check();
+  };
+
+  if (session.media) {
+    consider(session.media);
+  }
+  if (typeof session.addMediaListener === 'function') {
+    session.addMediaListener((media) => consider(media));
+  }
+}
+
 function startChromecastCast(event) {
   if (event) event.preventDefault();
   if (!castTvState.senderAllowed) {
@@ -2407,25 +2608,29 @@ function startChromecastCast(event) {
 
   let sessionPromise;
   try {
-    const activeSession = typeof castContext.getCurrentSession === 'function'
-      ? castContext.getCurrentSession()
-      : null;
-    sessionPromise = activeSession || typeof castContext.requestSession !== 'function'
-      ? Promise.resolve(activeSession)
-      : castContext.requestSession();
+    const existing = resolveChromecastSessionForLoadMedia(castContext);
+    if (existing) {
+      sessionPromise = Promise.resolve();
+    } else if (typeof castContext.requestSession === 'function') {
+      sessionPromise = castContext.requestSession();
+    } else {
+      throw new Error('Cast session API unavailable');
+    }
   } catch (error) {
     toast(`Could not start Chromecast: ${error.message}`, 'error', 5000);
     return false;
   }
 
-  sessionPromise.then(async (session) => {
+  sessionPromise.then(async () => {
+    const ctx = getReadyGoogleCastContext();
+    const session = resolveChromecastSessionForLoadMedia(ctx);
     if (!session || typeof session.loadMedia !== 'function') {
       throw new Error('Chromecast session is not ready');
     }
     let subtitleOptions = castTvState.subtitleOptions;
     if (meta.subtitleManifestUrl) {
       try {
-        subtitleOptions = await loadCastSubtitleOptions(meta.subtitleManifestUrl);
+        subtitleOptions = await loadCastSubtitleOptions(meta.subtitleManifestUrl, meta);
         castTvState.subtitleOptions = subtitleOptions;
         if (subtitleOptions.length > 0) {
           const currentTrackId = String(castTvState.selectedSubtitleTrackId || '');
@@ -2453,7 +2658,8 @@ function startChromecastCast(event) {
       wizard.titleText
     );
     const mediaInfo = new window.chrome.cast.media.MediaInfo(draft.contentId, draft.contentType);
-    mediaInfo.streamType = window.chrome.cast.media.StreamType.BUFFERED;
+    const streamTypeEnum = window.chrome.cast.media.StreamType || {};
+    mediaInfo.streamType = draft.streamType || streamTypeEnum.BUFFERED || 'BUFFERED';
     const metadata = new window.chrome.cast.media.GenericMediaMetadata();
     metadata.title = draft.metadata.title;
     mediaInfo.metadata = metadata;
@@ -2464,7 +2670,7 @@ function startChromecastCast(event) {
         castTrack.trackContentType = track.trackContentType;
         castTrack.subtype = window.chrome.cast.media.TextTrackType.SUBTITLES;
         castTrack.name = track.name;
-        castTrack.language = track.language;
+        castTrack.language = track.language || 'en';
         return castTrack;
       });
     }
@@ -2474,7 +2680,17 @@ function startChromecastCast(event) {
       loadRequest.activeTrackIds = draft.activeTrackIds;
     }
     await session.loadMedia(loadRequest);
-    
+
+    let receiverLoadFailed = false;
+    attachChromecastReceiverErrorHandler(session, () => {
+      receiverLoadFailed = true;
+      toast('Chromecast could not play this stream (format, firewall on port 8000, or network).', 'error', 7000);
+      handleCastSessionEnd();
+    });
+    if (receiverLoadFailed) {
+      return;
+    }
+
     // Set up session state tracking
     castTvState.isCasting = true;
     castTvState.castSession = session;
@@ -3414,6 +3630,7 @@ function connectStreamSSE(sessionId) {
       const payload = JSON.parse(e.data);
       const { url } = payload;
       applyActiveStreamMeta(payload);
+      maybePreloadCastSenderSdk();
       clearWaitingTimer(); // Stop timer immediately so it can't overwrite the badge
       showPlayerBanner(url);
       updateStreamReadyActions(payload);
@@ -3694,6 +3911,7 @@ window.renderHistory = renderHistory;
 window.openActivePlayer = openActivePlayer;
 window.openActiveVlc = openActiveVlc;
 window.openCastTvModal = openCastTvModal;
+window.openCastFromNav = openCastFromNav;
 window.startChromecastCast = startChromecastCast;
 window.stopChromecastCast = stopChromecastCast;
 window.handleCastSubtitleSelection = handleCastSubtitleSelection;

@@ -147,6 +147,7 @@ function testBuildCastMediaDraftHonorsSelectedSubtitleTrack() {
 
   assert.strictEqual(draft.contentId, 'http://192.168.1.50:8000/video.mp4?compat=1');
   assert.strictEqual(draft.contentType, 'video/mp4');
+  assert.strictEqual(draft.streamType, 'LIVE');
   assert.deepStrictEqual(Array.from(draft.activeTrackIds), [2]);
   assert.strictEqual(draft.metadata.title, 'Demo Movie');
 }
@@ -212,10 +213,24 @@ async function flushAsyncWork() {
 async function testStartChromecastRequestsSessionBeforeSubtitleRefresh() {
   const calls = [];
   const session = {
+    media: null,
+    getStatus() {
+      return 'connected';
+    },
+    getVolume() {
+      return 0.5;
+    },
+    isMuted() {
+      return false;
+    },
+    getReceiverStatus() {
+      return { receiver: { friendlyName: 'Test TV' } };
+    },
     async loadMedia() {
       calls.push('load');
     },
   };
+  let mockCurrentSession = null;
   const { startChromecastCast, castTvState } = loadCastHelpers({
     fetchJson: async () => {
       calls.push('fetch');
@@ -244,11 +259,13 @@ async function testStartChromecastRequestsSessionBeforeSubtitleRefresh() {
               return {
                 setOptions() {},
                 getCurrentSession() {
-                  return null;
+                  return mockCurrentSession;
                 },
                 requestSession() {
                   calls.push('request');
-                  return Promise.resolve(session);
+                  // Real Cast Framework resolves with no session; session comes from getCurrentSession().
+                  mockCurrentSession = session;
+                  return Promise.resolve();
                 },
               };
             },
@@ -264,7 +281,9 @@ async function testStartChromecastRequestsSessionBeforeSubtitleRefresh() {
               this.contentId = contentId;
               this.contentType = contentType;
             },
-            StreamType: { BUFFERED: 'BUFFERED' },
+            StreamType: { BUFFERED: 'BUFFERED', LIVE: 'LIVE' },
+            PlayerState: { IDLE: 'IDLE', PLAYING: 'PLAYING' },
+            IdleReason: { ERROR: 'ERROR' },
             GenericMediaMetadata: function GenericMediaMetadata() {},
             Track: function Track(trackId) {
               this.trackId = trackId;
