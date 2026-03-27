@@ -38,10 +38,26 @@ class HistoryStore {
     if (type === 'movie') {
       db.movies[String(item.tmdbId)] = normalized;
     } else if (type === 'tv') {
+      const existing = db.tvShows[String(item.tmdbId)];
+      // Preserve tracking state; default to true for new entries
+      if (existing && existing.tracking !== undefined) {
+        normalized.tracking = existing.tracking;
+      } else if (normalized.tracking === undefined) {
+        normalized.tracking = true;
+      }
       db.tvShows[String(item.tmdbId)] = normalized;
     } else {
       throw new Error('type must be movie or tv');
     }
+    this.write(db);
+    return db;
+  }
+
+  setTracking(id, tracking) {
+    const db = this.read();
+    const show = db.tvShows[String(id)];
+    if (!show) throw new Error('TV show not found in history');
+    show.tracking = !!tracking;
     this.write(db);
     return db;
   }

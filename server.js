@@ -251,6 +251,20 @@ app.post('/api/history', (req, res) => {
   }
 });
 
+app.patch('/api/history/tv/:id/tracking', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tracking } = req.body || {};
+    if (typeof tracking !== 'boolean') {
+      return res.status(400).json({ error: 'tracking must be a boolean' });
+    }
+    const db = getServices().historyStore.setTracking(id, tracking);
+    res.json({ ok: true, item: db.tvShows[String(id)] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.delete('/api/history/:type/:id', (req, res) => {
   try {
     const { type, id } = req.params;
@@ -343,7 +357,7 @@ app.post('/api/recommendations/event', async (req, res) => {
 app.get('/api/newEpisodes', async (req, res) => {
   try {
     const db = readHistory();
-    const shows = Object.values(db.tvShows);
+    const shows = Object.values(db.tvShows).filter((s) => s.tracking !== false);
     if (shows.length === 0) return res.json([]);
 
     const updates = await Promise.all(

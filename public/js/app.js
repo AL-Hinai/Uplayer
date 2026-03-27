@@ -91,6 +91,26 @@ function refreshHistoryViews() {
   renderHistTV(window._historyDB);
 }
 
+async function toggleTracking(id, tracking) {
+  try {
+    const res = await fetch(`/api/history/tv/${id}/tracking`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tracking }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Failed to update tracking');
+    if (window._historyDB && window._historyDB.tvShows) {
+      window._historyDB.tvShows[String(id)] = data.item;
+    }
+    toast(tracking ? 'Tracking enabled' : 'Tracking disabled', 'success');
+    return data.item;
+  } catch (e) {
+    toast(e.message || 'Failed to update tracking', 'error');
+    throw e;
+  }
+}
+
 function normalizeMediaPayload(type, item = {}) {
   const tmdbId = item.tmdbId || item.id;
   return stripUndefinedFields({
@@ -164,7 +184,7 @@ async function toggleWatchlistItem(type, item, options = {}) {
     if (state.watchlist[type]) {
       delete state.watchlist[type][String(payload.tmdbId)];
     }
-    if (!options.silent) toast('Removed from watchlist', 'info');
+    if (!options.silent) toast('Tracking disabled', 'info');
     return { saved: false, data };
   }
 
@@ -183,7 +203,7 @@ async function toggleWatchlistItem(type, item, options = {}) {
   }
   state.watchlist[type] = state.watchlist[type] || {};
   state.watchlist[type][String(payload.tmdbId)] = data.item || payload;
-  if (!options.silent) toast('Saved to watchlist', 'success');
+  if (!options.silent) toast('Now tracking', 'success');
   return { saved: true, data };
 }
 
@@ -287,7 +307,7 @@ function buildCard(item, opts = {}) {
     : '';
 
   const saveButton = opts.showSaveButton
-    ? `<button class="card-save-btn ${saved ? 'saved' : ''}" onclick="event.stopPropagation();toggleWatchlistFromCard(event,'${mt}',${id})">${saved ? 'Saved' : 'Save'}</button>`
+    ? `<button class="card-save-btn ${saved ? 'saved' : ''}" onclick="event.stopPropagation();toggleWatchlistFromCard(event,'${mt}',${id})">${saved ? 'Untrack' : 'Track'}</button>`
     : '';
 
   const reasonHTML = reasonLabel
@@ -489,6 +509,7 @@ function route() {
   document.getElementById('navLinks').classList.remove('open');
 
   document.getElementById('app').innerHTML = `<div class="page-loader"><div class="spinner"></div></div>`;
+  window.scrollTo(0, 0);
   fn();
 }
 
@@ -498,11 +519,14 @@ async function renderHome() {
   const app = document.getElementById('app');
 
   try {
-    const [trending, trendingMovies, trendingTV] = await Promise.all([
+    const [trending, trendingMovies, trendingTV, newEps] = await Promise.all([
       api('/api/trending?type=all&window=week'),
       api('/api/trending?type=movie&window=week'),
       api('/api/trending?type=tv&window=week'),
+      api('/api/newEpisodes').catch(() => []),
     ]);
+
+    state.newEpisodes = newEps;
 
     const heroHTML = renderHero(trending.results);
 
@@ -518,8 +542,39 @@ async function renderHome() {
       buildCard(item, { mediaType: 'tv', showTypeBadge: false })
     ).join('');
 
+    let newEpsHTML = '';
+    if (newEps.length > 0) {
+      const epCards = newEps.map((ep) => `
+        <div class="new-ep-card" onclick="openDetail('tv',${ep.tmdbId})">
+          ${ep.poster_path
+            ? `<img class="new-ep-poster" src="https://image.tmdb.org/t/p/w200${ep.poster_path}" alt="${escape(ep.title)}" loading="lazy" />`
+            : `<div class="new-ep-poster new-ep-poster-placeholder">TV</div>`}
+          <div class="new-ep-card-info">
+            <div class="new-ep-card-title">${escape(ep.title)}</div>
+            <div class="new-ep-card-detail">
+              You watched S${ep.lastWatchedSeason}E${ep.lastWatchedEpisode}
+            </div>
+            <div class="new-ep-card-new">
+              New: S${ep.latestSeason}E${ep.latestEpisode}
+              ${ep.latestEpisodeName ? ` "${escape(ep.latestEpisodeName)}"` : ''}
+            </div>
+            ${ep.latestAirDate ? `<div class="new-ep-card-date">${formatDate(ep.latestAirDate)}</div>` : ''}
+          </div>
+        </div>`).join('');
+
+      newEpsHTML = `
+        <div class="section new-episodes-section">
+          <div class="section-header">
+            <h2 class="section-title">New Episodes</h2>
+            <a href="#/history" class="section-link">View History -></a>
+          </div>
+          <div class="scroll-row new-ep-scroll">${epCards}</div>
+        </div>`;
+    }
+
     app.innerHTML = `
       ${heroHTML}
+      ${newEpsHTML}
       <div class="section">
         <div class="section-header">
           <h2 class="section-title">Trending This Week</h2>
@@ -868,7 +923,7 @@ function buildRecommendationSummary(data = {}) {
       </div>
       <div class="recs-stat-row">
         <span class="recs-stat-pill">Signals ${Math.round(personalization.positiveSignalWeight || 0)}</span>
-        <span class="recs-stat-pill">Watchlist ${data.watchlist?.total || 0}</span>
+        <span class="recs-stat-pill">Tracked ${data.watchlist?.total || 0}</span>
         <span class="recs-stat-pill">Quality floor ${personalization.qualityFloor ? personalization.qualityFloor.toFixed(1) : '6.2'}+</span>
       </div>
       ${topGenres.length ? `<div class="recs-summary-tags">${topGenres.map((genre) => `<span class="genre-chip">${escape(genre)}</span>`).join('')}</div>` : ''}
@@ -971,7 +1026,7 @@ function buildRecommendationsSidebarMeta(data = {}) {
       <label class="sidebar-label">Profile</label>
       <div class="recs-profile-box">
         <div class="recs-profile-title">${escape(status)}</div>
-        <div class="recs-profile-text">Signals ${Math.round(personalization.positiveSignalWeight || 0)} • Watchlist ${data.watchlist?.total || 0}</div>
+        <div class="recs-profile-text">Signals ${Math.round(personalization.positiveSignalWeight || 0)} • Tracked ${data.watchlist?.total || 0}</div>
         ${topGenres.length ? `<div class="recs-profile-tags">${topGenres.map((genre) => `<span class="genre-chip">${escape(genre)}</span>`).join('')}</div>` : '<div class="recs-profile-text">Open details, save titles, and stream more to sharpen results.</div>'}
       </div>
     </div>`;
@@ -1199,6 +1254,7 @@ async function openDetail(type, id) {
 
   try {
     await ensureWatchlistLoaded();
+    if (!window._historyDB) window._historyDB = await getHistory();
     const item = await api(`/api/detail/${type}/${id}`);
     trackRecommendationEvent('detail_click', type, id, item, { silent: true });
     const t = item.title || item.name;
@@ -1210,6 +1266,8 @@ async function openDetail(type, id) {
       (item.episode_run_time && item.episode_run_time[0] ? `${item.episode_run_time[0]} min/ep` : '');
     const cast = (item.credits?.cast || []).slice(0, 12);
     const savedToWatchlist = isSavedToWatchlist(type, id);
+
+    // no separate tracking toggle — the Track button handles both watchlist + history tracking
 
     const castHTML = cast.length ? `
       <h3 class="modal-section-title">Cast</h3>
@@ -1288,14 +1346,11 @@ async function openDetail(type, id) {
             <button class="btn btn-primary" style="font-size:1rem;padding:.7rem 1.6rem" onclick="closeModal();openStreamWizard('${type}',${id},'${escape(t)}')">
               Stream
             </button>
-            <button class="btn btn-outline" id="modalWatchlistBtn" onclick="toggleCurrentModalWatchlist()">
-              ${savedToWatchlist ? 'Saved' : 'Save'}
+            <button class="btn btn-outline ${savedToWatchlist ? 'tracked' : ''}" id="modalWatchlistBtn" onclick="toggleCurrentModalWatchlist()">
+              ${savedToWatchlist ? 'Untrack' : 'Track'}
             </button>
             <button class="btn btn-secondary" onclick="markCurrentModalItem()">
               Mark Watched
-            </button>
-            <button class="btn btn-danger btn-sm" onclick="removeHistoryFromModal('${type}',${id})">
-              Remove
             </button>
           </div>
           <div class="cli-hint">
@@ -1366,7 +1421,15 @@ async function toggleCurrentModalWatchlist() {
   const result = await toggleWatchlistItem(modal.type, modal.item);
   const btn = document.getElementById('modalWatchlistBtn');
   if (btn) {
-    btn.textContent = result.saved ? 'Saved' : 'Save';
+    btn.textContent = result.saved ? 'Untrack' : 'Track';
+    btn.classList.toggle('tracked', result.saved);
+  }
+  // Sync history tracking for TV shows
+  if (modal.type === 'tv' && window._historyDB && window._historyDB.tvShows) {
+    const histShow = window._historyDB.tvShows[String(modal.item.tmdbId)];
+    if (histShow) {
+      toggleTracking(modal.item.tmdbId, result.saved).catch(() => {});
+    }
   }
   if (state.currentPage === 'recommendations') {
     renderRecommendations(1, window._recsFilters || {});
@@ -1379,7 +1442,14 @@ async function toggleWatchlistFromCard(event, type, id) {
     tmdbId: id,
     title: event?.currentTarget?.closest('.card')?.querySelector('.card-title')?.textContent || 'Unknown',
   };
-  await toggleWatchlistItem(type, item);
+  const result = await toggleWatchlistItem(type, item);
+  // Sync history tracking for TV shows
+  if (type === 'tv' && window._historyDB && window._historyDB.tvShows) {
+    const histShow = window._historyDB.tvShows[String(id)];
+    if (histShow) {
+      toggleTracking(id, result.saved).catch(() => {});
+    }
+  }
   if (state.currentPage === 'recommendations') {
     renderRecommendations(1, window._recsFilters || {});
   }
@@ -1389,10 +1459,6 @@ async function markWatchedFromDetail(type, item) {
   await markWatched(type, item);
 }
 
-async function removeHistoryFromModal(type, id) {
-  await removeHistory(type, id);
-  closeModal();
-}
 
 // --- Close Modal --------------------------------------------------------------
 function closeModal() {
@@ -3908,7 +3974,6 @@ window.markWatchedFromDetail = markWatchedFromDetail;
 window.markCurrentModalItem = markCurrentModalItem;
 window.toggleCurrentModalWatchlist = toggleCurrentModalWatchlist;
 window.toggleWatchlistFromCard = toggleWatchlistFromCard;
-window.removeHistoryFromModal = removeHistoryFromModal;
 window.toggleSeason = toggleSeason;
 window.markEpWatched = markEpWatched;
 window.switchHistTab = switchHistTab;
