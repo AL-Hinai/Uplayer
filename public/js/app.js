@@ -269,7 +269,11 @@ function formatDate(str) {
 }
 
 function escape(str) {
-  return String(str || '').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(str || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function escapeJs(str) {
+  return String(str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
 }
 
 // --- Card Builder -------------------------------------------------------------
@@ -322,7 +326,7 @@ function buildCard(item, opts = {}) {
         ${typeBadge}
         ${watchedBadge}${newEpBadge}${badges}
         ${saveButton}
-        <button class="play-btn-card" onclick="event.stopPropagation();openStreamWizard('${mt}',${id},'${escape(t)}')" title="Stream this">Play</button>
+        <button class="play-btn-card" onclick="event.stopPropagation();openStreamWizard('${mt}',${id},'${escapeJs(t)}')" title="Stream this">Play</button>
         <div class="card-overlay">
           <div class="card-quick-actions">
             <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();openDetail('${mt}',${id})">Details</button>
@@ -1343,7 +1347,7 @@ async function openDetail(type, id) {
           <div class="modal-genres">${genres}</div>
           <p class="modal-overview">${escape(item.overview || 'No overview available.')}</p>
           <div class="modal-actions">
-            <button class="btn btn-primary" style="font-size:1rem;padding:.7rem 1.6rem" onclick="closeModal();openStreamWizard('${type}',${id},'${escape(t)}')">
+            <button class="btn btn-primary" style="font-size:1rem;padding:.7rem 1.6rem" onclick="closeModal();openStreamWizard('${type}',${id},'${escapeJs(t)}')">
               Stream
             </button>
             <button class="btn btn-outline ${savedToWatchlist ? 'tracked' : ''}" id="modalWatchlistBtn" onclick="toggleCurrentModalWatchlist()">
@@ -1380,17 +1384,29 @@ async function toggleSeason(headerEl, showId, seasonNum) {
   if (episodesEl.querySelector('.spinner')) {
     try {
       const data = await api(`/api/tv/${showId}/season/${seasonNum}`);
-      const eps = (data.episodes || []).map((ep) => `
-        <div class="ep-item" onclick="markEpWatched(${showId}, '${escape(data.name || '')}', ${ep.season_number}, ${ep.episode_number}, event)">
+      const showTitle = escapeJs(window._modalItem?.item?.title || data.name || '');
+      const histShow = window._historyDB?.tvShows?.[String(showId)];
+      const lastS = histShow?.lastSeason || 0;
+      const lastE = histShow?.lastEpisode || 0;
+      const eps = (data.episodes || []).map((ep) => {
+        const wasWatched = ep.season_number < lastS || (ep.season_number === lastS && ep.episode_number <= lastE);
+        return `
+        <div class="ep-item${wasWatched ? ' ep-watched' : ''}">
           <div class="ep-num">${ep.episode_number}</div>
           <div class="ep-info">
             <div class="ep-name">${escape(ep.name || `Episode ${ep.episode_number}`)}</div>
             <div class="ep-date">${ep.air_date ? formatDate(ep.air_date) : 'TBA'}</div>
           </div>
-          <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();markEpWatched(${showId}, '${escape(data.name || '')}', ${ep.season_number}, ${ep.episode_number}, event)">
-            Mark
-          </button>
-        </div>`).join('');
+          <div class="ep-actions">
+            <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();closeModal();openStreamWizardEp('tv',${showId},'${showTitle}',${ep.season_number},${ep.episode_number})">
+              Watch
+            </button>
+            <button class="btn btn-sm ep-watched-btn ${wasWatched ? 'is-watched' : ''}" id="epBtn-${showId}-${ep.season_number}-${ep.episode_number}" onclick="event.stopPropagation();markEpWatched(${showId}, '${showTitle}', ${ep.season_number}, ${ep.episode_number}, event)">
+              ${wasWatched ? 'Watched' : 'Mark Watched'}
+            </button>
+          </div>
+        </div>`;
+      }).join('');
       episodesEl.innerHTML = eps || '<p class="text-muted" style="padding:.5rem;font-size:.8rem">No episodes found</p>';
     } catch (e) {
       episodesEl.innerHTML = `<p style="padding:.5rem;font-size:.8rem;color:var(--red)">Failed to load episodes</p>`;
@@ -1407,6 +1423,13 @@ async function markEpWatched(showId, showTitle, season, episode, event) {
     lastEpisode: episode,
   };
   await markWatched('tv', item);
+  // Update button and row visually
+  const btn = document.getElementById(`epBtn-${showId}-${season}-${episode}`);
+  if (btn) {
+    btn.classList.add('is-watched');
+    btn.textContent = 'Watched';
+    btn.closest('.ep-item')?.classList.add('ep-watched');
+  }
 }
 
 async function markCurrentModalItem() {
@@ -1710,8 +1733,11 @@ function loadAnyWizardState() {
 }
 
 function openStreamWizard(type, tmdbId, titleText) {
-  // Navigate to the stream page with parameters
   navigate(`/stream?type=${type}&id=${tmdbId}&title=${encodeURIComponent(titleText)}`);
+}
+
+function openStreamWizardEp(type, tmdbId, titleText, season, episode) {
+  navigate(`/stream?type=${type}&id=${tmdbId}&title=${encodeURIComponent(titleText)}&s=${season}&e=${episode}`);
 }
 
 function buildWizardHistoryItem() {
@@ -2898,6 +2924,8 @@ async function renderStreamPage() {
   const routeType = params.get('type');
   const routeTmdbId = params.get('id');
   const routeTitleText = params.get('title') || '';
+  const routeSeason = params.get('s') ? Number(params.get('s')) : null;
+  const routeEpisode = params.get('e') ? Number(params.get('e')) : null;
   const restoredAny = loadAnyWizardState();
 
   let activeSessions = [];
@@ -2968,6 +2996,13 @@ async function renderStreamPage() {
     });
   }
 
+  // If season/episode passed via URL (e.g. from episode Watch button), skip to torrent search
+  if (type === 'tv' && routeSeason && routeEpisode && !runningSession) {
+    wizard.selectedSeason = routeSeason;
+    wizard.selectedEpisode = routeEpisode;
+    wizard.step = 2;
+  }
+
   if (runningSession) {
     wizard.sessionId = runningSession.id;
     wizard.playerUrl = runningSession.playerUrl || wizard.playerUrl || null;
@@ -2992,6 +3027,8 @@ async function renderStreamPage() {
 
   if (wizard.step === 4) {
     await resumeStreamSession();
+  } else if (wizard.step === 2 && routeSeason && routeEpisode) {
+    setTimeout(() => wizardSearchTorrents(), 100);
   }
 }
 
@@ -4003,6 +4040,7 @@ window.getCurrentFilters = getCurrentFilters;
 
 // Streaming wizard exports
 window.openStreamWizard = openStreamWizard;
+window.openStreamWizardEp = openStreamWizardEp;
 window.wizardSelectSeason = wizardSelectSeason;
 window.wizardSelectEpisode = wizardSelectEpisode;
 window.wizardStep1Next = wizardStep1Next;
