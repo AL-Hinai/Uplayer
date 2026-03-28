@@ -273,7 +273,7 @@ function escape(str) {
 }
 
 function escapeJs(str) {
-  return String(str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
+  return String(str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 
 // --- Card Builder -------------------------------------------------------------
@@ -3027,8 +3027,6 @@ async function renderStreamPage() {
 
   if (wizard.step === 4) {
     await resumeStreamSession();
-  } else if (wizard.step === 2 && routeSeason && routeEpisode) {
-    setTimeout(() => wizardSearchTorrents(), 100);
   }
 }
 
