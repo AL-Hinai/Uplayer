@@ -1059,7 +1059,8 @@ class TorrentScraper {
         { name: '1337x', fn: () => this.search1337x(q) },
         { name: 'YTS', fn: () => this.searchYTS(q) },
         { name: 'PirateBay', fn: () => this.searchPirateBay(q) },
-        { name: 'Nyaa', fn: () => this.searchNyaa(q) }
+        { name: 'Nyaa', fn: () => this.searchNyaa(q) },
+        { name: 'SubsPlease', fn: () => this.searchSubsPlease(q) }
       ];
 
       for (const source of sources) {
@@ -1137,7 +1138,12 @@ class TorrentScraper {
           `e${episodeStrPadded2}`,
           `e${episodeStr}`,
           `episode ${episodeValue}`,
-          `ep ${episodeValue}`
+          `ep ${episodeValue}`,
+          // Anime "Show - NN" format (SubsPlease, Erai-raws, HorribleSubs, ASW)
+          // Anchored with trailing space/bracket/paren/dot to avoid matching year suffixes or random numbers.
+          ` - ${episodeStrPadded2} `, ` - ${episodeStrPadded2}[`, ` - ${episodeStrPadded2}(`, ` - ${episodeStrPadded2}.`,
+          ` - ${episodeStrPadded3} `, ` - ${episodeStrPadded3}[`, ` - ${episodeStrPadded3}(`, ` - ${episodeStrPadded3}.`,
+          ` - ${episodeStr} `, ` - ${episodeStr}[`, ` - ${episodeStr}(`, ` - ${episodeStr}.`
         ];
         
         // Check for exact S##E#### match (highest priority) - includes EP format
@@ -1165,6 +1171,13 @@ class TorrentScraper {
           `s${seasonStr} ep${episodeStrPadded4}`,
           `s${seasonStr}_e${episodeStrPadded4}`,
           `s${seasonStr}_ep${episodeStrPadded4}`,
+          // Anime "Sn - NN" format (SubsPlease, ASW, Erai-raws)
+          `s${seasonStr} - ${episodeStrPadded2}`,
+          `s${seasonValue} - ${episodeStrPadded2}`,
+          `s${seasonStr} - ${episodeStrPadded3}`,
+          `s${seasonValue} - ${episodeStrPadded3}`,
+          `s${seasonStr} - ${episodeStr}`,
+          `s${seasonValue} - ${episodeStr}`,
           // Full text
           `season ${seasonValue} episode ${episodeValue}`
         ];
@@ -1232,6 +1245,19 @@ class TorrentScraper {
           if (toonsHubEpisode === episodeValue) {
             score += 500;  // High bonus for ToonsHub format match
             hasEpisode = true;
+          }
+        }
+
+        // Anime "Show - NN" format (SubsPlease/ASW/Erai-raws).
+        // Extract the number that appears between " - " and a boundary (space/bracket/paren/dot).
+        if (!hasEpisode) {
+          const animeEpMatch = nameLower.match(/\s-\s(\d{1,4})(?=\s|\[|\(|\.|$)/);
+          if (animeEpMatch) {
+            const animeEp = parseInt(animeEpMatch[1], 10);
+            if (animeEp === episodeValue) {
+              score += 500;
+              hasEpisode = true;
+            }
           }
         }
         
@@ -1448,6 +1474,47 @@ class TorrentScraper {
     }
   }
 
+  async searchSubsPlease(query) {
+    try {
+      const apiUrl = `https://subsplease.org/api/?f=search&tz=UTC&s=${encodeURIComponent(query)}`;
+      const response = await axios.get(apiUrl, {
+        headers: { 'User-Agent': this.userAgent, 'Accept': 'application/json' },
+        timeout: 10000,
+      });
+
+      const data = response.data;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return [];
+
+      const results = [];
+      for (const key of Object.keys(data)) {
+        const entry = data[key];
+        if (!entry || !Array.isArray(entry.downloads)) continue;
+
+        const showName = entry.show || key;
+        const episode = entry.episode != null ? String(entry.episode) : '';
+
+        for (const dl of entry.downloads) {
+          if (!dl || !dl.magnet) continue;
+          const res = dl.res ? `${dl.res}p` : '';
+          const name = `[SubsPlease] ${showName}${episode ? ` - ${episode}` : ''}${res ? ` (${res})` : ''}`;
+          results.push({
+            name,
+            seeders: 100,
+            leechers: 0,
+            size: 'Unknown',
+            link: dl.magnet,
+            source: 'SubsPlease',
+          });
+          if (results.length >= 30) break;
+        }
+        if (results.length >= 30) break;
+      }
+      return results;
+    } catch (error) {
+      return [];
+    }
+  }
+
   async getMagnetLink(torrentResult) {
     if (torrentResult.link.startsWith('magnet:')) {
       return torrentResult.link;
@@ -1477,8 +1544,8 @@ class TorrentScraper {
         return torrentResult.link;
     }
 
-    // For Nyaa and PirateBay, link should already be a magnet link
-    if (torrentResult.source === 'Nyaa' || torrentResult.source === 'PirateBay') {
+    // For Nyaa, PirateBay, and SubsPlease, link should already be a magnet link
+    if (torrentResult.source === 'Nyaa' || torrentResult.source === 'PirateBay' || torrentResult.source === 'SubsPlease') {
       return torrentResult.link;
     }
 
