@@ -221,7 +221,31 @@ app.get('/api/history', (req, res) => {
   res.json(readHistory());
 });
 
-app.post('/api/history', (req, res) => {
+// Look up missing TMDB metadata (poster_path / backdrop_path) so history
+// items always have artwork. Multiple save paths (wizard auto-save, CLI
+// session persist, hero "mark watched") can race against the wizard's TMDB
+// detail fetch and otherwise persist an item with the artwork stripped.
+async function enrichHistoryItemFromTmdb(type, item) {
+  if (!item || (item.poster_path && item.backdrop_path)) return item;
+  const tmdbId = item.tmdbId || item.id;
+  if (!tmdbId) return item;
+  try {
+    const detail = await tmdb(`/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}`);
+    return {
+      ...item,
+      poster_path: item.poster_path || detail.poster_path || null,
+      backdrop_path: item.backdrop_path || detail.backdrop_path || null,
+      release_date: item.release_date || detail.release_date,
+      first_air_date: item.first_air_date || detail.first_air_date,
+      vote_average: item.vote_average != null ? item.vote_average : detail.vote_average,
+    };
+  } catch (e) {
+    // Non-fatal — just keep what we have.
+    return item;
+  }
+}
+
+app.post('/api/history', async (req, res) => {
   try {
     const { type, item } = req.body || {};
     const tmdbId = item && (item.tmdbId || item.id);
@@ -229,10 +253,11 @@ app.post('/api/history', (req, res) => {
       return res.status(400).json({ error: 'Missing type or item' });
     }
 
+    const enriched = await enrichHistoryItemFromTmdb(type, item);
     const normalizedItem = {
-      ...item,
+      ...enriched,
       tmdbId,
-      title: item.title || item.name || item.original_title || item.original_name || 'Unknown',
+      title: enriched.title || enriched.name || enriched.original_title || enriched.original_name || 'Unknown',
     };
 
     const db = getServices().historyStore.markWatched(type, normalizedItem);
@@ -260,6 +285,39 @@ app.patch('/api/history/tv/:id/tracking', (req, res) => {
     }
     const db = getServices().historyStore.setTracking(id, tracking);
     res.json({ ok: true, item: db.tvShows[String(id)] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// One-shot artwork backfill — sweeps current history and patches in missing
+// poster_path / backdrop_path from TMDB. The frontend calls this once when
+// the history page loads so previously-broken records get fixed without
+// requiring the user to re-watch anything.
+app.post('/api/history/backfill', async (req, res) => {
+  try {
+    const store = getServices().historyStore;
+    const db = store.read();
+    const buckets = [
+      { type: 'movie', map: db.movies || {} },
+      { type: 'tv', map: db.tvShows || {} },
+    ];
+    let fixed = 0;
+    let attempted = 0;
+    for (const { type, map } of buckets) {
+      for (const id of Object.keys(map)) {
+        const item = map[id];
+        if (item && item.poster_path && item.backdrop_path) continue;
+        attempted += 1;
+        const enriched = await enrichHistoryItemFromTmdb(type, item);
+        if (enriched && (enriched.poster_path !== item.poster_path || enriched.backdrop_path !== item.backdrop_path)) {
+          map[id] = { ...item, ...enriched };
+          fixed += 1;
+        }
+      }
+    }
+    if (fixed > 0) store.write(db);
+    res.json({ ok: true, attempted, fixed });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -861,22 +919,56 @@ async function destroyAllSessions(code = 0) {
 
 app.post('/api/torrents/search', async (req, res) => {
   try {
-    const { title, type, season, episode } = req.body;
+    const { title, type, tmdbId, season, episode } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
 
-    const scraper = getServices().createTorrentScraper();
-    const results = await scraper.searchAllSources(
-      title,
-      null,
-      season != null ? Number(season) : null,
-      episode != null ? Number(episode) : null
-    );
+    const seasonNum = season != null ? Number(season) : null;
+    const episodeNum = episode != null ? Number(episode) : null;
 
-    // Sort by seeders descending, take top 20
-    const sorted = results
-      .filter((r) => r && r.name)
-      .sort((a, b) => (parseInt(b.seeders) || 0) - (parseInt(a.seeders) || 0))
-      .slice(0, 20);
+    // Derive anime metadata from TMDB so the scraper can pick the right query
+    // strategy (Nyaa/SubsPlease for anime, S##E## for live-action) and the
+    // right filter rules (absolute-episode matching for anime).
+    let isAnime = false;
+    let absoluteEpisode = null;
+
+    if (type === 'tv' && tmdbId && seasonNum != null && episodeNum != null) {
+      try {
+        const detail = await tmdb(`/tv/${tmdbId}`);
+        const genres = (detail.genres || []).map((g) => g.id);
+        const origins = detail.origin_country || [];
+        const lang = detail.original_language;
+        isAnime = genres.includes(16) && (origins.includes('JP') || lang === 'ja');
+
+        if (isAnime) {
+          // Two TMDB anime schemas: (a) reset-per-season (Bleach: S2E40 →
+          // abs = 366 + 40 = 406); (b) already-absolute (One Piece: S23E1159
+          // → abs = 1159, NOT priorSum + 1159). If the chosen episode_number
+          // is bigger than all prior seasons combined, it must already be the
+          // global counter — using priorSum + episode would double-count.
+          let priorSum = 0;
+          for (const s of detail.seasons || []) {
+            if (s && s.season_number > 0 && s.season_number < seasonNum) {
+              priorSum += s.episode_count || 0;
+            }
+          }
+          absoluteEpisode = episodeNum > priorSum ? episodeNum : priorSum + episodeNum;
+        }
+      } catch (lookupErr) {
+        // Non-fatal: fall back to non-anime behaviour if TMDB is unreachable.
+        console.warn(`/api/torrents/search: TMDB lookup failed for tmdbId=${tmdbId}: ${lookupErr.message}`);
+      }
+    }
+
+    const scraper = getServices().createTorrentScraper();
+    const results = await scraper.searchAllSources(title, {
+      season: seasonNum,
+      episode: episodeNum,
+      isAnime,
+      absoluteEpisode,
+    });
+
+    // Take top 20 — they're already sorted by score+seeders inside the scraper.
+    const sorted = (results || []).filter((r) => r && r.name).slice(0, 20);
 
     res.json(sorted);
   } catch (e) {

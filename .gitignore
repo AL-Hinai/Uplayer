@@ -10,6 +10,14 @@ dist/
 *.tmp
 stream-sandbox-*/
 
+# Torrent-naming research harness — regenerable artifacts.
+# We commit the human-readable report, machine summary, and the small
+# baseline test result, but ignore the raw 6 MB corpus, the 26 MB TMDB
+# response cache, and the latest test-results dump (regenerated each run).
+scripts/data/cache/
+scripts/data/torrent-naming-data.json
+scripts/data/test-results.json
+
 # System temp directories (for reference)
 # /tmp/webtorrent (cleaned automatically)
 # /dev/shm/stream-sandbox-* (RAM-based, auto-cleaned)

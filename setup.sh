@@ -9,6 +9,8 @@ C='\033[0;36m'
 R='\033[0;31m'
 N='\033[0m'
 
+UPLAYER_VERSION="0.15"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
 VLC_COMMAND=""
@@ -19,6 +21,7 @@ print_header() {
   clear || true
   echo -e "${C}========================================${N}"
   echo -e "${C}  UPLAYER - Universal Installer         ${N}"
+  echo -e "${C}  Version ${UPLAYER_VERSION}                          ${N}"
   echo -e "${C}========================================${N}"
   echo
 }

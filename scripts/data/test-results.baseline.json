@@ -1,0 +1,1023 @@
+{
+  "generatedAt": "2026-04-27T19:38:16.599Z",
+  "threshold": 0.8,
+  "baseline": true,
+  "shows": 10,
+  "totalAssertions": 35,
+  "totalPasses": 23,
+  "score": 0.6571428571428571,
+  "pass": false,
+  "cases": [
+    {
+      "show": {
+        "tmdbId": 95479,
+        "title": "JUJUTSU KAISEN",
+        "originalTitle": "呪術廻戦",
+        "isAnime": true,
+        "season": 1,
+        "episode": 59,
+        "absoluteEpisode": 59,
+        "firstAirYear": 2020
+      },
+      "runError": null,
+      "resultCount": 5,
+      "top10": [
+        {
+          "name": "[SubsPlease] Jujutsu Kaisen - 59 (480p)",
+          "source": "SubsPlease",
+          "seeders": 100,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": true,
+            "absoluteMatch": true,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "[SubsPlease] Jujutsu Kaisen - 59 (720p)",
+          "source": "SubsPlease",
+          "seeders": 100,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": true,
+            "absoluteMatch": true,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "[SubsPlease] Jujutsu Kaisen - 59 (1080p)",
+          "source": "SubsPlease",
+          "seeders": 100,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": true,
+            "absoluteMatch": true,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "[Judas] Jujutsu Kaisen (Season 03) [1080p][HEVC x265 10bit][Dual-Audio][Multi-Subs] (Batch)",
+          "source": "Nyaa",
+          "seeders": 372,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        },
+        {
+          "name": "Jujutsu Kaisen S03E01 Execution REPACK 1080p CR WEB-DL AAC2 0 H 264-playWEB",
+          "source": "PirateBay",
+          "seeders": 265,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": true,
+            "hasContradictingSeason": false
+          }
+        }
+      ],
+      "assertions": {
+        "topHit": {
+          "pass": true,
+          "detail": "[SubsPlease] Jujutsu Kaisen - 59 (480p)"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": false,
+          "detail": "Jujutsu Kaisen S03E01 Execution REPACK 1080p CR WEB-DL AAC2 0 H 264-playWEB",
+          "offenderCount": 1
+        },
+        "animeAbsolute": {
+          "pass": true,
+          "detail": "[SubsPlease] Jujutsu Kaisen - 59 (480p)"
+        }
+      },
+      "passes": 3,
+      "total": 4
+    },
+    {
+      "show": {
+        "tmdbId": 65733,
+        "title": "Doraemon",
+        "originalTitle": "ドラえもん",
+        "isAnime": true,
+        "season": 1,
+        "episode": 1447,
+        "absoluteEpisode": 1447,
+        "firstAirYear": 2005
+      },
+      "runError": null,
+      "resultCount": 0,
+      "top10": [],
+      "assertions": {
+        "topHit": {
+          "pass": false,
+          "detail": "(no match in top 5)"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": false,
+          "detail": "(no absolute/anime-dash match in top 10)"
+        }
+      },
+      "passes": 2,
+      "total": 4
+    },
+    {
+      "show": {
+        "tmdbId": 95897,
+        "title": "Overflow",
+        "originalTitle": "おーばーふろぉ",
+        "isAnime": true,
+        "season": 1,
+        "episode": 8,
+        "absoluteEpisode": 8,
+        "firstAirYear": 2020
+      },
+      "runError": null,
+      "resultCount": 0,
+      "top10": [],
+      "assertions": {
+        "topHit": {
+          "pass": false,
+          "detail": "(no match in top 5)"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": false,
+          "detail": "(no absolute/anime-dash match in top 10)"
+        }
+      },
+      "passes": 2,
+      "total": 4
+    },
+    {
+      "show": {
+        "tmdbId": 30984,
+        "title": "Bleach",
+        "originalTitle": "BLEACH",
+        "isAnime": true,
+        "season": 2,
+        "episode": 40,
+        "absoluteEpisode": 406,
+        "firstAirYear": 2004
+      },
+      "runError": null,
+      "resultCount": 1,
+      "top10": [
+        {
+          "name": "BLEACH Sennen Kessen hen S01E40 2024 1080p Baha WEB-DL x264 AAC-ADWeb",
+          "source": "PirateBay",
+          "seeders": 95,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": true,
+            "hasContradictingSeason": false
+          }
+        }
+      ],
+      "assertions": {
+        "topHit": {
+          "pass": false,
+          "detail": "(no match in top 5)"
+        },
+        "noWrongShow": {
+          "pass": false,
+          "detail": "BLEACH Sennen Kessen hen S01E40 2024 1080p Baha WEB-DL x264 AAC-ADWeb",
+          "offenderCount": 1
+        },
+        "noWrongSeason": {
+          "pass": false,
+          "detail": "BLEACH Sennen Kessen hen S01E40 2024 1080p Baha WEB-DL x264 AAC-ADWeb",
+          "offenderCount": 1
+        },
+        "animeAbsolute": {
+          "pass": false,
+          "detail": "(no absolute/anime-dash match in top 10)"
+        }
+      },
+      "passes": 0,
+      "total": 4
+    },
+    {
+      "show": {
+        "tmdbId": 113137,
+        "title": "Girlfriend, Girlfriend",
+        "originalTitle": "カノジョも彼女",
+        "isAnime": true,
+        "season": 2,
+        "episode": 12,
+        "absoluteEpisode": 24,
+        "firstAirYear": 2021
+      },
+      "runError": null,
+      "resultCount": 0,
+      "top10": [],
+      "assertions": {
+        "topHit": {
+          "pass": false,
+          "detail": "(no match in top 5)"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": false,
+          "detail": "(no absolute/anime-dash match in top 10)"
+        }
+      },
+      "passes": 2,
+      "total": 4
+    },
+    {
+      "show": {
+        "tmdbId": 85552,
+        "title": "Euphoria",
+        "originalTitle": "Euphoria",
+        "isAnime": false,
+        "season": 3,
+        "episode": 3,
+        "absoluteEpisode": 19,
+        "firstAirYear": 2019
+      },
+      "runError": null,
+      "resultCount": 10,
+      "top10": [
+        {
+          "name": "Euphoria US S03E03 The Ballad of Paladin 1080p AMZN WEB-DL DDP5 1 Atmos H 264-FLUX",
+          "source": "PirateBay",
+          "seeders": 3371,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria.US.S03E03.1080p.WEB.h264-GRACE",
+          "source": "PirateBay",
+          "seeders": 1922,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria US S03E03 The Ballad of Paladin 2160p HMAX WEB-DL DDP5 1 Atmos DV ",
+          "source": "PirateBay",
+          "seeders": 960,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria.US.S03E02.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 3027,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria US S03E03 720p HMAX WEB-DL DDP5 1 H 264-NTb",
+          "source": "PirateBay",
+          "seeders": 902,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria US S03E01 Andale 1080p AMZN WEB-DL DDP5 1 H 264-FLUX",
+          "source": "PirateBay",
+          "seeders": 2533,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria US S03E01 Andale REPACK 1080p AMZN WEB-DL DDP5 1 Atmos H 264-FLUX",
+          "source": "PirateBay",
+          "seeders": 816,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria US S03E02 1080p WEB h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 766,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Euphoria.US.S02.COMPLETE.1080p.WEBRip.AC3.x264-LESS",
+          "source": "PirateBay",
+          "seeders": 930,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        },
+        {
+          "name": "Euphoria.US.S01.REPACK.1080p.AMZN.WEBRip.DDP5.1.x264-KiNGS",
+          "source": "PirateBay",
+          "seeders": 745,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        }
+      ],
+      "assertions": {
+        "topHit": {
+          "pass": true,
+          "detail": "Euphoria US S03E03 The Ballad of Paladin 1080p AMZN WEB-DL DDP5 1 Atmos H 264-FLUX"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": true,
+          "detail": "n/a (not anime)",
+          "skipped": true
+        }
+      },
+      "passes": 3,
+      "total": 3
+    },
+    {
+      "show": {
+        "tmdbId": 124364,
+        "title": "FROM",
+        "originalTitle": "FROM",
+        "isAnime": false,
+        "season": 4,
+        "episode": 2,
+        "absoluteEpisode": 32,
+        "firstAirYear": 2022
+      },
+      "runError": null,
+      "resultCount": 9,
+      "top10": [
+        {
+          "name": "FROM S04E02 Fray 1080p AMZN WEB-DL DDP5 1 H 264-FLUX",
+          "source": "PirateBay",
+          "seeders": 3289,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "From S04E02 Fray 1080p AMZN WEB-DL DDP5 1 H 264-NTb",
+          "source": "PirateBay",
+          "seeders": 1882,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "FROM S04E02 Fray 2160p AMZN WEB-DL DDP5 1 H 265-FLUX",
+          "source": "PirateBay",
+          "seeders": 1295,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "From.S04E02.1080p.WEB.h264-GRACE",
+          "source": "PirateBay",
+          "seeders": 773,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "From.S04E01.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 2747,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "From S04E01 1080p HEVC x265-MeGusta",
+          "source": "PirateBay",
+          "seeders": 1434,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "From (2022) Season 2 S02 (1080p AMZN WEB-DL x265 HEVC 10bit EAC3 5.1 t3nzin)",
+          "source": "PirateBay",
+          "seeders": 933,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        },
+        {
+          "name": "From (2022) Season 1 S01 (1080p AMZN WEB-DL x265 HEVC 10bit EAC3",
+          "source": "PirateBay",
+          "seeders": 925,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        },
+        {
+          "name": "From.S03.COMPLETE.1080p.AMZN.WEB-DL.DDP5.1.H.264-FLUX[TGx]",
+          "source": "PirateBay",
+          "seeders": 577,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        }
+      ],
+      "assertions": {
+        "topHit": {
+          "pass": true,
+          "detail": "FROM S04E02 Fray 1080p AMZN WEB-DL DDP5 1 H 264-FLUX"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": true,
+          "detail": "n/a (not anime)",
+          "skipped": true
+        }
+      },
+      "passes": 3,
+      "total": 3
+    },
+    {
+      "show": {
+        "tmdbId": 76479,
+        "title": "The Boys",
+        "originalTitle": "The Boys",
+        "isAnime": false,
+        "season": 5,
+        "episode": 4,
+        "absoluteEpisode": 36,
+        "firstAirYear": 2019
+      },
+      "runError": null,
+      "resultCount": 10,
+      "top10": [
+        {
+          "name": "The.Boys.S05E04.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 6311,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The Boys S05E04 1080p HEVC x265-MeGusta",
+          "source": "PirateBay",
+          "seeders": 2930,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The.Boys.S05E03.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 4369,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The.Boys.S05E02.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 3749,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The.Boys.S05E04.1080p.x265-ELiTE",
+          "source": "PirateBay",
+          "seeders": 1324,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The.Boys.S05E01.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 2828,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The Boys S05E03 1080p HEVC x265-MeGusta",
+          "source": "PirateBay",
+          "seeders": 1974,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The Boys S05E01 REPACK 1080p WEB h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 1730,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The Boys S05E02 1080p HEVC x265-MeGusta",
+          "source": "PirateBay",
+          "seeders": 1693,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "The Boys S05E01 1080p HEVC x265-MeGusta",
+          "source": "PirateBay",
+          "seeders": 1585,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        }
+      ],
+      "assertions": {
+        "topHit": {
+          "pass": true,
+          "detail": "The.Boys.S05E04.1080p.WEB.h264-ETHEL"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": true,
+          "detail": "n/a (not anime)",
+          "skipped": true
+        }
+      },
+      "passes": 3,
+      "total": 3
+    },
+    {
+      "show": {
+        "tmdbId": 95557,
+        "title": "INVINCIBLE",
+        "originalTitle": "INVINCIBLE",
+        "isAnime": false,
+        "season": 4,
+        "episode": 8,
+        "absoluteEpisode": 32,
+        "firstAirYear": 2021
+      },
+      "runError": null,
+      "resultCount": 10,
+      "top10": [
+        {
+          "name": "Invincible.2021.S04E08.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 6066,
+          "verdict": {
+            "exactSEMatch": true,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible.2021.S04E07.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 3846,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible.2021.S04E06.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 3193,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible.2021.S04E01.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 2801,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible.2021.S04E02.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 2721,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible.2021.S04E03.1080p.WEB.h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 2674,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible 2021 S04E04 1080p WEB h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 3203,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible 2021 S04E05 1080p WEB h264-ETHEL",
+          "source": "PirateBay",
+          "seeders": 2691,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": false
+          }
+        },
+        {
+          "name": "Invincible (2021) Season 1 S01 (1080p WEB-DL x265 HEVC 10bit EAC",
+          "source": "PirateBay",
+          "seeders": 1576,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        },
+        {
+          "name": "Invincible.S02.COMPLETE.1080p.AMZN.WEB-DL.DDP5.1.H.264-Kitsune[T",
+          "source": "PirateBay",
+          "seeders": 1223,
+          "verdict": {
+            "exactSEMatch": false,
+            "longformMatch": false,
+            "episodeOnlyMatch": false,
+            "animeDashMatch": false,
+            "absoluteMatch": false,
+            "wrongSeason": false,
+            "hasContradictingSeason": true
+          }
+        }
+      ],
+      "assertions": {
+        "topHit": {
+          "pass": true,
+          "detail": "Invincible.2021.S04E08.1080p.WEB.h264-ETHEL"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": true,
+          "detail": "n/a (not anime)",
+          "skipped": true
+        }
+      },
+      "passes": 3,
+      "total": 3
+    },
+    {
+      "show": {
+        "tmdbId": 224263,
+        "title": "Stranger Things: Tales from '85",
+        "originalTitle": "Stranger Things: Tales from '85",
+        "isAnime": false,
+        "season": 1,
+        "episode": 10,
+        "absoluteEpisode": 10,
+        "firstAirYear": 2026
+      },
+      "runError": null,
+      "resultCount": 0,
+      "top10": [],
+      "assertions": {
+        "topHit": {
+          "pass": false,
+          "detail": "(no match in top 5)"
+        },
+        "noWrongShow": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "noWrongSeason": {
+          "pass": true,
+          "detail": "clean",
+          "offenderCount": 0
+        },
+        "animeAbsolute": {
+          "pass": true,
+          "detail": "n/a (not anime)",
+          "skipped": true
+        }
+      },
+      "passes": 2,
+      "total": 3
+    }
+  ]
+}

@@ -1807,11 +1807,47 @@ img { display: block; max-width: 100%; }
 .season-tab:hover { border-color: var(--accent); color: var(--accent); }
 .season-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
+/* Already-watched states for the season/episode pickers — earlier seasons
+   and episodes are implicitly watched once the user marks any later one. */
+.season-tab-watched { opacity: 0.55; }
+.season-tab-watched.active { opacity: 1; }
+.season-tab-partial { border-color: var(--accent); }
+
+.ep-btn-watched {
+  background: rgba(58, 170, 58, 0.08);
+  border-color: rgba(58, 170, 58, 0.4);
+  color: var(--text-muted);
+}
+.ep-btn-watched:hover {
+  background: rgba(58, 170, 58, 0.18);
+  border-color: rgba(58, 170, 58, 0.7);
+}
+.ep-btn-watched.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.ep-btn-check { font-size: 0.7em; }
+
 /* Torrent results table */
 .torrent-list {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  /* Cap the list height so a search returning many results doesn't push
+     the wizard-nav (Back / Next: Subtitles) off-screen. The list scrolls
+     internally instead. Mirrors .subtitle-list and .episode-grid. */
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+  /* Reserve a sliver of right-padding so the scrollbar doesn't clip the
+     rounded corners of the inner items. */
+  padding-right: 0.25rem;
+  /* Ensure the list never visually exceeds the wizard-panel content area
+     (the user's "Find Torrents box"); width is constrained to 100% of the
+     panel's content box, and box-sizing is explicit so any padding we add
+     above stays inside the parent's width. */
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .torrent-item {
@@ -1824,6 +1860,10 @@ img { display: block; max-width: 100%; }
   border-radius: 8px;
   cursor: pointer;
   transition: all var(--transition);
+  /* Keep items strictly inside the list's width — long source pills, long
+     names, and the meta column can otherwise push the row past the box. */
+  box-sizing: border-box;
+  min-width: 0;
 }
 
 .torrent-item:hover { border-color: var(--accent); background: rgba(108,99,255,0.05); }

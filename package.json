@@ -1,6 +1,6 @@
 {
   "name": "uplayer",
-  "version": "1.0.0",
+  "version": "0.15.0",
   "description": "Uplayer - Simple CLI torrent player. Just search and play movies instantly using WebTorrent",
   "main": "uplayer.js",
   "bin": {

@@ -1138,10 +1138,30 @@ async function renderHistory() {
     </div>`;
 
   try {
-    const [db, newEps] = await Promise.all([
+    let [db, newEps] = await Promise.all([
       getHistory(),
       api('/api/newEpisodes'),
     ]);
+
+    // One-shot artwork backfill: items written before the server enriched
+    // poster_path/backdrop_path on save (or saved while wizard.detail was
+    // still pending) come back without a poster. Ask the server to backfill
+    // from TMDB, then re-fetch the now-enriched history.
+    const needsBackfill = [
+      ...Object.values(db.movies || {}),
+      ...Object.values(db.tvShows || {}),
+    ].some((it) => it && (!it.poster_path || !it.backdrop_path));
+    if (needsBackfill) {
+      try {
+        const r = await fetch('/api/history/backfill', { method: 'POST' });
+        if (r.ok) {
+          const summary = await r.json().catch(() => null);
+          if (summary && summary.fixed > 0) db = await getHistory();
+        }
+      } catch (_) {
+        // Non-fatal — show what we have.
+      }
+    }
 
     state.newEpisodes = newEps;
 
@@ -3166,11 +3186,34 @@ function renderWizardStep1(panel) {
     wizard.selectedSeason = seasons[0].season_number;
   }
 
-  const seasonTabsHTML = seasons.map((s) => `
-    <button class="season-tab ${wizard.selectedSeason === s.season_number ? 'active' : ''}"
-      onclick="wizardSelectSeason(${s.season_number})">
-      S${String(s.season_number).padStart(2,'0')} <span style="opacity:.6;font-weight:400">(${s.episode_count}ep)</span>
-    </button>`).join('');
+  // Show user's progress so already-watched seasons render greyed-out and
+  // already-watched episodes carry a check-mark. Mirrors the modal's
+  // wasWatched logic (line ~1412) so the wizard step 1 picker is consistent.
+  const histShow = window._historyDB?.tvShows?.[String(wizard.tmdbId)];
+  const lastS = histShow?.lastSeason || 0;
+  const lastE = histShow?.lastEpisode || 0;
+  wizard._lastWatchedS = lastS;
+  wizard._lastWatchedE = lastE;
+
+  const seasonTabsHTML = seasons.map((s) => {
+    const fullyWatched = s.season_number < lastS;
+    const partiallyWatched = s.season_number === lastS && lastE > 0;
+    const cls = [
+      'season-tab',
+      wizard.selectedSeason === s.season_number ? 'active' : '',
+      fullyWatched ? 'season-tab-watched' : '',
+      partiallyWatched ? 'season-tab-partial' : '',
+    ].filter(Boolean).join(' ');
+    const watchedTag = fullyWatched
+      ? ' <span title="Watched" style="color:var(--green,#3a3);margin-left:.25rem">✓</span>'
+      : partiallyWatched
+        ? ` <span title="Watched up to E${lastE}" style="color:var(--accent);margin-left:.25rem;font-size:.7rem">(E${lastE})</span>`
+        : '';
+    return `
+    <button class="${cls}" onclick="wizardSelectSeason(${s.season_number})">
+      S${String(s.season_number).padStart(2,'0')} <span style="opacity:.6;font-weight:400">(${s.episode_count}ep)</span>${watchedTag}
+    </button>`;
+  }).join('');
 
   panel.innerHTML = `
     <div class="wizard-panel">
@@ -3215,13 +3258,31 @@ async function loadSeasonEpisodes(seasonNum) {
   try {
     const data = await api(`/api/tv/${wizard.tmdbId}/season/${seasonNum}`);
     wizard.episodes = data.episodes || [];
-    grid.innerHTML = wizard.episodes.map((ep) => `
-      <button class="ep-btn ${wizard.selectedEpisode === ep.episode_number ? 'selected' : ''}"
+    // Per-episode watched-state for visual feedback. Anything <= the show's
+    // lastSeason/lastEpisode is treated as already watched (the user
+    // implicitly sees earlier episodes as watched when they mark a later one).
+    const lastS = wizard._lastWatchedS || 0;
+    const lastE = wizard._lastWatchedE || 0;
+    grid.innerHTML = wizard.episodes.map((ep) => {
+      const wasWatched =
+        ep.season_number < lastS ||
+        (ep.season_number === lastS && ep.episode_number <= lastE);
+      const cls = [
+        'ep-btn',
+        wizard.selectedEpisode === ep.episode_number ? 'selected' : '',
+        wasWatched ? 'ep-btn-watched' : '',
+      ].filter(Boolean).join(' ');
+      const checkMark = wasWatched
+        ? '<span class="ep-btn-check" title="Watched" style="color:var(--green,#3a3);margin-left:.2rem">✓</span>'
+        : '';
+      return `
+      <button class="${cls}"
         onclick="wizardSelectEpisode(${ep.episode_number})"
-        title="${escape(ep.name || '')}">
-        <span class="ep-btn-num">${ep.episode_number}</span>
+        title="${escape(ep.name || '')}${wasWatched ? ' — already watched' : ''}">
+        <span class="ep-btn-num">${ep.episode_number}${checkMark}</span>
         <span class="ep-btn-label">${escape((ep.name || '').slice(0, 12))}</span>
-      </button>`).join('');
+      </button>`;
+    }).join('');
   } catch (e) {
     grid.innerHTML = `<p class="text-muted" style="grid-column:1/-1;font-size:.8rem">Failed to load episodes</p>`;
   }
@@ -3264,7 +3325,7 @@ function renderWizardStep2(panel) {
       </div>
       <div id="torrentSearchStatus" style="font-size:.85rem;color:var(--text-muted);margin-bottom:.75rem;display:flex;align-items:center;gap:.5rem">
         <div class="spinner" style="width:16px;height:16px;border-width:2px"></div>
-        Searching 4 sources (1337x, YTS, PirateBay, Nyaa)...
+        Searching 5 sources (1337x, YTS, PirateBay, Nyaa, SubsPlease)...
       </div>
       <div class="torrent-list" id="torrentList">
         ${wizard.torrents.length > 0 ? renderTorrentItems() : ''}
@@ -3292,13 +3353,14 @@ function renderWizardStep2(panel) {
 async function wizardSearchTorrents() {
   const statusEl = document.getElementById('torrentSearchStatus');
   const listEl = document.getElementById('torrentList');
-  if (statusEl) statusEl.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Searching 4 sources...`;
+  if (statusEl) statusEl.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Searching 5 sources...`;
   if (listEl) listEl.innerHTML = skeletonCards(4).replace(/class="card"/g, 'style="height:60px;border-radius:8px"');
 
   try {
     const body = {
       title: wizard.titleText,
       type: wizard.type,
+      tmdbId: wizard.tmdbId,
       season: wizard.selectedSeason,
       episode: wizard.selectedEpisode,
     };

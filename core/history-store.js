@@ -45,10 +45,50 @@ class HistoryStore {
       } else if (normalized.tracking === undefined) {
         normalized.tracking = true;
       }
+
+      // Monotonic-progress semantics: lastSeason/lastEpisode tracks the
+      // FURTHEST-watched point, so marking S2E3 as watched after already
+      // having watched up to S5E10 implicitly preserves S5E10 as progress
+      // (everything ≤ that is treated as watched in the UI). This means
+      // "marking an episode as watched also marks earlier ones" — the
+      // progress marker stays at whichever is later.
+      if (existing && existing.lastSeason != null && existing.lastEpisode != null) {
+        const newS = normalized.lastSeason;
+        const newE = normalized.lastEpisode;
+        const oldS = existing.lastSeason;
+        const oldE = existing.lastEpisode;
+        const newIsLater =
+          newS != null &&
+          newE != null &&
+          (newS > oldS || (newS === oldS && newE > oldE));
+        if (!newIsLater) {
+          // Caller's selection is at or before the existing progress —
+          // keep the existing marker (still updates watchedAt).
+          normalized.lastSeason = oldS;
+          normalized.lastEpisode = oldE;
+        }
+      }
+
       db.tvShows[String(item.tmdbId)] = normalized;
     } else {
       throw new Error('type must be movie or tv');
     }
+    this.write(db);
+    return db;
+  }
+
+  /**
+   * Reset TV progress back to the beginning (used by a "Reset progress"
+   * button in the UI). Keeps the show in history but clears the
+   * lastSeason/lastEpisode markers so the user can re-watch from S1E1.
+   */
+  resetProgress(id) {
+    const db = this.read();
+    const show = db.tvShows[String(id)];
+    if (!show) throw new Error('TV show not found in history');
+    delete show.lastSeason;
+    delete show.lastEpisode;
+    show.watchedAt = new Date().toISOString();
     this.write(db);
     return db;
   }

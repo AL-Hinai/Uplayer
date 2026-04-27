@@ -16,6 +16,7 @@ const { loadEnvFileOnce } = require('./core/config');
 const { createTmdbClient } = require('./core/tmdb-client');
 const { createSharedServices } = require('./core/shared-services');
 const { buildAccessibleUrls } = require('./core/network-address');
+const { parseName, classify } = require('./core/torrent-name-patterns');
 
 loadEnvFileOnce();
 
@@ -992,331 +993,189 @@ class TorrentScraper {
       return results;
   }
 
-  async searchAllSources(query, year = null, season = null, episode = null) {
-    // Search by show/movie name only, then filter results by season/episode
-    const results = [];
-    
-    // Extract episode/season info from query if not provided separately
-    let episodeMatch = null;
-    let seasonMatch = null;
-    
-    if (season !== null && episode !== null) {
-      // Use provided season/episode for filtering
-      episodeMatch = { 1: season.toString(), 2: episode.toString() };
-    } else {
-      // Try to extract from query
-      episodeMatch = query.match(/[Ss][_\s]?(\d{1,3})[Ee][_\s]?(\d{1,5})/i);
-    }
-    
-    if (!episodeMatch) {
-      if (season !== null) {
-        seasonMatch = { 1: season.toString() };
-      } else {
-        seasonMatch = query.match(/[Ss][_\s]?(\d{1,3})(?![Ee])|Season\s+(\d{1,3})/i);
-      }
-    }
-    
-    // Extract show name - remove season/episode info from query
-    const showName = query.split(/[Ss][_\s]?\d|Season\s+\d/i)[0].trim();
-    
-    // Build search queries using only the show/movie name (no season/episode)
-    let queries = [];
-    
-    if (episodeMatch) {
-      const season = parseInt(episodeMatch[1]);
-      const episode = parseInt(episodeMatch[2]);
-      const seasonStr = season.toString().padStart(2, '0');
-      const episodeStr = episode.toString();
-      
-      // For high episode numbers (3+ digits), don't over-pad
-      const episodeStrPadded2 = episodeStr.padStart(2, '0');
-      const episodeStrPadded3 = episodeStr.padStart(3, '0');
-      const episodeStrPadded4 = episodeStr.padStart(4, '0');
-      
-      // Search by show name only - filtering will happen after getting results
-      queries = [
-        showName  // Use only show name for search, filter by season/episode later
-      ];
-    } else if (seasonMatch) {
-      // Search by show name only - filtering will happen after getting results
-      queries = [
-        showName  // Use only show name for search, filter by season later
-      ];
-    } else {
-      queries = [showName || query];  // Use show name if extracted, otherwise original query
-    }
-    
-    // Remove duplicates
-    queries = [...new Set(queries)];
-    
-    console.log(chalk.cyan(`\nSearching ${queries.length} query variation(s) across all sources...`));
-    
-    // Search all sources in parallel for each query (fast!)
-    const allPromises = [];
-    
-    for (const q of queries) {
-      const sources = [
-        { name: '1337x', fn: () => this.search1337x(q) },
-        { name: 'YTS', fn: () => this.searchYTS(q) },
-        { name: 'PirateBay', fn: () => this.searchPirateBay(q) },
-        { name: 'Nyaa', fn: () => this.searchNyaa(q) },
-        { name: 'SubsPlease', fn: () => this.searchSubsPlease(q) }
-      ];
+  /**
+   * Search every torrent source and return scored, filtered results.
+   *
+   * Modern signature:
+   *   searchAllSources(query, { season, episode, isAnime, absoluteEpisode })
+   * Legacy positional signature (kept for old callers):
+   *   searchAllSources(query, year, season, episode)
+   *
+   * Strategy (data-driven, see scripts/data/torrent-naming-report.md):
+   * 1. Build provider-specific queries — `Title S##E##` for live-action
+   *    sources (PirateBay/1337x have ~91% SE_PAIR results), and an extra
+   *    `Title {absoluteEp}` for anime sources (Nyaa/SubsPlease) so we hit
+   *    the absolute-numbering anime releases like `[SubsPlease] One Piece - 1163`.
+   * 2. Use the shared classifier in core/torrent-name-patterns.js to decide
+   *    whether each result actually matches the requested S/E. The same
+   *    rules drive the corpus survey, the regression test, and this filter.
+   * 3. Hard-drop wrong-season results (unless the anime absolute path
+   *    redeems them) instead of the old `seeders > 200` catch-all that
+   *    let live-action S02 packs through for anime S23 queries.
+   */
+  async searchAllSources(query, ...rest) {
+    // ---- Argument parsing (modern + legacy) ---------------------------------
+    let season = null;
+    let episode = null;
+    let isAnime = false;
+    let absoluteEpisode = null;
 
-      for (const source of sources) {
-        allPromises.push(
-          source.fn()
-            .then(sourceResults => {
-              if (sourceResults && sourceResults.length > 0) {
-                return sourceResults;
-              }
-              return [];
-            })
-            .catch(() => [])  // Ignore errors, continue
-        );
+    if (rest.length === 1 && rest[0] && typeof rest[0] === 'object' && !Array.isArray(rest[0])) {
+      const opts = rest[0];
+      season = opts.season != null ? Number(opts.season) : null;
+      episode = opts.episode != null ? Number(opts.episode) : null;
+      isAnime = !!opts.isAnime;
+      absoluteEpisode = opts.absoluteEpisode != null ? Number(opts.absoluteEpisode) : null;
+    } else {
+      // legacy: (query, year, season, episode)
+      season = rest[1] != null ? Number(rest[1]) : null;
+      episode = rest[2] != null ? Number(rest[2]) : null;
+    }
+
+    // Backfill from the query string if no S/E was provided explicitly.
+    if (season == null || episode == null) {
+      const m = String(query).match(/\b[sS](\d{1,3})[\s_]*[eE](\d{1,5})\b/);
+      if (m) {
+        if (season == null) season = parseInt(m[1], 10);
+        if (episode == null) episode = parseInt(m[2], 10);
       }
     }
-    
-    // Wait for all searches to complete in parallel
-    const allResults = await Promise.all(allPromises);
-    
-    // Flatten results
-    for (const sourceResults of allResults) {
-      if (sourceResults && sourceResults.length > 0) {
-        results.push(...sourceResults);
+
+    // Extract bare show name (strip any S/E or "Season N" suffix from the query).
+    const showName = String(query)
+      .replace(/\b[sS]\d{1,3}[\s_]*[eE]\d{1,5}\b.*$/, '')
+      .replace(/\bSeason\s+\d{1,3}\b.*$/i, '')
+      .trim() || String(query);
+
+    const pad2 = (n) => String(n).padStart(2, '0');
+    const seTag = season != null && episode != null ? `S${pad2(season)}E${pad2(episode)}` : null;
+
+    // ---- Provider-specific query plan --------------------------------------
+    // Per the corpus survey: PirateBay/1337x respond well to `Title S##E##`,
+    // SubsPlease only carries anime and uses `Show - NN` (search by absolute
+    // number), Nyaa needs both forms because modern anime use S##E## while
+    // long-running shows use absolute numbering.
+    const queriesPerSource = {
+      '1337x': seTag ? [`${showName} ${seTag}`] : [showName],
+      'YTS': season == null ? [showName] : [],
+      'PirateBay': seTag ? [`${showName} ${seTag}`, showName] : [showName],
+      'Nyaa': [],
+      'SubsPlease': [],
+    };
+
+    // Nyaa: combine formatted-SE and (for anime) absolute-episode query.
+    if (seTag) queriesPerSource.Nyaa.push(`${showName} ${seTag}`);
+    if (isAnime && absoluteEpisode != null) {
+      queriesPerSource.Nyaa.push(`${showName} ${absoluteEpisode}`);
+    }
+    if (queriesPerSource.Nyaa.length === 0) queriesPerSource.Nyaa.push(showName);
+
+    // SubsPlease: anime-only. Prefer absolute-episode query (their format).
+    if (isAnime && absoluteEpisode != null) {
+      queriesPerSource.SubsPlease.push(`${showName} ${absoluteEpisode}`);
+    } else if (isAnime || season == null) {
+      queriesPerSource.SubsPlease.push(showName);
+    }
+
+    const sources = [
+      { name: '1337x', fn: (q) => this.search1337x(q) },
+      { name: 'YTS', fn: (q) => this.searchYTS(q) },
+      { name: 'PirateBay', fn: (q) => this.searchPirateBay(q) },
+      { name: 'Nyaa', fn: (q) => this.searchNyaa(q) },
+      { name: 'SubsPlease', fn: (q) => this.searchSubsPlease(q) },
+    ];
+
+    const totalQueries = Object.values(queriesPerSource).reduce((s, arr) => s + arr.length, 0);
+    console.log(
+      chalk.cyan(
+        `\nSearching ${totalQueries} query/source combinations` +
+          (isAnime ? ' (anime: absolute-episode enabled)' : '')
+      )
+    );
+
+    // ---- Issue all queries in parallel -------------------------------------
+    const allPromises = [];
+    for (const src of sources) {
+      const qs = queriesPerSource[src.name] || [];
+      for (const q of qs) {
+        allPromises.push(src.fn(q).catch(() => []));
       }
     }
-    
-    // Remove duplicates
+    const settled = await Promise.all(allPromises);
+    const flat = [].concat(...settled.filter(Boolean));
+
+    // ---- Dedupe by (name|source) -------------------------------------------
     const seen = new Set();
     const uniqueResults = [];
-    
-    for (const result of results) {
-      const key = `${result.name}|${result.source}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        uniqueResults.push(result);
-      }
+    for (const r of flat) {
+      if (!r || !r.name) continue;
+      const key = `${r.name}|${r.source}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueResults.push(r);
     }
-    
-    // Score and filter results for episode-specific searches - improved matching
-    // Use provided season/episode or extract from episodeMatch
-    if (episodeMatch) {
-      const seasonNum = season !== null ? season : parseInt(episodeMatch[1]);
-      const episodeNum = episode !== null ? episode : parseInt(episodeMatch[2]);
-      const seasonValue = seasonNum;
-      const episodeValue = episodeNum;
-      const seasonStr = seasonValue.toString().padStart(2, '0');
-      const episodeStr = episodeValue.toString();
-      const episodeStrPadded2 = episodeStr.padStart(2, '0');
-      const episodeStrPadded3 = episodeStr.padStart(3, '0');
-      const episodeStrPadded4 = episodeStr.padStart(4, '0');
-      
-      // Extract season/episode from result names for better matching
-      const scoredResults = uniqueResults.map(result => {
-        let score = result.seeders;
-        const nameLower = result.name.toLowerCase();
-        let hasSeason = false;
-        let hasEpisode = false;
-        let exactMatch = false;
-        
-        // Check for exact season and episode match (various formats)
-        const seasonPatterns = [
-          `s${seasonStr}e`,
-          `s${seasonValue}e`,
-          `season ${seasonValue} episode`,
-          `season ${seasonStr} episode`
-        ];
-        
-        const episodePatterns = [
-          `ep${episodeStrPadded4}`,  // EP1154 format (like ToonsHub)
-          `ep${episodeStrPadded3}`,
-          `ep${episodeStrPadded2}`,
-          `ep${episodeStr}`,
-          `e${episodeStrPadded4}`,  // E1154 format
-          `e${episodeStrPadded3}`,
-          `e${episodeStrPadded2}`,
-          `e${episodeStr}`,
-          `episode ${episodeValue}`,
-          `ep ${episodeValue}`,
-          // Anime "Show - NN" format (SubsPlease, Erai-raws, HorribleSubs, ASW)
-          // Anchored with trailing space/bracket/paren/dot to avoid matching year suffixes or random numbers.
-          ` - ${episodeStrPadded2} `, ` - ${episodeStrPadded2}[`, ` - ${episodeStrPadded2}(`, ` - ${episodeStrPadded2}.`,
-          ` - ${episodeStrPadded3} `, ` - ${episodeStrPadded3}[`, ` - ${episodeStrPadded3}(`, ` - ${episodeStrPadded3}.`,
-          ` - ${episodeStr} `, ` - ${episodeStr}[`, ` - ${episodeStr}(`, ` - ${episodeStr}.`
-        ];
-        
-        // Check for exact S##E#### match (highest priority) - includes EP format
-        const exactPatterns = [
-          // EP format (like ToonsHub)
-          `s${seasonStr}ep${episodeStrPadded4}`,
-          `s${seasonStr}ep${episodeStrPadded3}`,
-          `s${seasonStr}ep${episodeStrPadded2}`,
-          `s${seasonStr}ep${episodeStr}`,
-          `s${seasonValue}ep${episodeStrPadded4}`,
-          `s${seasonValue}ep${episodeStrPadded3}`,
-          `s${seasonValue}ep${episodeStrPadded2}`,
-          `s${seasonValue}ep${episodeStr}`,
-          // E format
-          `s${seasonStr}e${episodeStrPadded4}`,
-          `s${seasonStr}e${episodeStrPadded3}`,
-          `s${seasonStr}e${episodeStrPadded2}`,
-          `s${seasonStr}e${episodeStr}`,
-          `s${seasonValue}e${episodeStrPadded4}`,
-          `s${seasonValue}e${episodeStrPadded3}`,
-          `s${seasonValue}e${episodeStrPadded2}`,
-          `s${seasonValue}e${episodeStr}`,
-          // With spaces/underscores
-          `s${seasonStr} e${episodeStrPadded4}`,
-          `s${seasonStr} ep${episodeStrPadded4}`,
-          `s${seasonStr}_e${episodeStrPadded4}`,
-          `s${seasonStr}_ep${episodeStrPadded4}`,
-          // Anime "Sn - NN" format (SubsPlease, ASW, Erai-raws)
-          `s${seasonStr} - ${episodeStrPadded2}`,
-          `s${seasonValue} - ${episodeStrPadded2}`,
-          `s${seasonStr} - ${episodeStrPadded3}`,
-          `s${seasonValue} - ${episodeStrPadded3}`,
-          `s${seasonStr} - ${episodeStr}`,
-          `s${seasonValue} - ${episodeStr}`,
-          // Full text
-          `season ${seasonValue} episode ${episodeValue}`
-        ];
-        
-        for (const pattern of exactPatterns) {
-          if (nameLower.includes(pattern)) {
-            exactMatch = true;
-            score += 2000;  // Highest boost for exact match
-            hasSeason = true;
-            hasEpisode = true;
-            break;
-          }
-        }
-        
-        // Check for season match
-        if (!hasSeason) {
-          for (const pattern of seasonPatterns) {
-            if (nameLower.includes(pattern)) {
-              hasSeason = true;
-              score += 300;
-              break;
-            }
-          }
-        }
-        
-        // Check for episode match
-        if (!hasEpisode) {
-          for (const pattern of episodePatterns) {
-            if (nameLower.includes(pattern)) {
-              hasEpisode = true;
-              score += 500;
-              break;
-            }
-          }
-        }
-        
-        // Bonus for having both season and episode (even if not exact format)
-        if (hasSeason && hasEpisode && !exactMatch) {
-          score += 800;
-        }
-        
-        // Extract episode number from result name using regex (supports EP, E, Episode formats)
-        const resultEpisodeMatch = nameLower.match(/(?:ep|e|episode)[\s_]*(\d{1,5})/i);
-        if (resultEpisodeMatch) {
-          const resultEpisode = parseInt(resultEpisodeMatch[1]);
-          if (resultEpisode === episodeValue) {
-            score += 400;  // Bonus for matching episode number
-            // Extra bonus for EP format match (like ToonsHub: "EP1154")
-            if (nameLower.includes(`ep${episodeValue}`) || nameLower.includes(`ep${episodeStrPadded4}`)) {
-              score += 300;  // Higher bonus for EP format
-            }
-          } else {
-            // Penalty for wrong episode (but not too harsh)
-            const diff = Math.abs(resultEpisode - episodeValue);
-            if (diff > 10) {
-              score -= 200;  // Large penalty for very wrong episodes
-            }
-          }
-        }
-        
-        // Special handling for ToonsHub format: "[ToonsHub] One Piece EP1154"
-        const toonsHubMatch = nameLower.match(/\[toonshub\].*ep(\d{1,5})/i);
-        if (toonsHubMatch) {
-          const toonsHubEpisode = parseInt(toonsHubMatch[1]);
-          if (toonsHubEpisode === episodeValue) {
-            score += 500;  // High bonus for ToonsHub format match
-            hasEpisode = true;
-          }
-        }
 
-        // Anime "Show - NN" format (SubsPlease/ASW/Erai-raws).
-        // Extract the number that appears between " - " and a boundary (space/bracket/paren/dot).
-        if (!hasEpisode) {
-          const animeEpMatch = nameLower.match(/\s-\s(\d{1,4})(?=\s|\[|\(|\.|$)/);
-          if (animeEpMatch) {
-            const animeEp = parseInt(animeEpMatch[1], 10);
-            if (animeEp === episodeValue) {
-              score += 500;
-              hasEpisode = true;
-            }
-          }
-        }
-        
-        // Extract season number from result name
-        const resultSeasonMatch = nameLower.match(/[sseason\s]+(\d{1,3})/i);
-        if (resultSeasonMatch) {
-          const resultSeason = parseInt(resultSeasonMatch[1]);
-          if (resultSeason === seasonValue) {
-            score += 200;  // Bonus for matching season
-          } else {
-            // Penalty for wrong season
-            score -= 500;  // Strong penalty for wrong season
-          }
-        }
-        
-        return { 
-          ...result, 
-          score,
-          hasSeason,
-          hasEpisode,
-          exactMatch
-        };
+    // ---- No S/E filtering needed (movie or freeform query) -----------------
+    if (season == null || episode == null) {
+      uniqueResults.sort((a, b) => {
+        if ((b.seeders || 0) !== (a.seeders || 0)) return (b.seeders || 0) - (a.seeders || 0);
+        return String(a.name).localeCompare(String(b.name));
       });
-      
-      // Filter out results that don't match the episode (unless they have very high seeders)
-      const filteredResults = scoredResults.filter(result => {
-        // Keep if exact match
-        if (result.exactMatch) return true;
-        // Keep if has both season and episode
-        if (result.hasSeason && result.hasEpisode) return true;
-        // Keep if has episode and high seeders (might be correct)
-        if (result.hasEpisode && result.seeders > 50) return true;
-        // Keep if very high seeders (might be popular pack)
-        if (result.seeders > 200) return true;
-        // Filter out others
-        return false;
-      });
-      
-      // Sort by score first, then by seeders (higher is better)
-      filteredResults.sort((a, b) => {
-        if (b.score !== a.score) {
-          return b.score - a.score;
-        }
-        return b.seeders - a.seeders;
-      });
-      
-      return filteredResults;
+      return uniqueResults;
     }
-    
-    // Sort by seeders (highest first) - most important for regular searches
-    uniqueResults.sort((a, b) => {
-      // First sort by seeders (higher is better)
-      if (b.seeders !== a.seeders) {
-        return b.seeders - a.seeders;
+
+    // ---- Classify and score using the shared rule set ----------------------
+    const expected = { season, episode, isAnime, absoluteEpisode };
+    const scored = uniqueResults.map((result) => {
+      const parsed = parseName(result.name);
+      const verdict = classify(parsed, expected);
+
+      let score = result.seeders || 0;
+      let exactMatch = false;
+      let hasSeason = false;
+      let hasEpisode = false;
+
+      if (verdict.exactSEMatch || verdict.longformMatch) {
+        score += 2000;
+        exactMatch = true;
+        hasSeason = true;
+        hasEpisode = true;
+      } else if (verdict.absoluteMatch) {
+        // Anime absolute-episode hit (e.g. `One Piece - 1163`, `EP1163`).
+        score += 1500;
+        hasEpisode = true;
+      } else if (verdict.animeDashMatch) {
+        score += 1000;
+        hasEpisode = true;
+      } else if (verdict.episodeOnlyMatch) {
+        // Episode tagged but no season tag, no contradicting season —
+        // implicit-season match. Trustworthy per the survey data.
+        score += 800;
+        hasEpisode = true;
       }
-      // If seeders are equal, sort by name
-      return a.name.localeCompare(b.name);
+
+      return { ...result, score, exactMatch, hasSeason, hasEpisode, verdict };
     });
-    return uniqueResults;
+
+    // ---- Filter: only keep real matches; drop wrong-season hard ------------
+    const filtered = scored.filter((r) => {
+      if (r.verdict.wrongSeason && !r.verdict.absoluteMatch) return false;
+      if (r.verdict.hasContradictingSeason && !r.verdict.absoluteMatch) return false;
+      return (
+        r.verdict.exactSEMatch ||
+        r.verdict.longformMatch ||
+        r.verdict.absoluteMatch ||
+        r.verdict.animeDashMatch ||
+        r.verdict.episodeOnlyMatch
+      );
+    });
+
+    filtered.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return (b.seeders || 0) - (a.seeders || 0);
+    });
+
+    return filtered;
   }
 
   async search1337x(query) {

@@ -40,6 +40,31 @@ function testHistoryStore() {
   const removed = store.read();
   assert.strictEqual(removed.movies['10'], undefined);
 
+  // Monotonic-progress semantics for TV: marking an EARLIER episode after a
+  // later one must NOT regress lastSeason/lastEpisode — the later marker is
+  // the user's progress, and earlier episodes are implicitly watched.
+  store.markWatched('tv', { tmdbId: 100, title: 'TV Show', lastSeason: 5, lastEpisode: 10 });
+  let after = store.read();
+  assert.strictEqual(after.tvShows['100'].lastSeason, 5);
+  assert.strictEqual(after.tvShows['100'].lastEpisode, 10);
+
+  store.markWatched('tv', { tmdbId: 100, title: 'TV Show', lastSeason: 2, lastEpisode: 3 });
+  after = store.read();
+  assert.strictEqual(after.tvShows['100'].lastSeason, 5, 'progress must not regress when marking earlier ep');
+  assert.strictEqual(after.tvShows['100'].lastEpisode, 10, 'progress must not regress when marking earlier ep');
+
+  // Marking a LATER episode advances progress.
+  store.markWatched('tv', { tmdbId: 100, title: 'TV Show', lastSeason: 6, lastEpisode: 1 });
+  after = store.read();
+  assert.strictEqual(after.tvShows['100'].lastSeason, 6, 'progress should advance for later season');
+  assert.strictEqual(after.tvShows['100'].lastEpisode, 1, 'progress should advance for later season');
+
+  // resetProgress clears the marker.
+  store.resetProgress(100);
+  after = store.read();
+  assert.strictEqual(after.tvShows['100'].lastSeason, undefined);
+  assert.strictEqual(after.tvShows['100'].lastEpisode, undefined);
+
   fs.rmSync(tmpFile, { force: true });
 }
 
