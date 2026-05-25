@@ -26,7 +26,8 @@ function testIncludesSubtitleSyncUi() {
   assert.match(html, /id="subtitleAdjustPopup"/);
   assert.match(html, /id="subtitlePreview"/);
   assert.match(html, /Positive values delay subtitles/);
-  assert.match(html, /"subtitleTracks":\[\{"index":0,"language":"en","label":"English","source":"downloaded"\}\]/);
+  assert.match(html, /"subtitleTracks":\[\{"index":0,"language":"en","label":"English","source":"downloaded","url":"\/subtitle_0\.vtt"\}\]/);
+  assert.match(html, /"subtitleManifestUrl":"\/api\/subtitles"/);
 }
 
 function testHidesSyncButtonWithoutTracks() {

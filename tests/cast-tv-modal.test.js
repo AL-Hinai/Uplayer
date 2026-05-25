@@ -136,7 +136,7 @@ async function testSubtitleManifestTracksBecomeAbsoluteUrls() {
 function testBuildCastMediaDraftHonorsSelectedSubtitleTrack() {
   const { buildCastMediaDraft } = loadCastHelpers();
   const draft = buildCastMediaDraft(
-    { castUrl: 'http://192.168.1.50:8000/video.mp4?compat=1' },
+    { castUrl: 'http://192.168.1.50:8000/video.mp4' },
     [
       { trackId: 1, trackContentId: 'http://192.168.1.50:8000/subtitle_0.vtt', name: 'English', language: 'en', ready: true },
       { trackId: 2, trackContentId: 'http://192.168.1.50:8000/subtitle_1.vtt', name: 'Arabic', language: 'ar', ready: true },
@@ -145,11 +145,60 @@ function testBuildCastMediaDraftHonorsSelectedSubtitleTrack() {
     'Demo Movie'
   );
 
-  assert.strictEqual(draft.contentId, 'http://192.168.1.50:8000/video.mp4?compat=1');
+  assert.strictEqual(draft.contentId, 'http://192.168.1.50:8000/video.mp4');
   assert.strictEqual(draft.contentType, 'video/mp4');
-  assert.strictEqual(draft.streamType, 'LIVE');
+  assert.strictEqual(draft.streamType, 'BUFFERED');
   assert.deepStrictEqual(Array.from(draft.activeTrackIds), [2]);
   assert.strictEqual(draft.metadata.title, 'Demo Movie');
+}
+
+function testBuildCastMediaDraftUsesHlsContentTypeWhenStrategyIsRemux() {
+  const { buildCastMediaDraft } = loadCastHelpers();
+  const draft = buildCastMediaDraft(
+    {
+      castUrl: 'http://192.168.1.50:8000/hls/index.m3u8',
+      videoFormat: { container: 'mkv', codec: 'h264', acodec: 'aac', playbackStrategy: 'remux' },
+    },
+    [],
+    '',
+    'Demo Movie'
+  );
+
+  assert.strictEqual(draft.contentType, 'application/vnd.apple.mpegurl');
+  assert.strictEqual(draft.streamType, 'BUFFERED');
+  assert.ok(/\.m3u8(\?|$)/.test(draft.contentId), 'HLS strategy should keep manifest URL');
+}
+
+function testBuildCastMediaDraftKeepsBufferedForFullTranscode() {
+  const { buildCastMediaDraft } = loadCastHelpers();
+  const draft = buildCastMediaDraft(
+    {
+      castUrl: 'http://192.168.1.50:8000/hls/index.m3u8',
+      videoFormat: { container: 'mkv', codec: 'hevc', acodec: 'ac3', playbackStrategy: 'transcode' },
+    },
+    [],
+    '',
+    'Demo HEVC'
+  );
+
+  assert.strictEqual(draft.contentType, 'application/vnd.apple.mpegurl');
+  assert.strictEqual(draft.streamType, 'BUFFERED', 'HLS supports seeking, so BUFFERED even for full transcode');
+}
+
+function testBuildCastMediaDraftDirectPlayUsesMp4ContentType() {
+  const { buildCastMediaDraft } = loadCastHelpers();
+  const draft = buildCastMediaDraft(
+    {
+      castUrl: 'http://192.168.1.50:8000/video.mp4',
+      videoFormat: { container: 'mp4', codec: 'h264', acodec: 'aac', playbackStrategy: 'directplay' },
+    },
+    [],
+    '',
+    'Direct'
+  );
+
+  assert.strictEqual(draft.contentType, 'video/mp4');
+  assert.strictEqual(draft.streamType, 'BUFFERED');
 }
 
 function testBuildCastMediaDraftOmitsTracksWhenNoSubtitlesSelected() {
@@ -383,6 +432,9 @@ function testCastOriginHelpersPreferLocalhostOrHttps() {
 async function main() {
   await testSubtitleManifestTracksBecomeAbsoluteUrls();
   testBuildCastMediaDraftHonorsSelectedSubtitleTrack();
+  testBuildCastMediaDraftUsesHlsContentTypeWhenStrategyIsRemux();
+  testBuildCastMediaDraftKeepsBufferedForFullTranscode();
+  testBuildCastMediaDraftDirectPlayUsesMp4ContentType();
   testBuildCastMediaDraftOmitsTracksWhenNoSubtitlesSelected();
   testRenderCastTvModalUsesPlayerUrlForTvLinkOnly();
   testRenderCastTvModalShowsSubtitleChooserAndNoSubtitleWarning();

@@ -930,14 +930,29 @@ app.post('/api/torrents/search', async (req, res) => {
     // right filter rules (absolute-episode matching for anime).
     let isAnime = false;
     let absoluteEpisode = null;
+    let altTitles = [];
 
     if (type === 'tv' && tmdbId && seasonNum != null && episodeNum != null) {
       try {
-        const detail = await tmdb(`/tv/${tmdbId}`);
+        const detail = await tmdb(`/tv/${tmdbId}`, { append_to_response: 'alternative_titles' });
         const genres = (detail.genres || []).map((g) => g.id);
         const origins = detail.origin_country || [];
         const lang = detail.original_language;
         isAnime = genres.includes(16) && (origins.includes('JP') || lang === 'ja');
+
+        if (isAnime) {
+          // Anime trackers (Nyaa/SubsPlease) list by romaji title. TMDB exposes it
+          // as a JP romaji/hepburn alternative title. Some shows also store their
+          // original_name already romanized (Latin script) — include that too, but
+          // skip the CJK/kanji original_name since these trackers never match it.
+          const altResults = (detail.alternative_titles && detail.alternative_titles.results) || [];
+          const romaji = altResults
+            .filter((a) => a && a.iso_3166_1 === 'JP' && /romaji|hepburn/i.test(a.type || ''))
+            .map((a) => a.title);
+          const hasCjk = (s) => /[　-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ]/.test(String(s || ''));
+          const origRomaji = detail.original_name && !hasCjk(detail.original_name) ? [detail.original_name] : [];
+          altTitles = [...new Set([...romaji, ...origRomaji].filter(Boolean))];
+        }
 
         if (isAnime) {
           // Two TMDB anime schemas: (a) reset-per-season (Bleach: S2E40 →
@@ -960,19 +975,39 @@ app.post('/api/torrents/search', async (req, res) => {
     }
 
     const scraper = getServices().createTorrentScraper();
+
+    // Stream ranked snapshots as NDJSON: one JSON object per line. Each `partial`
+    // carries the best-ranked results found so far (emitted as each source returns),
+    // and a closing `final` carries the complete ranked list. This lets the wizard
+    // show results immediately and re-rank as more sources arrive.
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+
+    const top20 = (results) => (results || []).filter((r) => r && r.name).slice(0, 20);
+
     const results = await scraper.searchAllSources(title, {
       season: seasonNum,
       episode: episodeNum,
       isAnime,
       absoluteEpisode,
+      altTitles,
+      onPartial: (snapshot) => {
+        if (res.writableEnded) return;
+        try {
+          res.write(JSON.stringify({ type: 'partial', results: top20(snapshot) }) + '\n');
+        } catch (_) { /* client may have disconnected */ }
+      },
     });
 
-    // Take top 20 — they're already sorted by score+seeders inside the scraper.
-    const sorted = (results || []).filter((r) => r && r.name).slice(0, 20);
-
-    res.json(sorted);
+    res.write(JSON.stringify({ type: 'final', results: top20(results) }) + '\n');
+    res.end();
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: e.message });
+    } else {
+      try { res.write(JSON.stringify({ type: 'error', error: e.message }) + '\n'); } catch (_) {}
+      res.end();
+    }
   }
 });
 

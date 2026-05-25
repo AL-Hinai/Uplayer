@@ -1994,10 +1994,12 @@ function isChromecastReceiverReachableUrl(href) {
 
 function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId, displayTitle) {
   const normalized = normalizeActiveStreamMeta(meta);
-  let contentUrl = rewriteCastUrlForChromecastReceiver(normalized.castUrl || '', meta);
+  const contentUrl = rewriteCastUrlForChromecastReceiver(normalized.castUrl || '', meta);
 
   const vf = normalized.videoFormat;
-  const codecStr = vf && vf.codec ? String(vf.codec) : '';
+  const playbackStrategy = vf && vf.playbackStrategy
+    ? String(vf.playbackStrategy).toLowerCase()
+    : null;
   let pathname = '';
   try {
     pathname = new URL(contentUrl, window.location.href).pathname.toLowerCase();
@@ -2005,25 +2007,17 @@ function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId
     pathname = String(contentUrl || '').toLowerCase();
   }
 
-  let needsCompat = false;
-  if (!pathname.endsWith('.mp4')) {
-    needsCompat = true;
-  }
-  if (/hevc|h\.?265|x265/i.test(codecStr)) {
-    needsCompat = true;
-  }
-  if (needsCompat && contentUrl && !/\bcompat=1\b/.test(contentUrl)) {
-    contentUrl += (contentUrl.includes('?') ? '&' : '?') + 'compat=1';
-  }
+  // HLS delivery whenever the server reports a remux/transcode tier, or whenever
+  // the resolved URL itself points at a manifest. HLS supports seeking mid-encode
+  // so the Cast UI gets a real scrub bar (streamType=BUFFERED) regardless of tier.
+  const isHlsUrl = /\.m3u8(\?|$)/.test(pathname);
+  const isHlsStrategy = playbackStrategy && playbackStrategy !== 'directplay';
+  const usesHls = isHlsUrl || isHlsStrategy;
 
-  const usesCompatTranscode = /\bcompat=1\b/.test(contentUrl);
   const castMedia = window.chrome && window.chrome.cast && window.chrome.cast.media;
   const StreamType = (castMedia && castMedia.StreamType) || { BUFFERED: 'BUFFERED', LIVE: 'LIVE' };
-  const contentType = usesCompatTranscode ? 'video/mp4' : guessVideoContentType(contentUrl);
-  // Chunked FFmpeg output has no fixed duration; LIVE matches progressive transcode better than BUFFERED.
-  const streamType = usesCompatTranscode && StreamType.LIVE
-    ? StreamType.LIVE
-    : (StreamType.BUFFERED || 'BUFFERED');
+  const contentType = usesHls ? 'application/vnd.apple.mpegurl' : guessVideoContentType(contentUrl);
+  const streamType = StreamType.BUFFERED || 'BUFFERED';
 
   const wantSubs = selectedSubtitleTrackId != null && String(selectedSubtitleTrackId).trim() !== '';
   const readyOnly = subtitleOptions.filter((t) => t.ready === true);
@@ -2031,15 +2025,22 @@ function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId
   let tracks = [];
   let activeTrackIds = [];
   if (wantSubs && readyOnly.length > 0) {
-    tracks = readyOnly.map((track) => ({
-      trackId: Number(track.trackId),
-      type: 'TEXT',
-      subtype: 'SUBTITLES',
-      trackContentId: rewriteLocalhostResourceUrlForChromecast(track.trackContentId, normalized),
-      trackContentType: track.trackContentType || 'text/vtt',
-      name: track.name || track.label || `Subtitle ${track.trackId}`,
-      language: track.language || 'en',
-    }));
+    // Cache-bust so the receiver re-fetches the (still-growing) VTT on every (re)load
+    // instead of serving a stale/partial copy.
+    const cacheBust = Date.now();
+    tracks = readyOnly.map((track) => {
+      const baseUrl = rewriteLocalhostResourceUrlForChromecast(track.trackContentId, normalized);
+      const sep = baseUrl.indexOf('?') === -1 ? '?' : '&';
+      return {
+        trackId: Number(track.trackId),
+        type: 'TEXT',
+        subtype: 'SUBTITLES',
+        trackContentId: `${baseUrl}${sep}t=${cacheBust}`,
+        trackContentType: track.trackContentType || 'text/vtt',
+        name: track.name || track.label || `Subtitle ${track.trackId}`,
+        language: track.language || 'en',
+      };
+    });
     tracks = tracks.filter((t) => isChromecastReceiverReachableUrl(t.trackContentId));
     const wanted = Number(selectedSubtitleTrackId);
     if (Number.isFinite(wanted) && tracks.some((t) => t.trackId === wanted)) {
@@ -2057,6 +2058,34 @@ function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId
     tracks,
     activeTrackIds,
   };
+}
+
+// Turns a cast media draft into a Chromecast LoadRequest. Shared by the initial cast
+// and the subtitle-completion reload so both build identical media/track info.
+function buildCastLoadRequest(draft) {
+  const mediaInfo = new window.chrome.cast.media.MediaInfo(draft.contentId, draft.contentType);
+  const streamTypeEnum = window.chrome.cast.media.StreamType || {};
+  mediaInfo.streamType = draft.streamType || streamTypeEnum.BUFFERED || 'BUFFERED';
+  const metadata = new window.chrome.cast.media.GenericMediaMetadata();
+  metadata.title = draft.metadata.title;
+  mediaInfo.metadata = metadata;
+  if (draft.tracks.length > 0) {
+    mediaInfo.tracks = draft.tracks.map((track) => {
+      const castTrack = new window.chrome.cast.media.Track(track.trackId, window.chrome.cast.media.TrackType.TEXT);
+      castTrack.trackContentId = track.trackContentId;
+      castTrack.trackContentType = track.trackContentType;
+      castTrack.subtype = window.chrome.cast.media.TextTrackType.SUBTITLES;
+      castTrack.name = track.name;
+      castTrack.language = track.language || 'en';
+      return castTrack;
+    });
+  }
+  const loadRequest = new window.chrome.cast.media.LoadRequest(mediaInfo);
+  loadRequest.autoplay = true;
+  if (draft.activeTrackIds.length > 0) {
+    loadRequest.activeTrackIds = draft.activeTrackIds;
+  }
+  return loadRequest;
 }
 
 function renderCastTvModalContent(meta, state = {}) {
@@ -2098,11 +2127,11 @@ function renderCastTvModalContent(meta, state = {}) {
             <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
               <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>No subtitles (video only)</option>
               ${subtitleOptions.map((track) => `
-                <option value="${escape(String(track.trackId))}" ${!track.ready ? 'disabled ' : ''}${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
+                <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
                   ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
                 </option>`).join('')}
             </select>
-            <p class="cast-modal-note">Changing subtitles may require restarting the cast session. Tracks still extracting are disabled until ready.</p>
+            <p class="cast-modal-note">Pick any subtitle even while it shows “extracting…” — casting starts right away and the subtitle appears on the TV automatically as it downloads, no restart needed.</p>
           ` : `
             <p class="cast-modal-note">No subtitles available for this stream.</p>
           `}
@@ -2117,11 +2146,11 @@ function renderCastTvModalContent(meta, state = {}) {
             <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
               <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>No subtitles (video only)</option>
               ${subtitleOptions.map((track) => `
-                <option value="${escape(String(track.trackId))}" ${!track.ready ? 'disabled ' : ''}${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
+                <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
                   ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
                 </option>`).join('')}
             </select>
-            <p class="cast-modal-note">Only tracks marked ready are sent to Chromecast. Embedded subs extract as the torrent buffers — wait for “extracting…” to clear.</p>
+            <p class="cast-modal-note">Pick any subtitle even while it shows “extracting…” — Uplayer keeps the cast in sync and the subtitle appears on the TV as it downloads, no restart needed.</p>
           ` : `
             <p class="cast-modal-note">No subtitles available for this stream. Casting will continue without subtitles.</p>
           `}
@@ -2346,6 +2375,7 @@ async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = nul
       ? rewriteLocalhostResourceUrlForChromecast(absolute, metaForRewrite)
       : absolute;
     const ready = typeof track.ready === 'boolean' ? track.ready : true;
+    const complete = typeof track.complete === 'boolean' ? track.complete : true;
     return {
       trackId: index + 1,
       name: track.label || `Subtitle ${index + 1}`,
@@ -2354,6 +2384,7 @@ async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = nul
       trackContentType: 'text/vtt',
       source: track.source || 'unknown',
       ready,
+      complete,
     };
   });
 }
@@ -2387,6 +2418,9 @@ function closeCastTvModal() {
 
 function handleCastSubtitleSelection(value) {
   castTvState.selectedSubtitleTrackId = String(value || '');
+  // Reset reload progress so the newly-selected track is (re)loaded as it extracts.
+  castTvState.subtitleReloadKey = null;
+  castTvState.subtitleReloadStage = 0;
   return false;
 }
 
@@ -2499,6 +2533,38 @@ async function testTvReadiness(event) {
   return false;
 }
 
+function castSubtitleOptionsSignature(options, selectedTrackId) {
+  return JSON.stringify({
+    sel: String(selectedTrackId || ''),
+    items: (options || []).map((t) => [String(t.trackId), !!t.ready, !!t.complete, t.name || '']),
+  });
+}
+
+// Updates the cast subtitle <select> options in place instead of re-rendering the whole
+// modal, so polling for newly-extracted subtitles doesn't close/reset the dropdown while
+// the user is choosing. Returns false if the <select> isn't present (caller should do a
+// full render — e.g. the first time options appear after starting with none).
+function updateCastSubtitleSelectInPlace(options, selectedTrackId) {
+  const select = document.getElementById('castSubtitleSelect');
+  if (!select) return false;
+  // Never rebuild while the user has the dropdown focused/open — it would collapse it.
+  if (document.activeElement === select) return true;
+
+  const sig = castSubtitleOptionsSignature(options, selectedTrackId);
+  if (select.dataset.optsig === sig) return true; // nothing changed
+
+  const sel = String(selectedTrackId || '');
+  let html = `<option value="" ${sel === '' ? 'selected' : ''}>No subtitles (video only)</option>`;
+  html += (options || []).map((track) => `
+    <option value="${escape(String(track.trackId))}" ${String(track.trackId) === sel ? 'selected' : ''}>
+      ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
+    </option>`).join('');
+  select.innerHTML = html;
+  select.value = sel;
+  select.dataset.optsig = sig;
+  return true;
+}
+
 async function populateCastTvModal(meta) {
   const content = document.getElementById('castModalContent');
   if (!content) return;
@@ -2560,7 +2626,10 @@ async function populateCastTvModal(meta) {
             const cur = String(castTvState.selectedSubtitleTrackId || '');
             const ok = cur === '' || next.some((t) => String(t.trackId) === cur);
             castTvState.selectedSubtitleTrackId = ok ? cur : '';
-            renderState();
+            // Update the dropdown in place so polling never closes/resets it. Only do a
+            // full re-render when the <select> doesn't exist yet (first options appear).
+            const updated = updateCastSubtitleSelectInPlace(castTvState.subtitleOptions, castTvState.selectedSubtitleTrackId);
+            if (!updated) renderState();
             if (next.some((t) => t.ready)) break;
           }
         } catch (e) {
@@ -2766,9 +2835,10 @@ function startChromecastCast(event) {
     const sel = String(castTvState.selectedSubtitleTrackId || '');
     if (sel) {
       const picked = subtitleOptions.find((t) => String(t.trackId) === sel);
-      if (!picked || !picked.ready) {
-        toast('This subtitle is still being extracted. Choose “No subtitles” or wait until it is ready (no “extracting…”).', 'info', 7000);
-        return;
+      if (picked && !picked.ready) {
+        // Don't block casting — start now and let the status poller attach the
+        // subtitle to the TV automatically as soon as it has content.
+        toast('Subtitle is still extracting — casting now; it will appear on the TV automatically.', 'info', 6000);
       }
     }
 
@@ -2778,28 +2848,7 @@ function startChromecastCast(event) {
       castTvState.selectedSubtitleTrackId,
       wizard.titleText
     );
-    const mediaInfo = new window.chrome.cast.media.MediaInfo(draft.contentId, draft.contentType);
-    const streamTypeEnum = window.chrome.cast.media.StreamType || {};
-    mediaInfo.streamType = draft.streamType || streamTypeEnum.BUFFERED || 'BUFFERED';
-    const metadata = new window.chrome.cast.media.GenericMediaMetadata();
-    metadata.title = draft.metadata.title;
-    mediaInfo.metadata = metadata;
-    if (draft.tracks.length > 0) {
-      mediaInfo.tracks = draft.tracks.map((track) => {
-        const castTrack = new window.chrome.cast.media.Track(track.trackId, window.chrome.cast.media.TrackType.TEXT);
-        castTrack.trackContentId = track.trackContentId;
-        castTrack.trackContentType = track.trackContentType;
-        castTrack.subtype = window.chrome.cast.media.TextTrackType.SUBTITLES;
-        castTrack.name = track.name;
-        castTrack.language = track.language || 'en';
-        return castTrack;
-      });
-    }
-    const loadRequest = new window.chrome.cast.media.LoadRequest(mediaInfo);
-    loadRequest.autoplay = true;
-    if (draft.activeTrackIds.length > 0) {
-      loadRequest.activeTrackIds = draft.activeTrackIds;
-    }
+    const loadRequest = buildCastLoadRequest(draft);
     await session.loadMedia(loadRequest);
 
     let receiverLoadFailed = false;
@@ -2816,6 +2865,20 @@ function startChromecastCast(event) {
     castTvState.isCasting = true;
     castTvState.castSession = session;
     castTvState.castDeviceName = session.getReceiverStatus?.()?.receiver?.friendlyName || 'Chromecast';
+    // Remember what we cast so the status poller can top up subtitles as they extract.
+    castTvState.castMeta = meta;
+    castTvState.castTitle = wizard.titleText;
+    // Record how complete the selected track already was at load time so the poller
+    // only reloads when it advances (first content -> stage 1, fully extracted -> 2).
+    const selInit = String(castTvState.selectedSubtitleTrackId || '');
+    const pickedInit = selInit ? subtitleOptions.find((t) => String(t.trackId) === selInit) : null;
+    if (pickedInit && pickedInit.ready) {
+      castTvState.subtitleReloadKey = selInit;
+      castTvState.subtitleReloadStage = pickedInit.complete ? 2 : 1;
+    } else {
+      castTvState.subtitleReloadKey = null;
+      castTvState.subtitleReloadStage = 0;
+    }
 
     // Get initial volume
     try {
@@ -3350,40 +3413,112 @@ function renderWizardStep2(panel) {
   }
 }
 
+function renderTorrentSearchProgress(statusEl, listEl, isFinal) {
+  const n = wizard.torrents.length;
+  if (statusEl) {
+    if (!isFinal) {
+      statusEl.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Found <strong>${n}</strong> so far - still searching...`;
+    } else {
+      statusEl.innerHTML = n > 0
+        ? `Found <strong>${n}</strong> results - pick one to stream`
+        : `<span style="color:var(--red)">No torrents found. Try a different search.</span>`;
+    }
+  }
+  if (listEl) {
+    if (n > 0) {
+      listEl.innerHTML = renderTorrentItems();
+    } else if (isFinal) {
+      listEl.innerHTML = `<div class="empty-state"><div class="empty-icon">0</div><h3>No torrents found</h3><p>The scrapers could not find any results. Check your connection or try later.</p></div>`;
+    } else {
+      listEl.innerHTML = skeletonCards(4).replace(/class="card"/g, 'style="height:60px;border-radius:8px"');
+    }
+  }
+}
+
 async function wizardSearchTorrents() {
   const statusEl = document.getElementById('torrentSearchStatus');
   const listEl = document.getElementById('torrentList');
   if (statusEl) statusEl.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Searching 5 sources...`;
   if (listEl) listEl.innerHTML = skeletonCards(4).replace(/class="card"/g, 'style="height:60px;border-radius:8px"');
 
+  wizard.torrents = [];
+
+  const body = {
+    title: wizard.titleText,
+    type: wizard.type,
+    tmdbId: wizard.tmdbId,
+    season: wizard.selectedSeason,
+    episode: wizard.selectedEpisode,
+  };
+
   try {
-    const body = {
-      title: wizard.titleText,
-      type: wizard.type,
-      tmdbId: wizard.tmdbId,
-      season: wizard.selectedSeason,
-      episode: wizard.selectedEpisode,
-    };
-    wizard.torrents = await fetch('/api/torrents/search', {
+    const resp = await fetch('/api/torrents/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    }).then((r) => r.json());
+    });
+
+    if (!resp.ok) {
+      let msg = `Search failed (${resp.status})`;
+      try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch (_) {}
+      throw new Error(msg);
+    }
+
+    const applyMessage = (msg) => {
+      if (!msg) return;
+      if (msg.error) throw new Error(msg.error);
+      if (Array.isArray(msg.results)) {
+        wizard.torrents = msg.results;
+        renderTorrentSearchProgress(statusEl, listEl, msg.type === 'final');
+      }
+    };
+
+    // The endpoint streams NDJSON (one ranked snapshot per line) so results show
+    // up as each source returns instead of waiting for all of them.
+    if (resp.body && typeof resp.body.getReader === 'function') {
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let done = false;
+      while (!done) {
+        const chunk = await reader.read();
+        done = chunk.done;
+        if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+        let nl;
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (!line) continue;
+          try { applyMessage(JSON.parse(line)); } catch (_) { /* skip partial line */ }
+        }
+      }
+      const tail = buffer.trim();
+      if (tail) {
+        try { applyMessage(JSON.parse(tail)); } catch (_) {}
+      }
+    } else {
+      // Fallback for environments without a streaming body: parse the whole text.
+      const text = await resp.text();
+      text.split('\n').forEach((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        try { applyMessage(JSON.parse(trimmed)); } catch (_) {}
+      });
+    }
+
+    renderTorrentSearchProgress(statusEl, listEl, true);
     persistWizardState();
-
-    if (statusEl) statusEl.innerHTML = wizard.torrents.length > 0
-      ? `Found <strong>${wizard.torrents.length}</strong> results - pick one to stream`
-      : `<span style="color:var(--red)">No torrents found. Try a different search.</span>`;
-
-    if (listEl) listEl.innerHTML = wizard.torrents.length > 0
-      ? renderTorrentItems()
-      : `<div class="empty-state"><div class="empty-icon">0</div><h3>No torrents found</h3><p>The scrapers could not find any results. Check your connection or try later.</p></div>`;
   } catch (e) {
     if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">Search failed: ${escape(e.message)}</span>`;
   }
 }
 
+function torrentKey(t) {
+  return t ? `${t.name || ''}|${t.source || ''}` : '';
+}
+
 function renderTorrentItems() {
+  const selectedKey = wizard.selectedTorrent ? torrentKey(wizard.selectedTorrent) : '';
   return wizard.torrents.map((t, i) => {
     const src = (t.source || '').toLowerCase().replace(/[^a-z]/g, '');
     const srcClass = src.includes('1337') ? 'source-1337x'
@@ -3393,16 +3528,19 @@ function renderTorrentItems() {
       : 'source-other';
     const seeds = parseInt(t.seeders) || 0;
     const leech = parseInt(t.leechers) || 0;
-    const isSelected = wizard.selectedTorrent && wizard.selectedTorrent._idx === i;
+    // Some sources (e.g. SubsPlease) expose no peer counts — don't show fake numbers.
+    const hasPeers = t.seeders != null;
+    const hasSize = t.size && t.size !== 'Unknown';
+    const isSelected = selectedKey !== '' && torrentKey(t) === selectedKey;
     return `
       <div class="torrent-item ${isSelected ? 'selected' : ''}" onclick="wizardSelectTorrent(${i})">
         <div class="torrent-radio"></div>
         <span class="torrent-source ${srcClass}">${escape(t.source || '?')}</span>
         <span class="torrent-name" title="${escape(t.name)}">${escape(t.name)}</span>
         <div class="torrent-meta">
-          <span class="torrent-seeds">Seeds ${seeds}</span>
-          <span class="torrent-leech">Leech ${leech}</span>
-          ${t.size ? `<span class="torrent-size">${escape(t.size)}</span>` : ''}
+          ${hasPeers ? `<span class="torrent-seeds">Seeds ${seeds}</span>
+          <span class="torrent-leech">Leech ${leech}</span>` : ''}
+          ${hasSize ? `<span class="torrent-size">${escape(t.size)}</span>` : ''}
         </div>
       </div>`;
   }).join('');
@@ -4005,6 +4143,59 @@ function updateCastStatusIndicator() {
   }
 }
 
+let castSubtitleReloadInFlight = false;
+
+// While casting, the Chromecast receiver only fetches a subtitle track once at load
+// time, but embedded subs keep extracting as the torrent downloads. So we let the user
+// pick a track even before it's ready, then reload the media (at the current position)
+// with a fresh cache-busted URL in two stages: stage 1 when the track first has content
+// (subs appear without waiting for full extraction), stage 2 when fully extracted.
+async function maybeReloadCastForSubtitleProgress() {
+  if (castSubtitleReloadInFlight) return;
+  if (!castTvState.isCasting || !castTvState.castSession) return;
+
+  const sel = String(castTvState.selectedSubtitleTrackId || '');
+  if (!sel) return;
+
+  const meta = castTvState.castMeta;
+  if (!meta || !meta.subtitleManifestUrl) return;
+
+  castSubtitleReloadInFlight = true;
+  try {
+    const options = await loadCastSubtitleOptions(meta.subtitleManifestUrl, meta);
+    castTvState.subtitleOptions = options;
+
+    const picked = options.find((t) => String(t.trackId) === sel);
+    if (!picked || !picked.ready) return; // no usable content yet
+
+    const desiredStage = picked.complete ? 2 : 1;
+    const doneStage = castTvState.subtitleReloadKey === sel ? (castTvState.subtitleReloadStage || 0) : 0;
+    if (doneStage >= desiredStage) return; // already loaded at this stage or beyond
+
+    const session = castTvState.castSession;
+    if (!castTvState.isCasting || !session || typeof session.loadMedia !== 'function') return;
+
+    let resumeTime = 0;
+    try {
+      const media = session.getMediaSession?.();
+      if (media && typeof media.getEstimatedTime === 'function') {
+        resumeTime = media.getEstimatedTime() || 0;
+      }
+    } catch (e) { /* ignore */ }
+
+    const draft = buildCastMediaDraft(meta, options, sel, castTvState.castTitle);
+    const loadRequest = buildCastLoadRequest(draft);
+    if (resumeTime > 0) loadRequest.currentTime = resumeTime;
+    await session.loadMedia(loadRequest);
+    castTvState.subtitleReloadKey = sel;
+    castTvState.subtitleReloadStage = desiredStage;
+  } catch (e) {
+    // transient — a later tick will retry
+  } finally {
+    castSubtitleReloadInFlight = false;
+  }
+}
+
 function startCastStatusUpdates() {
   stopCastStatusUpdates();
   castStatusUpdateInterval = setInterval(() => {
@@ -4024,6 +4215,7 @@ function startCastStatusUpdates() {
       } catch (e) {
         // Session may have been lost
       }
+      maybeReloadCastForSubtitleProgress();
     }
     updateCastStatusIndicator();
   }, 2000);

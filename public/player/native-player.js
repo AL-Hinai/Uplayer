@@ -20,6 +20,12 @@
   var selectedSubtitleIndex = null;
   var subtitleOffset = 0;
   var subtitlePollId = null;
+  var subtitleManifestPollId = null;
+  var subtitleTrackReady = {};
+  var subtitleTrackComplete = {};
+  var subtitleTrackFinalized = {};
+  var stallRecoveryTimer = null;
+  var lastRecoveryAt = 0;
   var lastKnownCueCount = -1;
   var lastPreviewSignature = "";
   var lastOverlaySignature = "";
@@ -193,6 +199,127 @@
     clearSubtitlePolling();
     syncSelectedTrack();
     subtitlePollId = setInterval(syncSelectedTrack, 1500);
+  }
+
+  // Embedded subtitles are extracted on the server while the torrent downloads, so the
+  // .vtt grows over time. The browser only fetches a <track> once, so we rebuild the
+  // active track element with a cache-busting query to pull in newly-extracted cues.
+  function getTrackElements() {
+    if (!video) return [];
+    return Array.prototype.slice.call(video.querySelectorAll("track"));
+  }
+
+  function refreshActiveSubtitleTrack() {
+    if (selectedSubtitleIndex === null || selectedSubtitleIndex < 0) return;
+
+    var trackEls = getTrackElements();
+    var oldEl = trackEls[selectedSubtitleIndex];
+    if (!oldEl) return;
+
+    var meta = Array.isArray(cfg.subtitleTracks) ? cfg.subtitleTracks[selectedSubtitleIndex] : null;
+    var baseUrl = (meta && meta.url) || oldEl.getAttribute("src") || "";
+    if (!baseUrl) return;
+    var cleanUrl = baseUrl.split("?")[0];
+
+    var newEl = document.createElement("track");
+    newEl.kind = "subtitles";
+    newEl.setAttribute("src", cleanUrl + "?t=" + Date.now());
+    var srclang = oldEl.getAttribute("srclang");
+    if (srclang) newEl.setAttribute("srclang", srclang);
+    var label = oldEl.getAttribute("label");
+    if (label) newEl.setAttribute("label", label);
+
+    // Replacing in the same DOM position keeps textTracks ordering stable, so
+    // selectedSubtitleIndex still maps correctly. The addtrack handler re-applies
+    // selection and offset.
+    oldEl.replaceWith(newEl);
+  }
+
+  function pollSubtitleManifest() {
+    var url = cfg.subtitleManifestUrl;
+    if (!url) {
+      stopSubtitleManifestPolling();
+      return;
+    }
+
+    fetch(url, { cache: "no-store" })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (data) {
+        var subs = (data && Array.isArray(data.subtitles)) ? data.subtitles : [];
+        subs.forEach(function (sub) {
+          if (sub && typeof sub.index === "number") {
+            subtitleTrackReady[sub.index] = sub.ready === true;
+            subtitleTrackComplete[sub.index] = sub.complete === true;
+          }
+        });
+
+        var active = selectedSubtitleIndex;
+        if (active !== null && active >= 0 && subtitleTrackReady[active]) {
+          if (!subtitleTrackComplete[active]) {
+            // Still extracting — pull the latest cues.
+            refreshActiveSubtitleTrack();
+          } else if (!subtitleTrackFinalized[active]) {
+            // Just finished — grab the full file once, then stop refreshing it.
+            subtitleTrackFinalized[active] = true;
+            refreshActiveSubtitleTrack();
+          }
+        }
+
+        var total = Array.isArray(cfg.subtitleTracks) ? cfg.subtitleTracks.length : 0;
+        var everythingComplete = total > 0 && subs.length >= total
+          && subs.every(function (sub) { return sub && sub.complete === true; });
+        var activeSettled = active === null || active < 0 || subtitleTrackFinalized[active];
+        if (total === 0 || (everythingComplete && activeSettled)) {
+          stopSubtitleManifestPolling();
+        }
+      })
+      .catch(function () { /* transient network errors are fine; next tick retries */ });
+  }
+
+  function startSubtitleManifestPolling() {
+    if (subtitleManifestPollId || !cfg.subtitleManifestUrl) return;
+    if (!Array.isArray(cfg.subtitleTracks) || cfg.subtitleTracks.length === 0) return;
+    setTimeout(pollSubtitleManifest, 3000);
+    subtitleManifestPollId = setInterval(pollSubtitleManifest, 9000);
+  }
+
+  function stopSubtitleManifestPolling() {
+    if (subtitleManifestPollId) {
+      clearInterval(subtitleManifestPollId);
+      subtitleManifestPollId = null;
+    }
+  }
+
+  // Buffer-health watcher: torrent throughput can dip below the bitrate and stall the
+  // <video>. If playback is genuinely stuck for a while, reload at the current position
+  // as a last resort. hls.js owns its own recovery, so this only applies to direct files.
+  function cancelStallRecovery() {
+    if (stallRecoveryTimer) {
+      clearTimeout(stallRecoveryTimer);
+      stallRecoveryTimer = null;
+    }
+  }
+
+  function scheduleStallRecovery() {
+    if (!video || cfg.isHlsSource || stallRecoveryTimer) return;
+    stallRecoveryTimer = setTimeout(function () {
+      stallRecoveryTimer = null;
+      if (!video || video.paused || video.ended) return;
+      if (video.readyState >= 3 /* HAVE_FUTURE_DATA */) return; // recovered on its own
+      var now = Date.now();
+      if (now - lastRecoveryAt < 15000) return; // never thrash the stream
+      lastRecoveryAt = now;
+      var pos = video.currentTime;
+      try {
+        var resume = function () {
+          video.removeEventListener("loadedmetadata", resume);
+          try { video.currentTime = pos; } catch (e) { /* ignore */ }
+          video.play().catch(function () { /* ignore autoplay failure */ });
+        };
+        video.addEventListener("loadedmetadata", resume);
+        video.load();
+      } catch (e) { /* ignore */ }
+    }, 8000);
   }
 
   function setSubtitleIndex(index) {
@@ -378,7 +505,15 @@
 
   if (subtitleSelect) {
     subtitleSelect.addEventListener("change", function () {
-      setSubtitleIndex(parseInt(subtitleSelect.value, 10));
+      var nextIndex = parseInt(subtitleSelect.value, 10);
+      setSubtitleIndex(nextIndex);
+      // A freshly-selected track may have loaded empty/partial earlier; allow the
+      // poller to refresh it again and resume polling if it had stopped.
+      if (Number.isInteger(nextIndex) && nextIndex >= 0) {
+        subtitleTrackFinalized[nextIndex] = false;
+        startSubtitleManifestPolling();
+        pollSubtitleManifest();
+      }
     });
   }
 
@@ -431,12 +566,37 @@
     });
   }
 
+  // HLS attach — Safari plays m3u8 natively; everything else needs hls.js (loaded as CDN <script>).
+  if (video && cfg.isHlsSource && cfg.videoUrl) {
+    var canNative = typeof video.canPlayType === "function"
+      && video.canPlayType("application/vnd.apple.mpegurl") !== "";
+    if (canNative) {
+      try { video.src = cfg.videoUrl; } catch (e) { /* keep <source> fallback */ }
+    } else if (typeof window.Hls !== "undefined" && window.Hls && window.Hls.isSupported && window.Hls.isSupported()) {
+      try {
+        var hls = new window.Hls({ enableWorker: true, lowLatencyMode: false });
+        hls.loadSource(cfg.videoUrl);
+        hls.attachMedia(video);
+        hls.on(window.Hls.Events.ERROR, function (_event, data) {
+          if (data && data.fatal) {
+            showError("HLS error: " + (data.details || data.type || "unknown"));
+          }
+        });
+      } catch (e) {
+        showError("HLS playback failed to initialize.");
+      }
+    } else {
+      showError("This browser cannot play HLS streams. Use Safari, Edge, Chrome, or open the VLC link.");
+    }
+  }
+
   if (video) {
     video.addEventListener("loadedmetadata", function () {
       setStatus(cfg.transcoding ? "Transcoding stream ready" : "Ready");
       refreshSubtitleSelect();
       setSubtitleIndex(selectedSubtitleIndex === null ? findInitialSubtitleIndex(getSubtitleTracks()) : selectedSubtitleIndex);
       updateOffsetDisplay();
+      startSubtitleManifestPolling();
     });
 
     video.addEventListener("loadeddata", function () {
@@ -457,7 +617,16 @@
     video.addEventListener("playing", function () {
       hideError();
       setStatus("Playing");
+      cancelStallRecovery();
       renderSubtitleOverlay(true);
+    });
+
+    video.addEventListener("canplay", function () {
+      cancelStallRecovery();
+    });
+
+    video.addEventListener("stalled", function () {
+      scheduleStallRecovery();
     });
 
     video.addEventListener("pause", function () {
@@ -471,6 +640,7 @@
 
     video.addEventListener("waiting", function () {
       setStatus("Buffering...");
+      scheduleStallRecovery();
     });
 
     video.addEventListener("timeupdate", function () {

@@ -1019,6 +1019,8 @@ class TorrentScraper {
     let episode = null;
     let isAnime = false;
     let absoluteEpisode = null;
+    let onPartial = null;
+    let altTitles = [];
 
     if (rest.length === 1 && rest[0] && typeof rest[0] === 'object' && !Array.isArray(rest[0])) {
       const opts = rest[0];
@@ -1026,6 +1028,8 @@ class TorrentScraper {
       episode = opts.episode != null ? Number(opts.episode) : null;
       isAnime = !!opts.isAnime;
       absoluteEpisode = opts.absoluteEpisode != null ? Number(opts.absoluteEpisode) : null;
+      onPartial = typeof opts.onPartial === 'function' ? opts.onPartial : null;
+      if (Array.isArray(opts.altTitles)) altTitles = opts.altTitles;
     } else {
       // legacy: (query, year, season, episode)
       season = rest[1] != null ? Number(rest[1]) : null;
@@ -1050,11 +1054,28 @@ class TorrentScraper {
     const pad2 = (n) => String(n).padStart(2, '0');
     const seTag = season != null && episode != null ? `S${pad2(season)}E${pad2(episode)}` : null;
 
+    // Anime trackers (Nyaa/SubsPlease) index shows by their romaji title, not the
+    // English TMDB title (e.g. "Witch Hat Atelier" is listed as "Tongari Boushi no
+    // Atelier"). Search every known title variant so we don't miss the show.
+    const cleanTitle = (t) => String(t || '')
+      .replace(/\b[sS]\d{1,3}[\s_]*[eE]\d{1,5}\b.*$/, '')
+      .replace(/\bSeason\s+\d{1,3}\b.*$/i, '')
+      .trim();
+    const titleVariants = [];
+    const seenTitle = new Set();
+    for (const t of [showName, ...altTitles]) {
+      const c = cleanTitle(t);
+      const key = c.toLowerCase();
+      if (c && !seenTitle.has(key)) {
+        seenTitle.add(key);
+        titleVariants.push(c);
+      }
+    }
+
     // ---- Provider-specific query plan --------------------------------------
     // Per the corpus survey: PirateBay/1337x respond well to `Title S##E##`,
-    // SubsPlease only carries anime and uses `Show - NN` (search by absolute
-    // number), Nyaa needs both forms because modern anime use S##E## while
-    // long-running shows use absolute numbering.
+    // SubsPlease only carries anime and searches by show name (appending an
+    // episode number returns nothing), Nyaa needs both S##E## and absolute forms.
     const queriesPerSource = {
       '1337x': seTag ? [`${showName} ${seTag}`] : [showName],
       'YTS': season == null ? [showName] : [],
@@ -1063,18 +1084,27 @@ class TorrentScraper {
       'SubsPlease': [],
     };
 
-    // Nyaa: combine formatted-SE and (for anime) absolute-episode query.
-    if (seTag) queriesPerSource.Nyaa.push(`${showName} ${seTag}`);
-    if (isAnime && absoluteEpisode != null) {
-      queriesPerSource.Nyaa.push(`${showName} ${absoluteEpisode}`);
+    // Nyaa: formatted-SE and (for anime) absolute-episode queries, across every
+    // title variant so romaji-only listings are found.
+    for (const t of titleVariants) {
+      if (seTag) queriesPerSource.Nyaa.push(`${t} ${seTag}`);
+      if (isAnime && absoluteEpisode != null) {
+        queriesPerSource.Nyaa.push(`${t} ${absoluteEpisode}`);
+      }
     }
-    if (queriesPerSource.Nyaa.length === 0) queriesPerSource.Nyaa.push(showName);
+    if (queriesPerSource.Nyaa.length === 0) {
+      for (const t of titleVariants) queriesPerSource.Nyaa.push(t);
+    }
 
-    // SubsPlease: anime-only. Prefer absolute-episode query (their format).
-    if (isAnime && absoluteEpisode != null) {
-      queriesPerSource.SubsPlease.push(`${showName} ${absoluteEpisode}`);
-    } else if (isAnime || season == null) {
-      queriesPerSource.SubsPlease.push(showName);
+    // SubsPlease: anime-only. Search by show name only (no episode number) — the
+    // API returns the show's episodes and scoring picks the right one.
+    if (isAnime || season == null) {
+      for (const t of titleVariants) queriesPerSource.SubsPlease.push(t);
+    }
+
+    // Dedupe queries per source to avoid redundant requests.
+    for (const k of Object.keys(queriesPerSource)) {
+      queriesPerSource[k] = [...new Set(queriesPerSource[k])];
     }
 
     const sources = [
@@ -1093,89 +1123,114 @@ class TorrentScraper {
       )
     );
 
-    // ---- Issue all queries in parallel -------------------------------------
-    const allPromises = [];
+    // Dedupe + classify + score + sort a set of raw results. Pure over its input
+    // so it can be re-run on the growing accumulator as each source returns.
+    const expected = { season, episode, isAnime, absoluteEpisode };
+    const rankResults = (rawResults) => {
+      // ---- Dedupe by (name|source) -----------------------------------------
+      const seen = new Set();
+      const uniqueResults = [];
+      for (const r of rawResults) {
+        if (!r || !r.name) continue;
+        const key = `${r.name}|${r.source}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        uniqueResults.push(r);
+      }
+
+      // ---- No S/E filtering needed (movie or freeform query) ---------------
+      if (season == null || episode == null) {
+        uniqueResults.sort((a, b) => {
+          if ((b.seeders || 0) !== (a.seeders || 0)) return (b.seeders || 0) - (a.seeders || 0);
+          return String(a.name).localeCompare(String(b.name));
+        });
+        return uniqueResults;
+      }
+
+      // ---- Classify and score using the shared rule set --------------------
+      const scored = uniqueResults.map((result) => {
+        const parsed = parseName(result.name);
+        const verdict = classify(parsed, expected);
+
+        let score = result.seeders || 0;
+        let exactMatch = false;
+        let hasSeason = false;
+        let hasEpisode = false;
+
+        if (verdict.exactSEMatch || verdict.longformMatch) {
+          score += 2000;
+          exactMatch = true;
+          hasSeason = true;
+          hasEpisode = true;
+        } else if (verdict.absoluteMatch) {
+          // Anime absolute-episode hit (e.g. `One Piece - 1163`, `EP1163`).
+          score += 1500;
+          hasEpisode = true;
+        } else if (verdict.animeDashMatch) {
+          score += 1000;
+          hasEpisode = true;
+        } else if (verdict.episodeOnlyMatch) {
+          // Episode tagged but no season tag, no contradicting season —
+          // implicit-season match. Trustworthy per the survey data.
+          score += 800;
+          hasEpisode = true;
+        }
+
+        return { ...result, score, exactMatch, hasSeason, hasEpisode, verdict };
+      });
+
+      // ---- Filter: only keep real matches; drop wrong-season hard ----------
+      const filtered = scored.filter((r) => {
+        if (r.verdict.wrongSeason && !r.verdict.absoluteMatch) return false;
+        if (r.verdict.hasContradictingSeason && !r.verdict.absoluteMatch) return false;
+        return (
+          r.verdict.exactSEMatch ||
+          r.verdict.longformMatch ||
+          r.verdict.absoluteMatch ||
+          r.verdict.animeDashMatch ||
+          r.verdict.episodeOnlyMatch
+        );
+      });
+
+      filtered.sort((a, b) => {
+        // Pin SubsPlease to the top for anime searches (no seeders to rank on).
+        if (isAnime) {
+          const aSub = a.source === 'SubsPlease' ? 1 : 0;
+          const bSub = b.source === 'SubsPlease' ? 1 : 0;
+          if (aSub !== bSub) return bSub - aSub;
+        }
+        if (b.score !== a.score) return b.score - a.score;
+        return (b.seeders || 0) - (a.seeders || 0);
+      });
+
+      return filtered;
+    };
+
+    // ---- Issue all queries in parallel; rank+emit as each source returns ---
+    // Callers can pass opts.onPartial to receive a freshly-ranked snapshot every
+    // time a source resolves, so the UI can show results without waiting for all.
+    const accumulated = [];
+    const tasks = [];
     for (const src of sources) {
       const qs = queriesPerSource[src.name] || [];
       for (const q of qs) {
-        allPromises.push(src.fn(q).catch(() => []));
+        tasks.push(
+          src.fn(q)
+            .catch(() => [])
+            .then((res) => {
+              if (Array.isArray(res) && res.length) {
+                for (const r of res) accumulated.push(r);
+              }
+              if (onPartial) {
+                try { onPartial(rankResults(accumulated)); } catch (e) { /* ignore */ }
+              }
+            })
+        );
       }
     }
-    const settled = await Promise.all(allPromises);
-    const flat = [].concat(...settled.filter(Boolean));
+    await Promise.all(tasks);
 
-    // ---- Dedupe by (name|source) -------------------------------------------
-    const seen = new Set();
-    const uniqueResults = [];
-    for (const r of flat) {
-      if (!r || !r.name) continue;
-      const key = `${r.name}|${r.source}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      uniqueResults.push(r);
-    }
-
-    // ---- No S/E filtering needed (movie or freeform query) -----------------
-    if (season == null || episode == null) {
-      uniqueResults.sort((a, b) => {
-        if ((b.seeders || 0) !== (a.seeders || 0)) return (b.seeders || 0) - (a.seeders || 0);
-        return String(a.name).localeCompare(String(b.name));
-      });
-      return uniqueResults;
-    }
-
-    // ---- Classify and score using the shared rule set ----------------------
-    const expected = { season, episode, isAnime, absoluteEpisode };
-    const scored = uniqueResults.map((result) => {
-      const parsed = parseName(result.name);
-      const verdict = classify(parsed, expected);
-
-      let score = result.seeders || 0;
-      let exactMatch = false;
-      let hasSeason = false;
-      let hasEpisode = false;
-
-      if (verdict.exactSEMatch || verdict.longformMatch) {
-        score += 2000;
-        exactMatch = true;
-        hasSeason = true;
-        hasEpisode = true;
-      } else if (verdict.absoluteMatch) {
-        // Anime absolute-episode hit (e.g. `One Piece - 1163`, `EP1163`).
-        score += 1500;
-        hasEpisode = true;
-      } else if (verdict.animeDashMatch) {
-        score += 1000;
-        hasEpisode = true;
-      } else if (verdict.episodeOnlyMatch) {
-        // Episode tagged but no season tag, no contradicting season —
-        // implicit-season match. Trustworthy per the survey data.
-        score += 800;
-        hasEpisode = true;
-      }
-
-      return { ...result, score, exactMatch, hasSeason, hasEpisode, verdict };
-    });
-
-    // ---- Filter: only keep real matches; drop wrong-season hard ------------
-    const filtered = scored.filter((r) => {
-      if (r.verdict.wrongSeason && !r.verdict.absoluteMatch) return false;
-      if (r.verdict.hasContradictingSeason && !r.verdict.absoluteMatch) return false;
-      return (
-        r.verdict.exactSEMatch ||
-        r.verdict.longformMatch ||
-        r.verdict.absoluteMatch ||
-        r.verdict.animeDashMatch ||
-        r.verdict.episodeOnlyMatch
-      );
-    });
-
-    filtered.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return (b.seeders || 0) - (a.seeders || 0);
-    });
-
-    return filtered;
+    return rankResults(accumulated);
   }
 
   async search1337x(query) {
@@ -1358,9 +1413,11 @@ class TorrentScraper {
           const name = `[SubsPlease] ${showName}${episode ? ` - ${episode}` : ''}${res ? ` (${res})` : ''}`;
           results.push({
             name,
-            seeders: 100,
-            leechers: 0,
-            size: 'Unknown',
+            // SubsPlease is a trusted anime release source but its API exposes no
+            // peer counts — leave them null instead of inventing numbers.
+            seeders: null,
+            leechers: null,
+            size: null,
             link: dl.magnet,
             source: 'SubsPlease',
           });
@@ -1982,24 +2039,26 @@ class StreamManager extends EventEmitter {
 
                     ffmpeg.on('close', (code) => {
                       clearInterval(checkInterval);
-                      
+
                       if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
                         if (!subtitleInfo) {
-                          const existingEntry = this.subtitlePaths.find(s => 
+                          const existingEntry = this.subtitlePaths.find(s =>
                             s.trackIndex === trackIndex && s.source === 'embedded' && s.isPlaceholder
                           );
-                          
+
                           if (existingEntry) {
                             existingEntry.path = outputPath;
                             existingEntry.isPlaceholder = false;
                             subtitleInfo = existingEntry;
                             // Don't log individual extractions - they'll be shown in batch at the end
                           }
-                          resolveTrack(subtitleInfo);
-                        } else {
-                          // Already resolved
-                          resolveTrack(subtitleInfo);
                         }
+                        // ffmpeg finished reading the whole stream: this track is now fully
+                        // extracted, so clients can stop re-fetching it.
+                        if (subtitleInfo) {
+                          subtitleInfo.complete = true;
+                        }
+                        resolveTrack(subtitleInfo);
                       } else {
                         resolveTrack(null);
                       }
@@ -2339,7 +2398,8 @@ class StreamManager extends EventEmitter {
             source: 'external',
             language: 'en',
             label: 'External Subtitle',
-            codec: 'srt'
+            codec: 'srt',
+            complete: true
           };
           this.subtitlePaths.push(subtitleInfo);
           if (!this.subtitlePath) {
@@ -2508,6 +2568,13 @@ class StreamManager extends EventEmitter {
 
   // Probe video codec from webtorrent file (HEVC/H.265 not supported in browsers - needs transcoding)
   async probeVideoCodec(videoFile) {
+    const probe = await this.probeMediaStreams(videoFile);
+    return probe ? probe.vcodec : null;
+  }
+
+  // Sample first ~10MB of the file and ffprobe it for video + audio + format info.
+  // Returns { vcodec, vlevel, vprofile, acodec, achannels, container, durationSec } or null.
+  async probeMediaStreams(videoFile) {
     const { spawn } = require('child_process');
     if (!this.ffprobePath) return null;
     const sampleSize = Math.min(10 * 1024 * 1024, videoFile.length);
@@ -2520,19 +2587,103 @@ class StreamManager extends EventEmitter {
       readStream.pipe(writeStream);
       writeStream.on('finish', () => {
         const ffprobe = spawn(this.ffprobePath, [
-          '-v', 'error', '-select_streams', 'v:0',
-          '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1',
-          samplePath
+          '-v', 'error',
+          '-show_streams',
+          '-show_format',
+          '-of', 'json',
+          samplePath,
         ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
         let out = '';
         ffprobe.stdout.on('data', (d) => { out += d.toString(); });
         ffprobe.on('close', (code) => {
           try { fs.unlinkSync(samplePath); } catch (e) {}
-          resolve(code === 0 && out ? out.trim().toLowerCase() : null);
+          if (code !== 0 || !out) return resolve(null);
+          try {
+            const parsed = JSON.parse(out);
+            const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+            const video = streams.find((s) => s.codec_type === 'video');
+            const audio = streams.find((s) => s.codec_type === 'audio');
+            const format = parsed.format || {};
+            const duration = Number.parseFloat(format.duration);
+            resolve({
+              vcodec: video && video.codec_name ? String(video.codec_name).toLowerCase() : null,
+              vprofile: video && video.profile ? String(video.profile).toLowerCase() : null,
+              vlevel: video && Number.isFinite(Number(video.level)) ? Number(video.level) : null,
+              acodec: audio && audio.codec_name ? String(audio.codec_name).toLowerCase() : null,
+              achannels: audio && Number.isFinite(Number(audio.channels)) ? Number(audio.channels) : null,
+              container: format && format.format_name ? String(format.format_name).toLowerCase() : null,
+              durationSec: Number.isFinite(duration) ? duration : null,
+            });
+          } catch (e) {
+            resolve(null);
+          }
         });
         ffprobe.on('error', () => { try { fs.unlinkSync(samplePath); } catch (e) {} resolve(null); });
       });
     });
+  }
+
+  // Pick the cheapest pipeline that yields a Chromecast-compatible stream.
+  // containerExt is the file extension (no dot), e.g. 'mp4', 'mkv'.
+  // Returns { strategy, audioArgs, videoArgs } where strategy is one of:
+  //   'directplay'   — serve raw bytes; no FFmpeg
+  //   'remux'        — `-c:v copy -c:a copy` into fMP4/HLS
+  //   'remux-audio'  — `-c:v copy -c:a aac …`
+  //   'transcode'    — full re-encode (Tier 3)
+  decidePlaybackStrategy(probe, containerExt) {
+    const cont = String(containerExt || '').toLowerCase().replace(/^\./, '');
+    const directContainer = cont === 'mp4' || cont === 'm4v';
+
+    // No probe data: fall back to extension-only decision.
+    if (!probe) {
+      if (directContainer) return { strategy: 'directplay' };
+      return { strategy: 'remux', audioArgs: ['-c:a', 'copy'], videoArgs: ['-c:v', 'copy'] };
+    }
+
+    const vcodec = (probe.vcodec || '').toLowerCase();
+    const acodec = (probe.acodec || '').toLowerCase();
+    const vlevel = Number.isFinite(probe.vlevel) ? probe.vlevel : null;
+
+    const isH264 = vcodec === 'h264' || vcodec === 'avc' || vcodec === 'avc1';
+    const isHevc = vcodec === 'hevc' || vcodec === 'h265';
+    const needsVideoReencode = !isH264 || (vlevel != null && vlevel > 51); // L5.1 cap for CC1AD845
+
+    // Audio compatibility: Chromecast default receiver plays AAC + MP3 reliably.
+    const audioCastCompatible = acodec === 'aac' || acodec === 'mp3' || acodec === 'mp4a';
+
+    if (!needsVideoReencode && audioCastCompatible && directContainer) {
+      return { strategy: 'directplay' };
+    }
+
+    // H.264 in MP4/MKV uses AVCC packaging; MPEG-TS needs Annex-B. ffmpeg's hls
+    // muxer mostly auto-applies this filter, but being explicit avoids edge cases
+    // (some MKV muxes ship NAL units that the auto-detector misses).
+    const h264BsfArgs = isH264 ? ['-bsf:v', 'h264_mp4toannexb'] : [];
+
+    if (!needsVideoReencode && audioCastCompatible) {
+      // Codecs are fine, only the container is wrong → cheapest tier.
+      return {
+        strategy: 'remux',
+        videoArgs: ['-c:v', 'copy', ...h264BsfArgs],
+        audioArgs: ['-c:a', 'copy'],
+      };
+    }
+
+    if (!needsVideoReencode) {
+      // Video copy, audio transcode (AC3/EAC3/DTS/FLAC/Opus/TrueHD/...).
+      return {
+        strategy: 'remux-audio',
+        videoArgs: ['-c:v', 'copy', ...h264BsfArgs],
+        audioArgs: ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'],
+      };
+    }
+
+    // Tier 3 — encoder args injected later by caller from this._encoderArgs().
+    return {
+      strategy: 'transcode',
+      audioArgs: ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'],
+      hevcSource: isHevc,
+    };
   }
 
   // Detect the fastest available H.264 encoder by probing ffmpeg with a tiny null test.
@@ -2607,36 +2758,166 @@ class StreamManager extends EventEmitter {
   async startStreamingServer(videoFile, callback, subtitlePath = null) {
     const port = 8000;
     const videoExt = path.extname(videoFile.name).toLowerCase();
+    const containerExt = videoExt.replace(/^\./, '');
 
-    // Probe codec - HEVC/H.265 not supported in browsers, transcode to H.264
-    let needsTranscode = false;
-    const codec = await this.probeVideoCodec(videoFile);
+    // Probe video + audio streams once, decide playback tier from the result.
+    const probe = await this.probeMediaStreams(videoFile);
+    const codec = probe ? probe.vcodec : null;
+    let strategyInfo = this.decidePlaybackStrategy(probe, containerExt);
 
-    // Detect best encoder BEFORE creating the server (must happen at async level)
+    // FFmpeg is required for any non-directplay tier; fall back to directplay if missing.
+    if (strategyInfo.strategy !== 'directplay' && !this.ffmpegPath) {
+      console.log(chalk.yellow('\nNon-MP4 / non-AAC content - install ffmpeg for HLS remux/transcode. Falling back to direct-play.'));
+      strategyInfo = { strategy: 'directplay' };
+    }
+
+    // Detect best H.264 encoder up front for Tier 3 only.
     let selectedEncoder = null;
-    if (codec && (codec === 'hevc' || codec === 'h265')) {
-      needsTranscode = true;
-      if (this.ffmpegPath) {
-        selectedEncoder = await this.detectBestEncoder();
-        this._log(`HEVC detected - will transcode live via ${selectedEncoder ? selectedEncoder.label : 'CPU ultrafast'}.`);
+    if (strategyInfo.strategy === 'transcode') {
+      selectedEncoder = await this.detectBestEncoder();
+      this._log(`Full transcode required (${codec || 'unknown'} → H.264) via ${selectedEncoder ? selectedEncoder.label : 'CPU libx264'}.`);
+    } else if (strategyInfo.strategy === 'remux') {
+      this._log(`Tier 1 remux: ${codec || 'video'}/${probe ? probe.acodec : 'audio'} stream-copy into HLS fMP4 (near-zero CPU).`);
+    } else if (strategyInfo.strategy === 'remux-audio') {
+      this._log(`Tier 2: video stream-copy, audio transcode (${probe && probe.acodec ? probe.acodec : 'audio'} → aac) into HLS fMP4.`);
+    } else {
+      this._log(`Tier 0 direct-play: serving raw ${containerExt || 'file'} via byte-range.`);
+    }
+
+    const useHls = strategyInfo.strategy !== 'directplay';
+    const serveTranscoded = useHls; // legacy alias kept for HTML player flag
+    const needsTranscode = useHls;
+
+    // MIME for raw byte-range `/video.<ext>` path (VLC + direct-play). Always derived
+    // from the source container, never overridden by HLS playback mode.
+    const rawContentType = (
+      { '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.webm': 'video/webm',
+        '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v' }[videoExt] || 'video/mp4'
+    );
+
+    // HLS session state — created on first HLS request, reused thereafter.
+    let hlsState = null;
+    if (useHls) {
+      const sessionDir = path.join(this.tempDir, `hls_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+      try { fs.mkdirSync(sessionDir, { recursive: true }); } catch (e) {}
+      hlsState = {
+        dir: sessionDir,
+        indexPath: path.join(sessionDir, 'index.m3u8'),
+        process: null,
+        starting: false,
+        started: false,
+        startError: null,
+      };
+    }
+
+    const startHlsPipeline = () => {
+      // Start exactly once per session. ffmpeg copy-remuxes the whole file (fast when
+      // it's already downloaded), reaches EOF and exits cleanly — which nulls .process.
+      // Without the `started` latch, the next /hls/ request would respawn ffmpeg from
+      // byte 0, overwriting every segment and rewriting index.m3u8 underneath the
+      // player (hls.js tolerates it; Chromecast catches the playlist mid-rewrite and stops).
+      if (!hlsState || hlsState.started || hlsState.process || hlsState.starting) return;
+      hlsState.starting = true;
+      hlsState.started = true;
+      const { spawn } = require('child_process');
+
+      const HLS_SEGMENT_SECS = 6;
+      // Assume 30 fps as a safe upper bound for GOP sizing. Real fps comes from probe
+      // but defaulting to 30 errs on the side of MORE-frequent keyframes (smaller GOP)
+      // when the source is 24-25 fps; this only costs a tiny bit of bitrate efficiency
+      // and guarantees segments stay within HLS_SEGMENT_SECS.
+      const ASSUMED_FPS = 30;
+      const GOP_FRAMES = HLS_SEGMENT_SECS * ASSUMED_FPS;
+      let videoArgs;
+      let audioArgs;
+      if (strategyInfo.strategy === 'transcode') {
+        // Force a keyframe every HLS_SEGMENT_SECS so HLS segments line up exactly with
+        // GOPs. Without this, the encoder reuses source GOPs (often 10 s+) which makes
+        // ffmpeg produce oversized segments and — worse — leaves later segments without
+        // a leading keyframe, which the Chromecast decoder hates (plays seg0, stops at
+        // seg1).
+        //
+        // Three layers of insurance because each encoder honors different options:
+        //   -g GOP_FRAMES                    universal max-GOP size
+        //   -keyint_min 1                    allow forced keyframes anywhere (libx264 / NVENC)
+        //   -sc_threshold 0                  libx264: no extra keyframes on scene cuts
+        //   -force_key_frames expr:…         demuxer-level keyframe hint
+        //   -forced-idr 1                    NVENC: turn forced keyframes into real IDR frames
+        videoArgs = [
+          ...this._encoderArgs(selectedEncoder),
+          '-g', String(GOP_FRAMES),
+          '-keyint_min', '1',
+          '-sc_threshold', '0',
+          '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_SECS})`,
+          '-forced-idr', '1',
+        ];
+        audioArgs = strategyInfo.audioArgs || ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'];
       } else {
-        console.log(chalk.yellow('\nHEVC video - browser may not play it. Install ffmpeg for auto-transcoding.'));
+        videoArgs = strategyInfo.videoArgs || ['-c:v', 'copy'];
+        audioArgs = strategyInfo.audioArgs || ['-c:a', 'copy'];
       }
-    }
 
-    const serveTranscoded = needsTranscode && this.ffmpegPath;
+      // MPEG-TS segments — Chromecast default receiver (CC1AD845) plays these reliably
+      // across all generations; fMP4 (.m4s) is supported only on newer CAF receivers
+      // and frequently shows the "loading forever" symptom otherwise.
+      //
+      // EVENT playlist (not VOD) — the playlist is GROWING as ffmpeg produces segments.
+      // VOD declares "this is the full list" and Chromecast stops after the last listed
+      // segment if #EXT-X-ENDLIST is missing (which it is until ffmpeg exits). EVENT
+      // explicitly signals "keep polling"; ffmpeg adds #EXT-X-ENDLIST automatically on
+      // clean shutdown so the manifest becomes a valid VOD playlist by then.
+      //
+      // -hls_list_size 0  → never drop old segments (default for VOD/event differs).
+      const ffmpegArgs = [
+        '-i', 'pipe:0',
+        ...videoArgs,
+        ...audioArgs,
+        '-f', 'hls',
+        '-hls_time', '6',
+        '-hls_playlist_type', 'event',
+        '-hls_list_size', '0',
+        '-hls_segment_type', 'mpegts',
+        '-hls_flags', 'independent_segments+temp_file',
+        '-hls_segment_filename', path.join(hlsState.dir, 'seg%05d.ts'),
+        hlsState.indexPath,
+      ];
 
-    if (serveTranscoded) {
-      this._log('HEVC will be transcoded live on-the-fly when you open the player.');
-    }
+      const inputStream = videoFile.createReadStream();
+      const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
+      hlsState.process = ffmpeg;
+      hlsState.starting = false;
+      this.activeStreams.add(ffmpeg);
+      inputStream.pipe(ffmpeg.stdin);
 
-    // Web player URL (may be transcoded for HEVC)
-    const videoUrl = needsTranscode && this.ffmpegPath ? '/video.mp4' : `/video${videoExt}`;
+      inputStream.on('error', () => { try { ffmpeg.kill(); } catch (e) {} });
+      ffmpeg.stdin.on('error', () => { try { inputStream.destroy(); } catch (e) {} });
+      this._log(`HLS pipeline starting: ffmpeg ${ffmpegArgs.slice(0, 20).join(' ')}${ffmpegArgs.length > 20 ? ' …' : ''}`);
+      let stderrTail = '';
+      ffmpeg.stderr.on('data', (d) => {
+        const chunk = d.toString();
+        stderrTail = (stderrTail + chunk).slice(-2000);
+        const line = chunk.trim();
+        if (/error|failed|invalid|cannot|unable/i.test(line)) {
+          this._log(`HLS ffmpeg: ${line.substring(0, 300)}`);
+        }
+      });
+      ffmpeg.on('close', (code) => {
+        this.activeStreams.delete(ffmpeg);
+        hlsState.process = null;
+        if (code !== 0 && code !== null) {
+          hlsState.startError = `ffmpeg exit ${code}`;
+          this._log(`HLS pipeline exited with code ${code}. Last stderr:\n${stderrTail}`);
+        }
+      });
+    };
+
+    // Web player + Cast URL: HLS playlist when remuxing/transcoding, raw file when direct-play.
+    const videoUrl = useHls ? '/hls/index.m3u8' : `/video${videoExt}`;
     // Original file URL for VLC (VLC can play any format, no transcoding needed)
     // Always use the original file extension, even if transcoding is enabled for web
     const originalFileUrl = `/video${videoExt}`;
     const videoName = videoFile.name;
-    const contentType = (needsTranscode && this.ffmpegPath) ? 'video/mp4' : (
+    const contentType = useHls ? 'application/vnd.apple.mpegurl' : (
       { '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.webm': 'video/webm',
         '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v' }[videoExt] || 'video/mp4'
     );
@@ -2703,6 +2984,8 @@ class StreamManager extends EventEmitter {
             label: sub.label || `Subtitle ${index + 1}`,
             source: sub.source || 'unknown',
             ready,
+            // complete === true once extraction finished; clients stop re-fetching this track.
+            complete: sub.complete === true,
           };
         });
         res.end(JSON.stringify({ subtitles: subtitleList, count: subtitleList.length }));
@@ -2771,6 +3054,82 @@ class StreamManager extends EventEmitter {
         return;
       }
 
+      // HLS endpoint family: /hls/index.m3u8, /hls/init.mp4, /hls/segNNNNN.m4s
+      // Spawns one FFmpeg per session on first request, then serves segment files
+      // as they appear on disk. Waits briefly for files that the encoder hasn't
+      // produced yet (FFmpeg writes them sequentially with -hls_flags temp_file).
+      const hlsMatch = req.url.match(/^\/hls\/([A-Za-z0-9_.-]+)(\?.*)?$/);
+      if (hlsMatch) {
+        if (!hlsState) {
+          res.writeHead(404, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+          res.end('HLS pipeline not active for this stream');
+          return;
+        }
+
+        startHlsPipeline();
+
+        const fileName = hlsMatch[1];
+        const resolvedPath = path.join(hlsState.dir, fileName);
+        if (path.relative(hlsState.dir, resolvedPath).startsWith('..')) {
+          res.writeHead(403, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+          res.end('');
+          return;
+        }
+
+        const isPlaylist = fileName.endsWith('.m3u8');
+        const isSegment = fileName.endsWith('.ts');
+        const maxWaitMs = isPlaylist ? 15000 : 60000;
+        const startedWaiting = Date.now();
+
+        const tryServe = () => {
+          if (fs.existsSync(resolvedPath)) {
+            let mime = 'application/octet-stream';
+            if (isPlaylist) mime = 'application/vnd.apple.mpegurl';
+            else if (isSegment) mime = 'video/mp2t';
+            res.writeHead(200, {
+              'Content-Type': mime,
+              'Cache-Control': isPlaylist ? 'no-cache' : 'public, max-age=300',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+              'Access-Control-Allow-Headers': 'Range',
+            });
+            if (req.method === 'HEAD') {
+              res.end();
+              return;
+            }
+            const fileStream = fs.createReadStream(resolvedPath);
+            fileStream.on('error', () => { try { res.end(); } catch (e) {} });
+            fileStream.pipe(res);
+            return;
+          }
+          if (hlsState.startError) {
+            res.writeHead(500, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+            res.end(`HLS pipeline error: ${hlsState.startError}`);
+            return;
+          }
+          if (Date.now() - startedWaiting >= maxWaitMs) {
+            res.writeHead(404, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+            res.end('Segment not ready');
+            return;
+          }
+          setTimeout(tryServe, 200);
+        };
+
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            'Access-Control-Allow-Headers': 'Range',
+            'Access-Control-Max-Age': '86400',
+          });
+          res.end();
+          return;
+        }
+
+        tryServe();
+        return;
+      }
+
       const videoPathMatch = req.url.match(/^\/video\.(\w+)(\?.*)?$/);
       if (!videoPathMatch) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -2781,28 +3140,18 @@ class StreamManager extends EventEmitter {
       // Extract requested video extension
       const requestedExt = videoPathMatch[1].toLowerCase();
 
-      const forceCompatTranscode = /\bcompat=1\b/.test(req.url || '');
-      const isTranscodedRequest = requestedExt === 'mp4' && videoExt !== '.mp4';
-
       // Chromecast receivers send User-Agent containing CrKey; they need Content-Range on the first
       // byte fetch so they know the full size. A plain 200 with a short body looks like the whole file
       // and MP4/Matroska may not have headers in the first 10MB (playback never starts).
       const chromecastReceiverLike = /\bCrKey\b/i.test(String(req.headers['user-agent'] || ''));
 
       if (req.method === 'HEAD') {
-        if ((serveTranscoded && isTranscodedRequest || forceCompatTranscode) && this.ffmpegPath) {
-          res.writeHead(200, {
-            'Content-Type': 'video/mp4',
-            'Access-Control-Allow-Origin': '*',
-          });
-        } else {
-          res.writeHead(200, {
-            'Content-Length': videoFile.length,
-            'Accept-Ranges': 'bytes',
-            'Content-Type': contentType,
-            'Access-Control-Allow-Origin': '*',
-          });
-        }
+        res.writeHead(200, {
+          'Content-Length': videoFile.length,
+          'Accept-Ranges': 'bytes',
+          'Content-Type': rawContentType,
+          'Access-Control-Allow-Origin': '*',
+        });
         res.end();
         return;
       }
@@ -2853,47 +3202,6 @@ class StreamManager extends EventEmitter {
         }
       });
 
-      // HEVC live on-the-fly transcoding: pipe torrent stream → ffmpeg → HTTP (chunked)
-      // Only transcode when:
-      // 1. serveTranscoded is true (HEVC detected)
-      // 2. Requested URL is /video.mp4 (transcoded format)
-      // 3. ffmpeg is available
-      if ((serveTranscoded && isTranscodedRequest || forceCompatTranscode) && this.ffmpegPath) {
-          const { spawn } = require('child_process');
-          const videoArgs = this._encoderArgs(selectedEncoder);
-          const inputStream = videoFile.createReadStream();
-
-          res.writeHead(200, {
-            'Content-Type': 'video/mp4',
-            'Access-Control-Allow-Origin': '*',
-            'Transfer-Encoding': 'chunked',
-          });
-
-          const ffmpeg = spawn(this.ffmpegPath, [
-            '-i', 'pipe:0',
-            ...videoArgs,
-            '-c:a', 'aac', '-b:a', '192k',
-            '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
-            '-f', 'mp4', 'pipe:1',
-          ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
-
-          stream = ffmpeg;
-          this.activeStreams.add(ffmpeg);
-          inputStream.pipe(ffmpeg.stdin);
-          ffmpeg.stdout.pipe(res);
-
-          ffmpeg.stderr.on('data', (d) => {
-            const line = d.toString().trim();
-            if (line.includes('fps=') || line.includes('speed=')) {
-              this._log(`Live transcode: ${line.replace(/\s+/g, ' ')}`);
-            }
-          });
-          ffmpeg.on('close', () => { destroyStream(); });
-          inputStream.on('error', () => { ffmpeg.kill(); destroyStream(); });
-          res.on('close', () => { inputStream.destroy(); ffmpeg.kill(); });
-          return;
-        }
-
       // Without Range: use 200 + Content-Length matching the body (first chunk only).
       // Browsers/VLC expect 200 for a plain GET; 206 without a client Range breaks many stacks.
       // Chromecast still gets an honest length (no "wait for full file" hang).
@@ -2937,14 +3245,14 @@ class StreamManager extends EventEmitter {
           'Content-Range': `bytes ${start}-${end}/${videoFile.length}`,
           'Accept-Ranges': 'bytes',
           'Content-Length': chunksize,
-          'Content-Type': contentType,
+          'Content-Type': rawContentType,
           'Access-Control-Allow-Origin': '*',
         });
       } else {
         res.writeHead(200, {
           'Content-Length': chunksize,
           'Accept-Ranges': 'bytes',
-          'Content-Type': contentType,
+          'Content-Type': rawContentType,
           'Access-Control-Allow-Origin': '*',
         });
       }
@@ -2989,6 +3297,8 @@ class StreamManager extends EventEmitter {
         videoFormat: {
           container: (videoExt || '').replace(/^\./, '') || 'unknown',
           codec: codec || null,
+          acodec: probe && probe.acodec ? probe.acodec : null,
+          playbackStrategy: strategyInfo.strategy,
         },
       });
     });
@@ -3024,6 +3334,7 @@ class StreamManager extends EventEmitter {
         language,
         label: sub.label || `Subtitle ${index + 1}`,
         source: sub.source || 'unknown',
+        url: `/subtitle_${index}.vtt`,
       };
     });
 
@@ -3031,16 +3342,23 @@ class StreamManager extends EventEmitter {
       return `<track kind="subtitles" src="/subtitle_${track.index}.vtt" srclang="${esc(track.language)}" label="${esc(track.label)}" ${index === 0 ? 'default' : ''}>`;
     }).join('\n');
 
-    const compatFallbackUrl = this.ffmpegPath && videoUrl !== '/video.mp4'
-      ? '/video.mp4?compat=1'
-      : null;
+    // With HLS in play, the manifest IS the streaming source — no separate compat fallback.
+    const isHlsSource = /\.m3u8(\?|$)/.test(String(videoUrl || ''));
+    const compatFallbackUrl = null;
 
     const config = JSON.stringify({
       transcoding: !!transcoding,
       compatFallbackUrl,
+      isHlsSource,
+      videoUrl,
       subtitleCount: normalizedTracks.length,
       subtitleTracks: normalizedTracks,
+      subtitleManifestUrl: '/api/subtitles',
     });
+
+    const hlsScriptTag = isHlsSource
+      ? '<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js" crossorigin="anonymous"></script>'
+      : '';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -3053,7 +3371,7 @@ class StreamManager extends EventEmitter {
 <body>
   <div class="player-shell">
     <div class="video-wrap">
-      <video id="videoPlayer" controls preload="metadata" playsinline>
+      <video id="videoPlayer" controls preload="auto" playsinline>
         <source src="${esc(videoUrl)}" ${htmlVideoType}>
         ${trackTags}
       </video>
@@ -3108,6 +3426,7 @@ class StreamManager extends EventEmitter {
     </div>
   </div>
   <script>window.__UPLAYER_PLAYER_CONFIG__ = ${config};</script>
+  ${hlsScriptTag}
   <script src="/player.js"></script>
 </body>
 </html>`;
