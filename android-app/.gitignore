@@ -1,0 +1,20 @@
+# Android Studio / Gradle
+.gradle/
+build/
+.cxx/
+.kotlin/
+local.properties
+*.iml
+.idea/
+captures/
+
+# Generated/bundled Node app (produced by scripts/build-android-assets.js)
+app/src/main/assets/nodejs-project/
+
+# User-supplied native binaries (large; fetched per BUILD.md)
+app/src/main/jniLibs/
+app/src/main/cpp/nodejs-mobile/
+
+# Keystores / signing
+*.jks
+*.keystore

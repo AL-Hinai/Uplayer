@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Uplayer</string>
+    <string name="starting">Starting Uplayer…</string>
+    <string name="node_channel_name">Uplayer streaming</string>
+    <string name="node_notification_title">Uplayer is running</string>
+    <string name="node_notification_text">Streaming engine active</string>
+</resources>

@@ -54,6 +54,23 @@ class SandboxManager {
    * @returns {string} Path to sandboxed directory
    */
   createSandbox() {
+    // Option 0: explicit writable base dir (embedded/Android builds set this).
+    // Bypasses tmpfs/os.tmpdir detection, which targets /tmp, /dev/shm, /data —
+    // none writable on Android, causing EACCES.
+    const overrideBase = process.env.UPLAYER_SANDBOX_DIR;
+    if (overrideBase) {
+      try {
+        const dir = path.join(overrideBase, 'stream-sandbox-' + process.pid + '-' + Date.now());
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        this.tempDir = dir;
+        this.sandboxType = 'override';
+        this.isSandboxed = true;
+        return dir;
+      } catch (e) {
+        console.warn('[sandbox] UPLAYER_SANDBOX_DIR unusable (' + e.message + '); falling back');
+      }
+    }
+
     // Option 1: tmpfs (in-memory, completely isolated, auto-cleaned on reboot)
     if (this.options.useTmpfs && process.platform === 'linux') {
       const tmpfsDir = this.createTmpfsSandbox();
@@ -389,31 +406,22 @@ class SandboxManager {
       this.cleanupTimer = null;
     }
 
-    if (this.tempDir && fs.existsSync(this.tempDir)) {
-      try {
-        // Remove all files in sandbox
-        const files = fs.readdirSync(this.tempDir);
-        for (const file of files) {
-          const filePath = path.join(this.tempDir, file);
-          try {
-            const stat = fs.statSync(filePath);
-            if (stat.isDirectory()) {
-              fs.rmSync(filePath, { recursive: true, force: true });
-            } else {
-              fs.unlinkSync(filePath);
-            }
-          } catch (e) {
-            // Ignore individual file errors
-          }
-        }
-        
-        // Remove sandbox directory itself
-        fs.rmdirSync(this.tempDir);
+    if (!this.tempDir || !fs.existsSync(this.tempDir)) return;
+
+    try {
+      // Remove the whole sandbox (downloaded video + partials) in one shot. maxRetries
+      // rides out the brief window where a child process (ffmpeg) is still releasing its
+      // file handle, so we don't leave the downloaded file behind on a busy teardown.
+      fs.rmSync(this.tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      if (fs.existsSync(this.tempDir)) {
+        console.error(`⚠️  Sandbox still present after cleanup: ${this.tempDir}`);
+      } else {
         console.log(`✅ Cleaned up sandbox: ${this.tempDir}`);
-      } catch (e) {
-        // Ignore cleanup errors (files may be in use)
-        console.error(`⚠️  Could not fully clean up sandbox: ${e.message}`);
       }
+    } catch (e) {
+      // Surface the reason instead of swallowing it — a lingering sandbox means the
+      // downloaded file was not deleted.
+      console.error(`⚠️  Could not clean up sandbox ${this.tempDir}: ${e.message}`);
     }
   }
 

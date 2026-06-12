@@ -1,6 +1,23 @@
 #!/usr/bin/env node
 
-const WebTorrent = require('webtorrent-hybrid').default || require('webtorrent-hybrid');
+// Torrent engine loader.
+//   - Desktop: webtorrent-hybrid (adds native WebRTC peer support via wrtc).
+//   - Android / embedded (nodejs-mobile): wrtc has no ARM build, so fall back to
+//     plain webtorrent (TCP/uTP/DHT peers — what movie torrents actually use).
+// Force with UPLAYER_TORRENT_ENGINE=webtorrent to skip the hybrid attempt.
+const WebTorrent = (function loadWebTorrent() {
+  const resolve = (mod) => (mod && mod.default ? mod.default : mod);
+  const engine = String(process.env.UPLAYER_TORRENT_ENGINE || '').toLowerCase();
+  if (engine === 'webtorrent' || engine === 'plain') {
+    return resolve(require('webtorrent'));
+  }
+  try {
+    return resolve(require('webtorrent-hybrid'));
+  } catch (err) {
+    console.warn(`[uplayer] webtorrent-hybrid unavailable (${err.message}); using plain webtorrent`);
+    return resolve(require('webtorrent'));
+  }
+})();
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { program } = require('commander');
@@ -1740,7 +1757,11 @@ class StreamManager extends EventEmitter {
       const lines = String(text).split('\n');
       for (const line of lines) {
         const trimmed = line.trimEnd();
-        if (trimmed) this.emit('line', { text: trimmed });
+        if (trimmed) {
+          this.emit('line', { text: trimmed });
+          // Mirror to the embedded-build log sink (Android) for crash diagnosis.
+          if (typeof global.__uplayerTee === 'function') global.__uplayerTee(trimmed);
+        }
       }
     } else {
       // In CLI mode: write directly to stdout as before
@@ -1752,6 +1773,14 @@ class StreamManager extends EventEmitter {
     const { spawnSync } = require('child_process');
     const fs = require('fs');
     const path = require('path');
+
+    // Explicit override for embedded builds (Android nodejs-mobile ships ffmpeg/
+    // ffprobe as extracted native libs). Honored before any PATH lookup.
+    const overrideEnv = binaryName === 'ffprobe' ? 'UPLAYER_FFPROBE_PATH' : 'UPLAYER_FFMPEG_PATH';
+    const overridePath = process.env[overrideEnv];
+    if (overridePath && fs.existsSync(overridePath)) {
+      return overridePath;
+    }
 
     const lookupCommands = [];
     if (process.platform === 'win32') {
@@ -2286,7 +2315,10 @@ class StreamManager extends EventEmitter {
         }
       }, 5000);
 
-      client.add(enhancedMagnet, async (torrent) => {
+      // Store torrent data in our sandbox dir. WebTorrent otherwise defaults to
+      // /tmp/webtorrent (it picks /tmp whenever it merely *exists*), which is not
+      // writable on Android -> EACCES. An explicit path bypasses that default.
+      client.add(enhancedMagnet, { path: this.tempDir }, async (torrent) => {
         clearPendingSetup();
         if (settled) return;
 
@@ -3480,10 +3512,24 @@ class StreamManager extends EventEmitter {
       this._cancelPendingStream = null;
     }
     
-    // Clean up all active streams
-    this.activeStreams.forEach(stream => {
-      if (stream && !stream.destroyed) {
-        stream.destroy();
+    // Kill the background transcode child if running — it holds the sandbox video
+    // file open, which would block the sandbox cleanup below.
+    if (this._transcodeProc) {
+      try { this._transcodeProc.kill('SIGKILL'); } catch (e) { /* ignore */ }
+      this._transcodeProc = null;
+    }
+
+    // Clean up all active streams / child processes. ffmpeg children are tracked here
+    // too — they expose .kill(), not .destroy(); killing them releases the file handles.
+    this.activeStreams.forEach(entry => {
+      try {
+        if (entry && typeof entry.kill === 'function') {
+          entry.kill('SIGKILL');
+        } else if (entry && !entry.destroyed) {
+          entry.destroy();
+        }
+      } catch (e) {
+        // Ignore individual teardown failures
       }
     });
     this.activeStreams.clear();
@@ -3499,7 +3545,11 @@ class StreamManager extends EventEmitter {
 
     if (this.currentTorrent && this.client) {
       try {
-        this.client.remove(this.currentTorrent);
+        // destroyStore: have WebTorrent delete its own downloaded files, and await it
+        // so handles are released before we wipe the sandbox dir.
+        await new Promise((resolve) => {
+          this.client.remove(this.currentTorrent, { destroyStore: true }, () => resolve());
+        });
       } catch (e) {
         // Ignore torrent removal failures during teardown
       }

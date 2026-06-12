@@ -1844,6 +1844,24 @@ async function resolveActivePlayerUrl(fallbackUrl) {
 
 function openActivePlayer(event, fallbackUrl) {
   if (event) event.preventDefault();
+
+  // Android app: the embedded WebView has no multi-window support, so window.open
+  // ('_blank') yields a blank white page. Navigate the current view to the player
+  // instead — the hardware back button (MainActivity) returns to the app shell.
+  if (nativeCastBridge() || nativePlayerBridge()) {
+    resolveActivePlayerUrl(fallbackUrl).then((url) => {
+      if (url) {
+        window.location.assign(url);
+        return;
+      }
+      if (state.currentPage !== 'stream') navigate('/stream');
+      toast('Player is still starting', 'info');
+    }).catch(() => {
+      toast('Could not open the active player', 'error');
+    });
+    return false;
+  }
+
   let popup = null;
   try {
     popup = window.open('', '_blank');
@@ -1874,6 +1892,10 @@ function openActivePlayer(event, fallbackUrl) {
 
 function openActiveVlc(event, fallbackSessionId) {
   if (event) event.preventDefault();
+  // Android app: open the stream in an external player via intent, not server-side VLC.
+  if (nativePlayerBridge()) {
+    return openInNativePlayer();
+  }
   const sessionId = fallbackSessionId || wizard.sessionId || null;
   fetchJson('/api/stream/open-vlc', {
     method: 'POST',
@@ -1905,6 +1927,123 @@ function isCastSenderOriginAllowed(locationLike = window.location) {
     || hostname === '127.0.0.1'
     || hostname === '::1'
     || hostname === '[::1]';
+}
+
+// --- Native (Android APK) host bridges -------------------------------------
+// When Uplayer runs embedded in the Android app (nodejs-mobile + WebView), the
+// native host injects window.AndroidCast / window.AndroidPlayer. The web Google
+// Cast Sender SDK cannot run inside an Android WebView, so casting and external
+// playback are delegated to these native interfaces instead. On desktop both
+// bridges are absent, so every fork below is inert and the web paths run as-is.
+function nativeCastBridge() {
+  return (typeof window !== 'undefined' && window.AndroidCast) || null;
+}
+function nativePlayerBridge() {
+  return (typeof window !== 'undefined' && window.AndroidPlayer) || null;
+}
+function isNativeCastAvailable() {
+  const bridge = nativeCastBridge();
+  if (!bridge) return false;
+  try {
+    return typeof bridge.isAvailable === 'function' ? !!bridge.isAvailable() : true;
+  } catch (e) {
+    return true;
+  }
+}
+// Cast UI is allowed when the native bridge is present (Android app) OR the page
+// origin can host the web Cast SDK (desktop Chrome/Edge on https/localhost).
+function isCastSenderAllowed(locationLike = window.location) {
+  return isNativeCastAvailable() || isCastSenderOriginAllowed(locationLike);
+}
+
+// Route a ready stream to the TV through the native Google Cast SDK.
+function startNativeCast() {
+  const bridge = nativeCastBridge();
+  if (!bridge) return false;
+  const meta = castTvState.meta || normalizeActiveStreamMeta();
+  if (!meta || !meta.castUrl) {
+    toast('Cast stream is not ready yet', 'info');
+    return false;
+  }
+  const draft = buildCastMediaDraft(
+    meta,
+    castTvState.subtitleOptions || [],
+    castTvState.selectedSubtitleTrackId,
+    wizard.titleText
+  );
+  let subtitleUrl = '';
+  let subtitleLang = '';
+  if (draft.tracks.length > 0) {
+    const activeId = draft.activeTrackIds[0];
+    const picked = draft.tracks.find((t) => t.trackId === activeId) || draft.tracks[0];
+    if (picked) {
+      subtitleUrl = picked.trackContentId || '';
+      subtitleLang = picked.language || '';
+    }
+  }
+  const payload = {
+    url: draft.contentId,
+    contentType: draft.contentType,
+    title: draft.metadata.title,
+    subtitleUrl,
+    subtitleLang,
+  };
+  try {
+    bridge.cast(JSON.stringify(payload));
+    castTvState.isCasting = true;
+    castTvState.castDeviceName = 'TV';
+    // Remember what we cast so the native poller can re-push the subtitle as it extracts.
+    castTvState.castMeta = meta;
+    castTvState.castTitle = wizard.titleText;
+    // Seed reload progress from the selected track's current state so the poller only
+    // re-pushes on a genuine advance (first content -> stage 1, fully extracted -> 2).
+    const selInit = String(castTvState.selectedSubtitleTrackId || '');
+    const pickedInit = selInit
+      ? (castTvState.subtitleOptions || []).find((t) => String(t.trackId) === selInit)
+      : null;
+    if (pickedInit && pickedInit.ready) {
+      castTvState.subtitleReloadKey = selInit;
+      castTvState.subtitleReloadStage = pickedInit.complete ? 2 : 1;
+    } else {
+      castTvState.subtitleReloadKey = null;
+      castTvState.subtitleReloadStage = 0;
+    }
+    startNativeCastStatusUpdates();
+    toast('Casting to TV…', 'success');
+    if (typeof updateCastStatusIndicator === 'function') updateCastStatusIndicator();
+  } catch (error) {
+    toast(`Could not start casting: ${error && error.message ? error.message : error}`, 'error', 5000);
+  }
+  return false;
+}
+
+// Hand the active stream to an external Android player (VLC/MX/etc.) via intent.
+function openInNativePlayer() {
+  const bridge = nativePlayerBridge();
+  if (!bridge) return false;
+  const meta = castTvState.meta || normalizeActiveStreamMeta({
+    sessionId: wizard.sessionId,
+    playerUrl: wizard.playerUrl,
+    vlcUrl: wizard.vlcUrl,
+    castUrl: wizard.castUrl,
+  });
+  const url = meta.vlcUrl || meta.castUrl || meta.playerUrl;
+  if (!url) {
+    toast('Stream is still starting', 'info');
+    return false;
+  }
+  const payload = {
+    url,
+    contentType: guessVideoContentType(url),
+    title: wizard.titleText || 'Uplayer',
+  };
+  try {
+    bridge.open(JSON.stringify(payload));
+    toast('Opening in player…', 'success');
+  } catch (e) {
+    toast('No external player available', 'error');
+  }
+  return false;
 }
 
 function buildLocalhostSenderUrl(locationLike = window.location) {
@@ -2570,7 +2709,7 @@ async function populateCastTvModal(meta) {
   if (!content) return;
 
   const normalized = normalizeActiveStreamMeta(meta);
-  const senderAllowed = isCastSenderOriginAllowed();
+  const senderAllowed = isCastSenderAllowed();
   const senderHelperUrl = senderAllowed ? '' : buildLocalhostSenderUrl();
   let subtitleOptions = [];
 
@@ -2639,7 +2778,21 @@ async function populateCastTvModal(meta) {
     })();
   }
 
-  if (senderAllowed) {
+  if (nativeCastBridge()) {
+    // Native host owns Cast discovery/loading — no web sender SDK to initialize.
+    castTvState.castSdkReady = true;
+    renderState();
+    if (castTvState.pendingAutoStartCast && castTvState.meta && castTvState.meta.castUrl) {
+      castTvState.pendingAutoStartCast = false;
+      queueMicrotask(() => {
+        try {
+          startNativeCast();
+        } catch (e) {
+          /* ignore */
+        }
+      });
+    }
+  } else if (senderAllowed) {
     try {
       await ensureGoogleCastContext();
       castTvState.castSdkReady = true;
@@ -2682,7 +2835,7 @@ function openCastFromNav(event) {
     return openCastTvModal(event, {});
   }
   castTvState.meta = snapshot;
-  castTvState.senderAllowed = isCastSenderOriginAllowed();
+  castTvState.senderAllowed = isCastSenderAllowed();
   if (!castTvState.senderAllowed) {
     return openCastTvModal(event, {});
   }
@@ -2694,6 +2847,11 @@ function openCastFromNav(event) {
 }
 
 function maybePreloadCastSenderSdk() {
+  if (nativeCastBridge()) {
+    // Native Cast SDK is ready without any web sender preload.
+    castTvState.castSdkReady = true;
+    return;
+  }
   if (!isCastSenderOriginAllowed()) return;
   if (!wizard.castUrl) return;
   ensureGoogleCastContext().then(() => {
@@ -2772,6 +2930,10 @@ function attachChromecastReceiverErrorHandler(session, onPlaybackError) {
 
 function startChromecastCast(event) {
   if (event) event.preventDefault();
+  // Android app: delegate to the native Cast SDK (web sender SDK can't run here).
+  if (nativeCastBridge()) {
+    return startNativeCast();
+  }
   if (!castTvState.senderAllowed) {
     toast('Open Uplayer on localhost in Chrome or Edge to use Chromecast', 'info', 5000);
     return false;
@@ -2919,6 +3081,7 @@ function handleCastSessionEnd() {
   clearCastSessionState();
   updateCastStatusIndicator();
   stopCastStatusUpdates();
+  stopNativeCastStatusUpdates();
 }
 
 function stopChromecastCast(event) {
@@ -3287,16 +3450,8 @@ function renderWizardStep1(panel) {
       </div>
       <div class="wizard-nav">
         <span class="text-muted" style="font-size:.8rem" id="epSelection">
-          ${wizard.selectedSeason && wizard.selectedEpisode
-            ? `Selected: S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`
-            : 'Select an episode to enable torrent search'}
+          Tap an episode to search torrents
         </span>
-        <div class="wizard-nav-right">
-          <button class="btn btn-primary" onclick="wizardStep1Next()" id="step1Next"
-            ${wizard.selectedEpisode ? '' : 'disabled'}>
-            Search Torrents
-          </button>
-        </div>
       </div>
     </div>`;
 
@@ -3356,14 +3511,12 @@ function wizardSelectEpisode(n) {
   document.querySelectorAll('.ep-btn').forEach((b, i) => {
     b.classList.toggle('selected', wizard.episodes[i]?.episode_number === n);
   });
-  const sel = document.getElementById('epSelection');
-  if (sel) sel.textContent = `Selected: S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`;
-  const btn = document.getElementById('step1Next');
-  if (btn) btn.disabled = false;
   // Update wizard title
   const h1 = document.querySelector('.wizard-title');
   if (h1) h1.textContent = `${wizard.titleText} - S${String(wizard.selectedSeason).padStart(2,'0')}E${String(wizard.selectedEpisode).padStart(2,'0')}`;
   persistWizardState();
+  // Tap-to-advance: selecting an episode immediately moves to torrent search.
+  wizardStep1Next();
 }
 
 function wizardStep1Next() {
@@ -3397,10 +3550,6 @@ function renderWizardStep2(panel) {
         ${wizard.type === 'tv' ? `<button class="btn btn-outline btn-sm" onclick="wizardGoStep(1)">Back</button>` : `<button class="btn btn-outline btn-sm" onclick="history.back()">Back</button>`}
         <div class="wizard-nav-right">
           <button class="btn btn-outline btn-sm" onclick="wizardSearchTorrents()">Search Again</button>
-          <button class="btn btn-primary" onclick="wizardStep2Next()" id="step2Next"
-            ${wizard.selectedTorrent ? '' : 'disabled'}>
-            Next: Subtitles
-          </button>
         </div>
       </div>
     </div>`;
@@ -3552,15 +3701,15 @@ function wizardSelectTorrent(idx) {
   // Re-render list to update selection
   const listEl = document.getElementById('torrentList');
   if (listEl) listEl.innerHTML = renderTorrentItems();
-  const btn = document.getElementById('step2Next');
-  if (btn) btn.disabled = false;
+  // Tap-to-advance: selecting a torrent resolves the magnet and moves on.
+  wizardStep2Next();
 }
 
 async function wizardStep2Next() {
   if (!wizard.selectedTorrent) return;
   // Resolve magnet
-  const btn = document.getElementById('step2Next');
-  if (btn) { btn.disabled = true; btn.textContent = 'Resolving...'; }
+  const status = document.getElementById('torrentSearchStatus');
+  if (status) status.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Resolving magnet…';
 
   try {
     const data = await fetch('/api/torrents/magnet', {
@@ -3576,7 +3725,8 @@ async function wizardStep2Next() {
     renderWizardUI();
   } catch (e) {
     toast(`Failed to resolve magnet: ${e.message}`, 'error', 5000);
-    if (btn) { btn.disabled = false; btn.textContent = 'Next: Subtitles'; }
+    const status = document.getElementById('torrentSearchStatus');
+    if (status) status.innerHTML = `<span style="color:var(--red)">Couldn't open that torrent — pick another.</span>`;
   }
 }
 
@@ -3605,11 +3755,7 @@ function renderWizardStep3(panel) {
       <div class="wizard-nav">
         <button class="btn btn-outline btn-sm" onclick="wizardGoStep(2)">Back</button>
         <div class="wizard-nav-right">
-          <button class="btn btn-outline" onclick="wizardSkipSubtitles()">Skip Subtitles</button>
-          <button class="btn btn-primary" onclick="wizardStep3Next()" id="step3Next"
-            ${wizard.selectedSubtitle ? '' : 'disabled'}>
-            Start Streaming
-          </button>
+          <button class="btn btn-primary" onclick="wizardSkipSubtitles()">Skip &amp; Stream &rarr;</button>
         </div>
       </div>
     </div>`;
@@ -3679,8 +3825,8 @@ function wizardSelectSubtitle(idx) {
   persistWizardState();
   const listEl = document.getElementById('subtitleList');
   if (listEl) listEl.innerHTML = renderSubtitleItems();
-  const btn = document.getElementById('step3Next');
-  if (btn) btn.disabled = false;
+  // Tap-to-advance: download the chosen subtitle and start streaming.
+  wizardStep3Next();
 }
 
 function wizardSkipSubtitles() {
@@ -3696,8 +3842,8 @@ function wizardSkipSubtitles() {
 
 async function wizardStep3Next() {
   if (!wizard.selectedSubtitle) return;
-  const btn = document.getElementById('step3Next');
-  if (btn) { btn.disabled = true; btn.textContent = 'Downloading subtitle...'; }
+  const status = document.getElementById('subStatus');
+  if (status) status.innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px;display:inline-block;vertical-align:middle"></div> Downloading subtitle…';
 
   try {
     const data = await fetchJson('/api/subtitles/download', {
@@ -3716,7 +3862,8 @@ async function wizardStep3Next() {
     setTimeout(() => wizardStartStream(), 100);
   } catch (e) {
     toast(`Subtitle download failed: ${e.message}`, 'error', 5000);
-    if (btn) { btn.disabled = false; btn.textContent = 'Start Streaming'; }
+    const status = document.getElementById('subStatus');
+    if (status) status.innerHTML = `<span style="color:var(--red)">Download failed — pick another or skip.</span>`;
   }
 }
 
@@ -4193,6 +4340,82 @@ async function maybeReloadCastForSubtitleProgress() {
     // transient — a later tick will retry
   } finally {
     castSubtitleReloadInFlight = false;
+  }
+}
+
+let nativeCastSubtitleReloadInFlight = false;
+let nativeCastStatusInterval = null;
+
+// Mobile (native Cast bridge) equivalent of maybeReloadCastForSubtitleProgress. The
+// web sender path above can't run in the Android WebView, so we drive the native
+// bridge instead: as embedded subs keep extracting we re-push the updated, cache-busted
+// subtitle to the bridge, which reloads the media at the current TV position. Bounded to
+// two pushes — stage 1 (first content) and stage 2 (fully extracted).
+async function maybeReloadNativeCastForSubtitleProgress() {
+  if (nativeCastSubtitleReloadInFlight) return;
+  const bridge = nativeCastBridge();
+  if (!bridge || typeof bridge.updateSubtitle !== 'function') return;
+  if (!castTvState.isCasting) return;
+
+  const sel = String(castTvState.selectedSubtitleTrackId || '');
+  if (!sel) return;
+
+  const meta = castTvState.castMeta;
+  if (!meta || !meta.subtitleManifestUrl) return;
+
+  nativeCastSubtitleReloadInFlight = true;
+  try {
+    const options = await loadCastSubtitleOptions(meta.subtitleManifestUrl, meta);
+    castTvState.subtitleOptions = options;
+
+    const picked = options.find((t) => String(t.trackId) === sel);
+    if (!picked || !picked.ready) return; // no usable content yet
+
+    const desiredStage = picked.complete ? 2 : 1;
+    const doneStage = castTvState.subtitleReloadKey === sel ? (castTvState.subtitleReloadStage || 0) : 0;
+    if (doneStage >= desiredStage) return; // already pushed at this stage or beyond
+
+    const draft = buildCastMediaDraft(meta, options, sel, castTvState.castTitle);
+    let subtitleUrl = '';
+    let subtitleLang = '';
+    if (draft.tracks.length > 0) {
+      const activeId = draft.activeTrackIds[0];
+      const track = draft.tracks.find((t) => t.trackId === activeId) || draft.tracks[0];
+      if (track) {
+        subtitleUrl = track.trackContentId || '';
+        subtitleLang = track.language || '';
+      }
+    }
+    if (!subtitleUrl) return;
+
+    bridge.updateSubtitle(JSON.stringify({
+      url: draft.contentId,
+      contentType: draft.contentType,
+      title: draft.metadata.title,
+      subtitleUrl,
+      subtitleLang,
+    }));
+    castTvState.subtitleReloadKey = sel;
+    castTvState.subtitleReloadStage = desiredStage;
+  } catch (e) {
+    // transient — a later tick will retry
+  } finally {
+    nativeCastSubtitleReloadInFlight = false;
+  }
+}
+
+function startNativeCastStatusUpdates() {
+  stopNativeCastStatusUpdates();
+  nativeCastStatusInterval = setInterval(() => {
+    if (!castTvState.isCasting) return;
+    maybeReloadNativeCastForSubtitleProgress();
+  }, 2000);
+}
+
+function stopNativeCastStatusUpdates() {
+  if (nativeCastStatusInterval) {
+    clearInterval(nativeCastStatusInterval);
+    nativeCastStatusInterval = null;
   }
 }
 

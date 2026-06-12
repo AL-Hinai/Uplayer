@@ -36,6 +36,13 @@ Deprecated compatibility flags (accepted as no-op):
 - `--low-memory`
 - `--no-subtitles`
 
+## Android (standalone APK)
+
+A native Android app that runs the whole stack **on the phone** (on-device
+torrenting + transcoding, serves the LAN URL, opens an external player, and casts
+to a TV via the native Google Cast SDK) lives in [`android-app/`](android-app/).
+Build it with Android Studio — see [android-app/BUILD.md](android-app/BUILD.md).
+
 ## Runtime Behavior
 
 - Single visible player mode: native JS player.

@@ -1,6 +1,6 @@
 {
   "name": "uplayer",
-  "version": "0.15.0",
+  "version": "0.17.0",
   "description": "Uplayer - Simple CLI torrent player. Just search and play movies instantly using WebTorrent",
   "main": "uplayer.js",
   "bin": {
@@ -29,7 +29,11 @@
     "build:win": "pkg . --targets node18-win-x64 --out-path dist",
     "build:macos": "pkg . --targets node18-macos-x64 --out-path dist",
     "install:bun": "bun install",
-    "install:npm": "npm install"
+    "install:npm": "npm install",
+    "build:android-assets": "node scripts/build-android-assets.js",
+    "setup:android-libs": "node scripts/setup-android-libs.js restore",
+    "setup:android-libs:save": "node scripts/setup-android-libs.js save",
+    "setup:android-libs:check": "node scripts/setup-android-libs.js check"
   },
   "keywords": [
     "webtorrent",
@@ -53,6 +57,7 @@
     "open": "^8.4.2",
     "opensubtitles.com": "^1.1.0",
     "tmdb-js-node": "^1.3.2",
+    "webtorrent": "^1.9.7",
     "webtorrent-hybrid": "^5.0.2"
   },
   "devDependencies": {

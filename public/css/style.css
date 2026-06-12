@@ -1928,6 +1928,36 @@ img { display: block; max-width: 100%; }
   box-shadow: inset 0 0 0 3px var(--bg-3);
 }
 
+/* ─── Phone refinements for the streaming wizard ─────────────────────────────
+   On narrow screens the torrent row is a single horizontal flex line, so the
+   seeds/leech/size meta gets clipped. Let rows wrap: name on line 1, meta on
+   line 2. Also tighten wizard padding and collapse step labels to the active
+   one so the step bar doesn't need horizontal scrolling. */
+@media (max-width: 640px) {
+  /* Extra bottom space so the nav buttons clear the device's system bar. */
+  .wizard-page { padding: 1rem 1rem 2.5rem; }
+  .wizard-title { font-size: 1.2rem; }
+
+  /* Shorter lists leave room for the bottom nav without deep scrolling. */
+  .torrent-list, .subtitle-list { max-height: 46vh; }
+
+  .wizard-step-label { display: none; }
+  .wizard-step.active .wizard-step-label { display: inline; }
+  .wizard-step-line { min-width: 12px; margin: 0 0.35rem; }
+
+  .torrent-item { flex-wrap: wrap; row-gap: 0.4rem; gap: 0.6rem; padding: 0.7rem 0.8rem; }
+  .torrent-name { flex: 1 1 0; }
+  .torrent-meta { flex: 1 0 100%; padding-left: calc(16px + 0.6rem); gap: 1.1rem; }
+  .torrent-source { min-width: 56px; font-size: 0.66rem; }
+
+  /* Subtitle rows: same wrap so the download count never clips. */
+  .subtitle-item { flex-wrap: wrap; row-gap: 0.3rem; }
+  .subtitle-downloads { flex-basis: 100%; }
+
+  /* Bigger tap targets for the wizard's primary actions. */
+  .wizard-nav .btn { min-height: 40px; }
+}
+
 /* Subtitle list */
 .subtitle-list {
   display: flex;

@@ -22,6 +22,15 @@ scripts/data/test-results.json
 # /tmp/webtorrent (cleaned automatically)
 # /dev/shm/stream-sandbox-* (RAM-based, auto-cleaned)
 
+# Build artifacts (the debug APK is copied into the repo root by the Android build)
+*.apk
+*.aab
+
+# Note: android-app/ has its own .gitignore covering Gradle/IDE caches, the regenerated
+# bundled Node app (app/src/main/assets/nodejs-project/ — a node_modules copy + .env),
+# the large prebuilt native libs (jniLibs/, nodejs-mobile headers — fetched per
+# android-app/BUILD.md), and keystores.
+
 
 
 

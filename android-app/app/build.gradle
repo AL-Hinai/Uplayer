@@ -1,0 +1,124 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.uplayer.app'
+    compileSdk 34
+    ndkVersion "26.1.10909125"
+
+    defaultConfig {
+        applicationId "com.uplayer.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.16.0"
+
+        // Ship arm64 only by default (covers virtually all modern phones). Add
+        // 'armeabi-v7a' / 'x86_64' here AND provide matching libnode.so + ffmpeg
+        // binaries under jniLibs if you need them.
+        ndk { abiFilters 'arm64-v8a' }
+
+        externalNativeBuild {
+            cmake { arguments "-DANDROID_STL=c++_shared" }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    // CRITICAL: legacy packaging keeps native libs uncompressed AND extracted to
+    // the app's nativeLibraryDir, which is the only directory Android lets us
+    // exec from. ffmpeg/ffprobe ship as libffmpeg.so / libffprobe.so and rely on this.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    androidResources {
+        // Default aapt ignore pattern MINUS the ".*" token, so dotfiles in assets
+        // (.env with API keys, .bundle-version) are actually packaged. aapt ignores
+        // dotfiles by default, which silently dropped our .env.
+        ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:<dir>_*:!CVS:!thumbs.db:!picasa.ini:!*~'
+    }
+
+    buildFeatures {
+        viewBinding true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+// --- Keep the APK's bundled Node app in sync with the shared desktop core ---------
+// The desktop (Windows/macOS/Linux) build and this APK share ONE source tree at the
+// repo root (server.js, uplayer.js, sandbox.js, core/, public/, .env). This task
+// re-copies that shared core into the APK assets BEFORE packaging, so simply
+// rebuilding the APK always picks up the latest desktop changes — no separate manual
+// `npm run build:android-assets` step. Skip with -PskipNodeBundle (e.g. if Node isn't
+// installed in the build environment and the bundle is already up to date).
+def repoRoot = rootProject.projectDir.parentFile
+def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
+tasks.register('bundleNodeAssets', Exec) {
+    group = 'build'
+    description = 'Bundle the shared Node core (repo root) into the APK assets.'
+    workingDir repoRoot
+    def bundleScript = new File(repoRoot, 'scripts/build-android-assets.js').absolutePath
+    if (isWindows) {
+        commandLine 'cmd', '/c', 'node', bundleScript
+    } else {
+        commandLine 'node', bundleScript
+    }
+}
+// The large native libs (libnode.so, libffmpeg.so, libffprobe.so + nodejs-mobile
+// headers) are gitignored, so a fresh clone lacks them. This restores them from the
+// local cache (seeded via `npm run setup:android-libs:save`) before the native build,
+// failing fast with guidance if they're absent. Skip with -PskipNodeLibs.
+tasks.register('ensureNodeLibs', Exec) {
+    group = 'build'
+    description = 'Ensure Android native libs (libnode/ffmpeg/ffprobe + headers) are present; restores from cache.'
+    workingDir repoRoot
+    def setupScript = new File(repoRoot, 'scripts/setup-android-libs.js').absolutePath
+    if (isWindows) {
+        commandLine 'cmd', '/c', 'node', setupScript, 'restore'
+    } else {
+        commandLine 'node', setupScript, 'restore'
+    }
+}
+tasks.named('preBuild').configure {
+    if (!project.hasProperty('skipNodeBundle')) {
+        dependsOn 'bundleNodeAssets'
+    }
+    if (!project.hasProperty('skipNodeLibs')) {
+        dependsOn 'ensureNodeLibs'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.webkit:webkit:1.11.0'
+
+    // Google Cast (Chromecast) — the native sender SDK that replaces the
+    // browser-only web Cast SDK when Uplayer runs inside this WebView.
+    implementation 'androidx.mediarouter:mediarouter:1.7.0'
+    implementation 'com.google.android.gms:play-services-cast-framework:21.5.0'
+}
