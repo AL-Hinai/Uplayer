@@ -127,13 +127,20 @@ These are accepted but no-op in CLI:
 ## Tests
 
 ```bash
-npm run test:core
+npm test                 # the whole suite
+npm run test:core        # or any single test:<slug>
 npm run test:api-contract
 npm run test:lifecycle
-npm run test:stream-speed
 ```
 
-`test:stream-speed` requires a valid magnet input (`--magnet` or `UPLAYER_TEST_MAGNET`).
+`npm test` runs `tests/run-all.js`, which globs `tests/*.test.js` — a new test file needs no
+registration. Benchmarks are separate and live in `bench/`:
+
+```bash
+npm run bench:stream-speed
+```
+
+`bench:stream-speed` requires a valid magnet input (`--magnet` or `UPLAYER_TEST_MAGNET`).
 
 ## Chromecast & TV Casting
 

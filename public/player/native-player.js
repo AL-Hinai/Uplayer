@@ -1,737 +1,259 @@
 (function () {
   "use strict";
-
   var cfg = window.__UPLAYER_PLAYER_CONFIG__ || {};
-  var video = document.getElementById("videoPlayer");
-  var subtitleSelect = document.getElementById("subtitleSelect");
-  var subtitleOverlay = document.getElementById("subtitleOverlay");
-  var subtitleAdjustBtn = document.getElementById("subtitleAdjustBtn");
-  var subtitleAdjustPopup = document.getElementById("subtitleAdjustPopup");
-  var closePopupBtn = document.getElementById("closePopupBtn");
-  var subtitlePreview = document.getElementById("subtitlePreview");
-  var offsetValue = document.getElementById("offsetValue");
-  var statusText = document.getElementById("statusText");
-  var retryBtn = document.getElementById("retryBtn");
-  var errorOverlay = document.getElementById("errorOverlay");
-  var errorMessage = document.getElementById("errorMessage");
-  var reloadBtn = document.getElementById("reloadBtn");
-
-  var fallbackTried = false;
-  var selectedSubtitleIndex = null;
-  var subtitleOffset = 0;
-  var subtitlePollId = null;
-  var subtitleManifestPollId = null;
-  var subtitleTrackReady = {};
-  var subtitleTrackComplete = {};
-  var subtitleTrackFinalized = {};
-  var stallRecoveryTimer = null;
-  var lastRecoveryAt = 0;
-  var lastKnownCueCount = -1;
-  var lastPreviewSignature = "";
-  var lastOverlaySignature = "";
-  var lastOverlayRenderAt = 0;
-  var lastPreviewRenderAt = 0;
-
-  function setStatus(text) {
-    if (statusText) statusText.textContent = text;
-  }
-
-  function hideError() {
-    if (errorOverlay) errorOverlay.classList.remove("visible");
-  }
-
-  function showError(text) {
-    if (errorMessage) errorMessage.textContent = text || "Playback failed.";
-    if (errorOverlay) errorOverlay.classList.add("visible");
-  }
-
-  function escapeHtml(value) {
-    return String(value || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
-
-  function formatCueText(value) {
-    return escapeHtml(value).replace(/\r?\n/g, "<br>");
-  }
-
-  function formatTime(seconds) {
-    var total = Number.isFinite(seconds) ? seconds : 0;
-    var sign = total < 0 ? "-" : "";
-    var abs = Math.abs(total);
-    var hours = Math.floor(abs / 3600);
-    var minutes = Math.floor((abs % 3600) / 60);
-    var secs = Math.floor(abs % 60);
-    var millis = Math.floor((abs % 1) * 1000);
-
-    if (hours > 0) {
-      return sign
-        + hours
-        + ":"
-        + String(minutes).padStart(2, "0")
-        + ":"
-        + String(secs).padStart(2, "0")
-        + "."
-        + String(millis).padStart(3, "0");
-    }
-
-    return sign
-      + minutes
-      + ":"
-      + String(secs).padStart(2, "0")
-      + "."
-      + String(millis).padStart(3, "0");
-  }
-
-  function isPopupVisible() {
-    return !!(subtitleAdjustPopup && !subtitleAdjustPopup.hidden);
-  }
-
-  function setPreviewMessage(text) {
-    if (!subtitlePreview) return;
-    var html = '<div class="subtitle-empty">' + escapeHtml(text) + "</div>";
-    if (html !== lastPreviewSignature) {
-      subtitlePreview.innerHTML = html;
-      lastPreviewSignature = html;
-    }
-  }
-
-  function clearSubtitleOverlay() {
-    if (!subtitleOverlay) return;
-    subtitleOverlay.innerHTML = "";
-    subtitleOverlay.classList.remove("visible");
-    lastOverlaySignature = "";
-  }
-
-  function getSubtitleTracks() {
-    if (!video || !video.textTracks) return [];
-    return Array.prototype.slice.call(video.textTracks).filter(function (track) {
-      return track.kind === "subtitles";
-    });
-  }
-
-  function mapTrackName(track, idx) {
-    var meta = Array.isArray(cfg.subtitleTracks) ? cfg.subtitleTracks[idx] : null;
-    var label = track.label || (meta && meta.label) || ("Subtitle " + (idx + 1));
-    var language = track.language || (meta && meta.language) || "";
-
-    if (language && label.toLowerCase().indexOf(language.toLowerCase()) === -1) {
-      return label + " (" + language + ")";
-    }
-
-    return label;
-  }
-
-  function getSelectedTrack() {
-    var tracks = getSubtitleTracks();
-    if (selectedSubtitleIndex === null || selectedSubtitleIndex < 0 || selectedSubtitleIndex >= tracks.length) {
-      return null;
-    }
-    return tracks[selectedSubtitleIndex];
-  }
-
-  function findInitialSubtitleIndex(tracks) {
-    var activeIndex = tracks.findIndex(function (track) {
-      return track.mode === "showing" || track.mode === "hidden";
-    });
-
-    if (activeIndex !== -1) return activeIndex;
-    return tracks.length > 0 ? 0 : -1;
-  }
-
-  function refreshSubtitleControlsVisibility() {
-    var hasTracks = getSubtitleTracks().length > 0;
-    if (subtitleAdjustBtn) subtitleAdjustBtn.hidden = !hasTracks;
-    if (!hasTracks && subtitleAdjustPopup) {
-      subtitleAdjustPopup.hidden = true;
-    }
-  }
-
-  function refreshSubtitleSelect() {
-    if (!subtitleSelect) return;
-
-    var tracks = getSubtitleTracks();
-    subtitleSelect.innerHTML = "";
-
-    var off = document.createElement("option");
-    off.value = "-1";
-    off.textContent = "Subtitles: Off";
-    subtitleSelect.appendChild(off);
-
-    tracks.forEach(function (track, idx) {
-      var opt = document.createElement("option");
-      opt.value = String(idx);
-      opt.textContent = mapTrackName(track, idx);
-      subtitleSelect.appendChild(opt);
-    });
-
-    if (selectedSubtitleIndex === null) {
-      selectedSubtitleIndex = findInitialSubtitleIndex(tracks);
-    } else if (selectedSubtitleIndex >= tracks.length) {
-      selectedSubtitleIndex = tracks.length > 0 ? 0 : -1;
-    }
-
-    subtitleSelect.value = String(selectedSubtitleIndex >= 0 ? selectedSubtitleIndex : -1);
-    refreshSubtitleControlsVisibility();
-  }
-
-  function clearSubtitlePolling() {
-    if (subtitlePollId) {
-      clearInterval(subtitlePollId);
-      subtitlePollId = null;
-    }
-  }
-
-  function syncSelectedTrack() {
-    var track = getSelectedTrack();
-    var cueCount = track && track.cues ? track.cues.length : 0;
-
-    if (cueCount !== lastKnownCueCount) {
-      lastKnownCueCount = cueCount;
-      renderSubtitleOverlay(true);
-      if (isPopupVisible()) renderSubtitlePreview(true);
-    }
-  }
-
-  function startSubtitlePolling() {
-    clearSubtitlePolling();
-    syncSelectedTrack();
-    subtitlePollId = setInterval(syncSelectedTrack, 1500);
-  }
-
-  // Embedded subtitles are extracted on the server while the torrent downloads, so the
-  // .vtt grows over time. The browser only fetches a <track> once, so we rebuild the
-  // active track element with a cache-busting query to pull in newly-extracted cues.
-  function getTrackElements() {
-    if (!video) return [];
-    return Array.prototype.slice.call(video.querySelectorAll("track"));
-  }
-
-  function refreshActiveSubtitleTrack() {
-    if (selectedSubtitleIndex === null || selectedSubtitleIndex < 0) return;
-
-    var trackEls = getTrackElements();
-    var oldEl = trackEls[selectedSubtitleIndex];
-    if (!oldEl) return;
-
-    var meta = Array.isArray(cfg.subtitleTracks) ? cfg.subtitleTracks[selectedSubtitleIndex] : null;
-    var baseUrl = (meta && meta.url) || oldEl.getAttribute("src") || "";
-    if (!baseUrl) return;
-    var cleanUrl = baseUrl.split("?")[0];
-
-    var newEl = document.createElement("track");
-    newEl.kind = "subtitles";
-    newEl.setAttribute("src", cleanUrl + "?t=" + Date.now());
-    var srclang = oldEl.getAttribute("srclang");
-    if (srclang) newEl.setAttribute("srclang", srclang);
-    var label = oldEl.getAttribute("label");
-    if (label) newEl.setAttribute("label", label);
-
-    // Replacing in the same DOM position keeps textTracks ordering stable, so
-    // selectedSubtitleIndex still maps correctly. The addtrack handler re-applies
-    // selection and offset.
-    oldEl.replaceWith(newEl);
-  }
-
-  function pollSubtitleManifest() {
-    var url = cfg.subtitleManifestUrl;
-    if (!url) {
-      stopSubtitleManifestPolling();
-      return;
-    }
-
-    fetch(url, { cache: "no-store" })
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (data) {
-        var subs = (data && Array.isArray(data.subtitles)) ? data.subtitles : [];
-        subs.forEach(function (sub) {
-          if (sub && typeof sub.index === "number") {
-            subtitleTrackReady[sub.index] = sub.ready === true;
-            subtitleTrackComplete[sub.index] = sub.complete === true;
-          }
-        });
-
-        var active = selectedSubtitleIndex;
-        if (active !== null && active >= 0 && subtitleTrackReady[active]) {
-          if (!subtitleTrackComplete[active]) {
-            // Still extracting — pull the latest cues.
-            refreshActiveSubtitleTrack();
-          } else if (!subtitleTrackFinalized[active]) {
-            // Just finished — grab the full file once, then stop refreshing it.
-            subtitleTrackFinalized[active] = true;
-            refreshActiveSubtitleTrack();
-          }
-        }
-
-        var total = Array.isArray(cfg.subtitleTracks) ? cfg.subtitleTracks.length : 0;
-        var everythingComplete = total > 0 && subs.length >= total
-          && subs.every(function (sub) { return sub && sub.complete === true; });
-        var activeSettled = active === null || active < 0 || subtitleTrackFinalized[active];
-        if (total === 0 || (everythingComplete && activeSettled)) {
-          stopSubtitleManifestPolling();
-        }
-      })
-      .catch(function () { /* transient network errors are fine; next tick retries */ });
-  }
-
-  function startSubtitleManifestPolling() {
-    if (subtitleManifestPollId || !cfg.subtitleManifestUrl) return;
-    if (!Array.isArray(cfg.subtitleTracks) || cfg.subtitleTracks.length === 0) return;
-    setTimeout(pollSubtitleManifest, 3000);
-    subtitleManifestPollId = setInterval(pollSubtitleManifest, 9000);
-  }
-
-  function stopSubtitleManifestPolling() {
-    if (subtitleManifestPollId) {
-      clearInterval(subtitleManifestPollId);
-      subtitleManifestPollId = null;
-    }
-  }
-
-  // Buffer-health watcher: torrent throughput can dip below the bitrate and stall the
-  // <video>. If playback is genuinely stuck for a while, reload at the current position
-  // as a last resort. hls.js owns its own recovery, so this only applies to direct files.
-  function cancelStallRecovery() {
-    if (stallRecoveryTimer) {
-      clearTimeout(stallRecoveryTimer);
-      stallRecoveryTimer = null;
-    }
-  }
-
-  function scheduleStallRecovery() {
-    if (!video || cfg.isHlsSource || stallRecoveryTimer) return;
-    stallRecoveryTimer = setTimeout(function () {
-      stallRecoveryTimer = null;
-      if (!video || video.paused || video.ended) return;
-      if (video.readyState >= 3 /* HAVE_FUTURE_DATA */) return; // recovered on its own
-      var now = Date.now();
-      if (now - lastRecoveryAt < 15000) return; // never thrash the stream
-      lastRecoveryAt = now;
-      var pos = video.currentTime;
-      try {
-        var resume = function () {
-          video.removeEventListener("loadedmetadata", resume);
-          try { video.currentTime = pos; } catch (e) { /* ignore */ }
-          video.play().catch(function () { /* ignore autoplay failure */ });
-        };
-        video.addEventListener("loadedmetadata", resume);
-        video.load();
-      } catch (e) { /* ignore */ }
-    }, 8000);
-  }
-
-  function setSubtitleIndex(index) {
-    var tracks = getSubtitleTracks();
-    var nextIndex = Number.isInteger(index) ? index : -1;
-
-    if (nextIndex < 0 || nextIndex >= tracks.length) {
-      nextIndex = -1;
-    }
-
-    selectedSubtitleIndex = nextIndex;
-
-    tracks.forEach(function (track, trackIndex) {
-      track.mode = trackIndex === selectedSubtitleIndex ? "hidden" : "disabled";
-    });
-
-    if (subtitleSelect) {
-      subtitleSelect.value = String(selectedSubtitleIndex >= 0 ? selectedSubtitleIndex : -1);
-    }
-
-    lastKnownCueCount = -1;
-
-    if (selectedSubtitleIndex >= 0) {
-      startSubtitlePolling();
-    } else {
-      clearSubtitlePolling();
-      clearSubtitleOverlay();
-      if (isPopupVisible()) {
-        setPreviewMessage("Select a subtitle track to inspect timing.");
-      }
-    }
-
-    renderSubtitleOverlay(true);
-    if (isPopupVisible()) renderSubtitlePreview(true);
-  }
-
-  function buildActiveCueLines(track, currentTime) {
-    if (!track || !track.cues || track.cues.length === 0) return [];
-
-    var lines = [];
-    for (var i = 0; i < track.cues.length; i += 1) {
-      var cue = track.cues[i];
-      var start = cue.startTime + subtitleOffset;
-      var end = cue.endTime + subtitleOffset;
-
-      if (currentTime < start && lines.length === 0) {
-        break;
-      }
-
-      if (currentTime >= start && currentTime <= end) {
-        lines.push(String(cue.text || ""));
-      }
-    }
-
-    return lines;
-  }
-
-  function renderSubtitleOverlay(force) {
-    if (!video || !subtitleOverlay) return;
-
-    var track = getSelectedTrack();
-    var lines = buildActiveCueLines(track, video.currentTime || 0);
-
-    if (lines.length === 0) {
-      clearSubtitleOverlay();
-      return;
-    }
-
-    var html = lines.map(function (line) {
-      return '<div class="subtitle-overlay-line">' + formatCueText(line) + "</div>";
-    }).join("");
-
-    if (force || html !== lastOverlaySignature) {
-      subtitleOverlay.innerHTML = html;
-      subtitleOverlay.classList.add("visible");
-      lastOverlaySignature = html;
-    }
-  }
-
-  function renderSubtitlePreview(force) {
-    if (!subtitlePreview || !isPopupVisible()) return;
-
-    var track = getSelectedTrack();
-    if (!track) {
-      setPreviewMessage("Select a subtitle track to inspect timing.");
-      return;
-    }
-
-    if (!track.cues || track.cues.length === 0) {
-      setPreviewMessage("Waiting for subtitle cues to load...");
-      return;
-    }
-
-    var currentTime = video ? (video.currentTime || 0) : 0;
-    var timeWindow = 120;
-    var html = "";
-    var activeIndex = -1;
-
-    for (var i = 0; i < track.cues.length; i += 1) {
-      var cue = track.cues[i];
-      var adjustedStart = cue.startTime + subtitleOffset;
-      var adjustedEnd = cue.endTime + subtitleOffset;
-
-      if (currentTime >= adjustedStart && currentTime <= adjustedEnd && activeIndex === -1) {
-        activeIndex = i;
-      }
-
-      if (adjustedStart < currentTime - timeWindow) {
-        continue;
-      }
-
-      if (adjustedStart > currentTime + timeWindow) {
-        break;
-      }
-
-      html += '<div class="subtitle-item'
-        + (i === activeIndex ? " active" : "")
-        + '" data-cue-index="'
-        + i
-        + '"><div class="time">'
-        + escapeHtml(formatTime(adjustedStart) + " -> " + formatTime(adjustedEnd))
-        + '</div><div class="text">'
-        + formatCueText(cue.text || "")
-        + "</div></div>";
-    }
-
-    if (!html) {
-      html = '<div class="subtitle-empty">No subtitles in the current time window.</div>';
-    }
-
-    if (force || html !== lastPreviewSignature) {
-      subtitlePreview.innerHTML = html;
-      lastPreviewSignature = html;
-    }
-
-    if (activeIndex >= 0) {
-      var activeItem = subtitlePreview.querySelector('[data-cue-index="' + activeIndex + '"]');
-      if (activeItem) {
-        activeItem.scrollIntoView({ block: "center", behavior: "smooth" });
-      }
-    }
-  }
-
-  function updateOffsetDisplay() {
-    if (offsetValue) {
-      var sign = subtitleOffset >= 0 ? "+" : "";
-      offsetValue.textContent = sign + subtitleOffset.toFixed(2) + "s";
-    }
-    renderSubtitleOverlay(true);
-    if (isPopupVisible()) renderSubtitlePreview(true);
-  }
-
-  function adjustOffset(delta) {
-    subtitleOffset = Math.round((subtitleOffset + delta) * 100) / 100;
-    updateOffsetDisplay();
-  }
-
-  function toggleSubtitlePopup() {
-    if (!subtitleAdjustPopup || getSubtitleTracks().length === 0) return;
-    subtitleAdjustPopup.hidden = !subtitleAdjustPopup.hidden;
-    if (subtitleAdjustPopup.hidden) {
-      lastPreviewSignature = "";
-    } else {
-      renderSubtitlePreview(true);
-    }
-  }
-
-  function closeSubtitlePopup() {
-    if (!subtitleAdjustPopup) return;
-    subtitleAdjustPopup.hidden = true;
-    lastPreviewSignature = "";
-  }
-
-  function attemptCompatFallback() {
-    if (fallbackTried || !cfg.compatFallbackUrl || !video) return false;
-    fallbackTried = true;
-    setStatus("Applying compatibility fallback...");
-    video.src = cfg.compatFallbackUrl;
-    video.load();
-    video.play().catch(function () { /* ignore autoplay failure */ });
-    return true;
-  }
-
-  if (subtitleSelect) {
-    subtitleSelect.addEventListener("change", function () {
-      var nextIndex = parseInt(subtitleSelect.value, 10);
-      setSubtitleIndex(nextIndex);
-      // A freshly-selected track may have loaded empty/partial earlier; allow the
-      // poller to refresh it again and resume polling if it had stopped.
-      if (Number.isInteger(nextIndex) && nextIndex >= 0) {
-        subtitleTrackFinalized[nextIndex] = false;
-        startSubtitleManifestPolling();
-        pollSubtitleManifest();
-      }
-    });
-  }
-
-  if (subtitleAdjustBtn) {
-    subtitleAdjustBtn.addEventListener("click", toggleSubtitlePopup);
-  }
-
-  if (closePopupBtn) {
-    closePopupBtn.addEventListener("click", closeSubtitlePopup);
-  }
-
-  if (subtitlePreview) {
-    subtitlePreview.addEventListener("click", function (event) {
-      var item = event.target && event.target.closest ? event.target.closest("[data-cue-index]") : null;
-      var track = getSelectedTrack();
-      if (!item || !track || !track.cues) return;
-
-      var cueIndex = parseInt(item.getAttribute("data-cue-index"), 10);
-      if (!Number.isInteger(cueIndex) || cueIndex < 0 || cueIndex >= track.cues.length) return;
-
-      var cue = track.cues[cueIndex];
-      if (!cue || !video) return;
-      video.currentTime = Math.max(0, cue.startTime + subtitleOffset);
-      renderSubtitleOverlay(true);
-      renderSubtitlePreview(true);
-    });
-  }
-
-  [
-    ["subtract1Btn", -1.0],
-    ["subtract0_5Btn", -0.5],
-    ["add0_5Btn", 0.5],
-    ["add1Btn", 1.0],
-    ["subtract0_1Btn", -0.1],
-    ["add0_1Btn", 0.1],
-  ].forEach(function (entry) {
-    var button = document.getElementById(entry[0]);
-    if (button) {
-      button.addEventListener("click", function () {
-        adjustOffset(entry[1]);
-      });
-    }
+  var videoEl = document.getElementById("videoPlayer");
+  if (!videoEl || typeof videojs === "undefined") return;
+
+  // One full-screen Video.js player using its built-in controls (the control bar
+  // already has a subtitles/captions menu, volume, seek, speed and fullscreen).
+  // autoplay is driven by startPlayback() below rather than Video.js, so we can try
+  // to start WITH sound and only fall back to muted if the browser refuses.
+  var player = videojs(videoEl, {
+    controls: true,
+    autoplay: false,
+    preload: "auto",
+    fill: true,
+    playbackRates: [0.5, 1, 1.25, 1.5, 2],
+    html5: { vhs: { overrideNative: !videojs.browser.IS_SAFARI }, nativeAudioTracks: false, nativeVideoTracks: false },
   });
 
-  var resetBtn = document.getElementById("resetBtn");
-  if (resetBtn) {
-    resetBtn.addEventListener("click", function () {
-      subtitleOffset = 0;
-      updateOffsetDisplay();
+  // Start unmuted. Browsers reject autoplay-with-sound until a site has enough user
+  // engagement, so if play() is rejected, retry muted — starting silently beats not
+  // starting at all — and unmuteOnce() below restores sound on the first interaction.
+  function startPlayback() {
+    try { player.muted(false); if (player.volume() < 0.1) player.volume(1); } catch (e) {}
+    var p = player.play();
+    if (p && typeof p.catch === "function") {
+      p.catch(function () {
+        try { player.muted(true); } catch (e) {}
+        var retry = player.play();
+        if (retry && typeof retry.catch === "function") retry.catch(function () {});
+      });
+    }
+  }
+
+  // Unmute on the first user gesture (click/key/touch anywhere). Only has an effect if
+  // startPlayback() had to fall back to a muted start.
+  function unmuteOnce() {
+    try { if (player.muted()) { player.muted(false); if (player.volume() < 0.1) player.volume(1); } } catch (e) {}
+    document.removeEventListener("pointerdown", unmuteOnce);
+    document.removeEventListener("keydown", unmuteOnce);
+  }
+  document.addEventListener("pointerdown", unmuteOnce);
+  document.addEventListener("keydown", unmuteOnce);
+
+  function sourceType() {
+    if (cfg.isHlsSource) return "application/x-mpegURL";
+    var u = String(cfg.videoUrl || "").toLowerCase();
+    if (/\.webm($|\?)/.test(u)) return "video/webm";
+    if (/\.mkv($|\?)/.test(u)) return "video/x-matroska";
+    return "video/mp4";
+  }
+  if (cfg.videoUrl) player.src({ src: cfg.videoUrl, type: sourceType() });
+  player.ready(startPlayback);
+
+  // --- resume + progress reporting ------------------------------------------
+  // ?t=<seconds> resumes where the user left off (threaded in by the app from
+  // watch history). Seek once, as soon as the duration is known.
+  var startAt = parseFloat(new URLSearchParams(window.location.search).get("t"));
+  if (isFinite(startAt) && startAt > 0) {
+    player.one("loadedmetadata", function () {
+      try { if (startAt < (player.duration() || Infinity) - 5) player.currentTime(startAt); } catch (e) {}
     });
   }
 
-  // HLS attach — Safari plays m3u8 natively; everything else needs hls.js (loaded as CDN <script>).
-  if (video && cfg.isHlsSource && cfg.videoUrl) {
-    var canNative = typeof video.canPlayType === "function"
-      && video.canPlayType("application/vnd.apple.mpegurl") !== "";
-    if (canNative) {
-      try { video.src = cfg.videoUrl; } catch (e) { /* keep <source> fallback */ }
-    } else if (typeof window.Hls !== "undefined" && window.Hls && window.Hls.isSupported && window.Hls.isSupported()) {
-      try {
-        var hls = new window.Hls({ enableWorker: true, lowLatencyMode: false });
-        hls.loadSource(cfg.videoUrl);
-        hls.attachMedia(video);
-        hls.on(window.Hls.Events.ERROR, function (_event, data) {
-          if (data && data.fatal) {
-            showError("HLS error: " + (data.details || data.type || "unknown"));
+  // Report the playhead every 10s while playing (plus on pause, and a beacon on
+  // tab close) to this stream's own origin — the server folds it into watch
+  // history for "Continue Watching". Positions below the floor are startup noise;
+  // the threshold is injected so it has a single owner (core/playback-target.js).
+  var minPositionSec = isFinite(cfg.minPositionSec) ? cfg.minPositionSec : 5;
+  function progressPayload(ended) {
+    var pos = player.currentTime(), dur = player.duration();
+    if (!isFinite(pos) || pos < minPositionSec) return null;
+    return JSON.stringify({
+      positionSec: Math.floor(pos),
+      durationSec: isFinite(dur) && dur > 0 ? Math.floor(dur) : null,
+      ended: !!ended,
+    });
+  }
+  function post(body) {
+    if (!cfg.progressUrl || !body) return;
+    try {
+      fetch(cfg.progressUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: body, keepalive: true }).catch(function () {});
+    } catch (e) {}
+  }
+  function reportProgress(ended) {
+    post(progressPayload(ended));
+  }
+  setInterval(function () { if (!player.paused()) reportProgress(false); }, 10000);
+  player.on("pause", function () { reportProgress(false); });
+  player.on("ended", function () { reportProgress(true); });
+  window.addEventListener("pagehide", function () {
+    if (!cfg.progressUrl || !navigator.sendBeacon) return reportProgress(false);
+    var body = progressPayload(false);
+    if (body) { try { navigator.sendBeacon(cfg.progressUrl, new Blob([body], { type: "application/json" })); } catch (e) {} }
+  });
+
+  // Tell the server when playback fails. Video.js shows its own error modal on this
+  // tab, but the tab the user is actually looking at is the main app — without this
+  // it has no idea anything went wrong and just keeps showing "loading".
+  player.on("error", function () {
+    var err = null;
+    try { err = player.error(); } catch (e) {}
+    post(JSON.stringify({
+      error: {
+        code: err && err.code ? err.code : null,
+        message: (err && err.message) ? String(err.message) : "Playback failed",
+      },
+    }));
+  });
+
+  // --- subtitles -----------------------------------------------------------
+  // Pull tracks from /api/subtitles into Video.js's native captions menu, turning the
+  // first one on by default. Subtitles are extracted in two passes (a quick "first
+  // minutes" file, then the full one), so when a track flips to complete we reload it
+  // once to pick up the rest of the cues — without duplicating it on screen.
+  var subTracks = {}; // url -> { el, complete }
+  function showingTrack() {
+    var t = player.textTracks();
+    for (var i = 0; i < t.length; i++) {
+      if ((t[i].kind === "subtitles" || t[i].kind === "captions") && t[i].mode === "showing") return t[i];
+    }
+    return null;
+  }
+  function syncSub(s) {
+    if (!s || !s.url) return;
+    var cur = subTracks[s.url];
+    if (cur && cur.complete) return;       // already loaded the final version
+    if (cur && !s.complete) return;        // early version already loaded; wait for complete
+    var wasShowing = true;
+    if (cur && cur.el) {
+      try { if (cur.el.track) wasShowing = (cur.el.track.mode === "showing"); } catch (e) {}
+      try { player.removeRemoteTextTrack(cur.el); } catch (e) {}
+    }
+    var src = s.url + (s.url.indexOf("?") === -1 ? "?" : "&") + "t=" + Date.now();
+    try {
+      var el = player.addRemoteTextTrack({ kind: "subtitles", src: src, srclang: s.language || "en", label: s.label || s.name || "Subtitle" }, false);
+      if (el && el.track && (wasShowing || !showingTrack())) el.track.mode = "showing";
+      subTracks[s.url] = { el: el, complete: !!s.complete };
+    } catch (e) {}
+  }
+  function pollSubs() {
+    if (!cfg.subtitleManifestUrl) return;
+    fetch(cfg.subtitleManifestUrl, { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        ((d && d.subtitles) || []).forEach(function (s) { if (s.ready && s.url) syncSub(s); });
+        updateToolButtons(d && d.tools, d && d.job, (d && d.subtitles) || []);
+      })
+      .catch(function () {});
+  }
+  setTimeout(pollSubs, 800);
+  setInterval(pollSubs, 8000);
+
+  // --- one-click subtitle tools (whisper generate / alass sync) -------------
+  // Buttons appear in the control bar only when the server reports the binary is
+  // installed. Both fire a background job on the stream's own origin; the finished
+  // track then arrives through the normal manifest poll above.
+  var toolButtons = {}; // kind -> videojs button component
+  var manifestBase = String(cfg.subtitleManifestUrl || "").replace(/\/api\/subtitles$/, "");
+  var lastSubCount = 0;
+  var latestSubs = []; // most recent manifest track list, for the sync button's click handler
+
+  function postTool(kind, payload) {
+    return fetch(manifestBase + "/api/subtitles/" + kind, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    }).then(function (r) { return r.json(); }).catch(function () { return { ok: false }; });
+  }
+
+  function showingTrackIndex(subs) {
+    var tr = showingTrack();
+    if (!tr) return -1;
+    for (var i = 0; i < subs.length; i++) {
+      if (subs[i].label && tr.label === subs[i].label) return subs[i].index;
+    }
+    return subs.length ? subs[0].index : -1;
+  }
+
+  function makeToolButton(kind, text, title, onClick) {
+    var Button = videojs.getComponent("Button");
+    var btn = new Button(player, { clickHandler: onClick });
+    btn.addClass("vjs-subtitle-tool");
+    btn.addClass("vjs-subtitle-tool-" + kind);
+    btn.controlText(title);
+    btn.el().querySelector(".vjs-icon-placeholder").textContent = text;
+    var bar = player.getChild("controlBar");
+    // Insert before the fullscreen toggle so the buttons sit with the other menus.
+    var fs = bar.getChild("fullscreenToggle");
+    bar.addChild(btn, {}, fs ? bar.children().indexOf(fs) : undefined);
+    return btn;
+  }
+
+  function updateToolButtons(tools, job, subs) {
+    if (tools && tools.whisper && !toolButtons.generate) {
+      toolButtons.generate = makeToolButton("generate", "AI CC", "Generate subtitles from the audio (whisper)", function () {
+        postTool("generate", {});
+        setButtonBusy("generate", true);
+      });
+    }
+    if (tools && tools.alass && !toolButtons.sync) {
+      toolButtons.sync = makeToolButton("sync", "CC⇄", "Fix subtitle timing against the audio (alass)", function () {
+        var idx = showingTrackIndex(latestSubs);
+        if (idx < 0) return;
+        postTool("sync", { index: idx });
+        setButtonBusy("sync", true);
+      });
+    }
+    latestSubs = subs;
+    var running = job && job.running;
+    setButtonBusy("generate", running && job.kind === "generate");
+    setButtonBusy("sync", running && job.kind === "sync");
+    // A finished job that produced a new track: auto-show it once.
+    if (subs.length > lastSubCount) {
+      var newest = subs[subs.length - 1];
+      if (newest && (newest.source === "whisper" || newest.source === "alass") && newest.ready) {
+        setTimeout(function () {
+          var t = player.textTracks();
+          for (var i = 0; i < t.length; i++) {
+            if (t[i].label === newest.label) t[i].mode = "showing";
+            else if (t[i].kind === "subtitles" || t[i].kind === "captions") t[i].mode = "disabled";
           }
-        });
-      } catch (e) {
-        showError("HLS playback failed to initialize.");
+        }, 500);
       }
-    } else {
-      showError("This browser cannot play HLS streams. Use Safari, Edge, Chrome, or open the VLC link.");
     }
+    lastSubCount = subs.length;
   }
 
-  if (video) {
-    video.addEventListener("loadedmetadata", function () {
-      setStatus(cfg.transcoding ? "Transcoding stream ready" : "Ready");
-      refreshSubtitleSelect();
-      setSubtitleIndex(selectedSubtitleIndex === null ? findInitialSubtitleIndex(getSubtitleTracks()) : selectedSubtitleIndex);
-      updateOffsetDisplay();
-      startSubtitleManifestPolling();
-    });
-
-    video.addEventListener("loadeddata", function () {
-      syncSelectedTrack();
-      renderSubtitleOverlay(true);
-      if (isPopupVisible()) renderSubtitlePreview(true);
-    });
-
-    video.addEventListener("error", function () {
-      var err = video.error;
-      var msg = err && err.message ? err.message : "The media could not be loaded.";
-      if (!attemptCompatFallback()) {
-        showError(msg);
-        setStatus("Playback error");
-      }
-    });
-
-    video.addEventListener("playing", function () {
-      hideError();
-      setStatus("Playing");
-      cancelStallRecovery();
-      renderSubtitleOverlay(true);
-    });
-
-    video.addEventListener("canplay", function () {
-      cancelStallRecovery();
-    });
-
-    video.addEventListener("stalled", function () {
-      scheduleStallRecovery();
-    });
-
-    video.addEventListener("pause", function () {
-      renderSubtitleOverlay(true);
-    });
-
-    video.addEventListener("seeked", function () {
-      renderSubtitleOverlay(true);
-      if (isPopupVisible()) renderSubtitlePreview(true);
-    });
-
-    video.addEventListener("waiting", function () {
-      setStatus("Buffering...");
-      scheduleStallRecovery();
-    });
-
-    video.addEventListener("timeupdate", function () {
-      var now = Date.now();
-      if (now - lastOverlayRenderAt >= 120) {
-        lastOverlayRenderAt = now;
-        renderSubtitleOverlay(false);
-      }
-
-      if (isPopupVisible() && now - lastPreviewRenderAt >= 500) {
-        lastPreviewRenderAt = now;
-        renderSubtitlePreview(false);
-      }
-    });
+  function setButtonBusy(kind, busy) {
+    var btn = toolButtons[kind];
+    if (!btn) return;
+    if (busy) btn.addClass("vjs-subtitle-tool-busy");
+    else btn.removeClass("vjs-subtitle-tool-busy");
+    btn.el().disabled = !!busy;
   }
 
-  var textTrackList = video ? video.textTracks : null;
-  if (textTrackList) {
-    var handleTrackListChange = function () {
-      var before = selectedSubtitleIndex;
-      refreshSubtitleSelect();
-      if (before !== null && before >= 0) {
-        setSubtitleIndex(before);
-      }
-    };
-
-    if (typeof textTrackList.addEventListener === "function") {
-      textTrackList.addEventListener("addtrack", handleTrackListChange);
-    } else {
-      textTrackList.onaddtrack = handleTrackListChange;
-    }
+  // Nudge subtitle timing with [ and ] — no on-screen clutter.
+  function shiftSubs(delta) {
+    var tr = showingTrack();
+    if (!tr || !tr.cues) return;
+    for (var i = 0; i < tr.cues.length; i++) { tr.cues[i].startTime += delta; tr.cues[i].endTime += delta; }
   }
 
-  if (retryBtn) {
-    retryBtn.addEventListener("click", function () {
-      hideError();
-      if (!video) return;
-      video.load();
-      video.play().catch(function () { /* ignore autoplay failure */ });
-    });
-  }
-
-  if (reloadBtn) {
-    reloadBtn.addEventListener("click", function () {
-      window.location.reload();
-    });
-  }
-
-  document.addEventListener("keydown", function (event) {
-    if (!video) return;
-    if (event.target && /input|textarea|select|button/i.test(event.target.tagName)) return;
-
-    if (event.key === " " || event.code === "Space") {
-      event.preventDefault();
-      if (video.paused) video.play().catch(function () {});
-      else video.pause();
-      return;
-    }
-
-    if (event.key === "ArrowRight") {
-      video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 5);
-      return;
-    }
-
-    if (event.key === "ArrowLeft") {
-      video.currentTime = Math.max(0, video.currentTime - 5);
-      return;
-    }
-
-    if (event.key.toLowerCase() === "m") {
-      video.muted = !video.muted;
-      return;
-    }
-
-    if (event.key.toLowerCase() === "f") {
-      if (document.fullscreenElement) {
-        document.exitFullscreen().catch(function () {});
-      } else if (video.requestFullscreen) {
-        video.requestFullscreen().catch(function () {});
-      }
-      return;
-    }
-
-    if (event.key === "[") {
-      adjustOffset(-0.1);
-      return;
-    }
-
-    if (event.key === "]") {
-      adjustOffset(0.1);
-      return;
+  // --- keyboard shortcuts --------------------------------------------------
+  document.addEventListener("keydown", function (e) {
+    if (e.target && /input|textarea|select/i.test(e.target.tagName || "")) return;
+    switch (e.key) {
+      case " ": case "Spacebar": e.preventDefault(); if (player.paused()) player.play(); else player.pause(); break;
+      case "ArrowRight": player.currentTime(player.currentTime() + 5); break;
+      case "ArrowLeft": player.currentTime(Math.max(0, player.currentTime() - 5)); break;
+      case "ArrowUp": player.volume(Math.min(1, player.volume() + 0.1)); break;
+      case "ArrowDown": player.volume(Math.max(0, player.volume() - 0.1)); break;
+      case "m": case "M": player.muted(!player.muted()); break;
+      case "f": case "F": if (player.isFullscreen()) player.exitFullscreen(); else player.requestFullscreen(); break;
+      case "[": shiftSubs(-0.1); break;
+      case "]": shiftSubs(0.1); break;
     }
   });
 })();

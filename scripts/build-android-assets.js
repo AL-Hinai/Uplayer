@@ -23,17 +23,21 @@ const DEST = path.join(ROOT, 'android-app', 'app', 'src', 'main', 'assets', 'nod
 // `.env` is included so the on-device server gets the same API keys as desktop.
 // (The assets bundle is gitignored, so keys aren't committed; note they ARE
 // embedded in the APK and extractable — fine for a personal TMDB key.)
-const INCLUDE = ['server.js', 'uplayer.js', 'sandbox.js', 'package.json', '.env', 'core', 'public'];
+// `routes` is NOT optional: server.js:96,100 require('./routes/catalog'|'./routes/library')
+// unconditionally at module load. Omitting it does not degrade the app — it kills the server
+// with "Cannot find module './routes/catalog'" before it ever listens, and the APK just sits
+// on "Starting Uplayer…" forever. That is exactly what happened when phase 3 extracted the
+// route modules and this list was not updated. See verifyBundle() below.
+const INCLUDE = ['server.js', 'uplayer.js', 'sandbox.js', 'package.json', '.env', 'core', 'public', 'routes'];
 
-// node_modules we never need on Android (desktop binaries / WebRTC / build tools).
+// node_modules we never need on Android (desktop binaries / build tools).
 // ffmpeg-static & ffprobe-static ship ~400MB of x64 binaries we replace with the
-// extracted aarch64 lib*.so; webtorrent-hybrid + wrtc are bypassed by the forced
-// plain-webtorrent engine.
+// extracted aarch64 lib*.so. The torrent engine is the TorrServer binary, shipped
+// as jniLibs/<abi>/libtorrserver.so (see scripts/setup-torrserver.js android) — not
+// an npm module — so nothing torrent-related needs bundling here.
 const PRUNE_MODULES = new Set([
   'ffmpeg-static',
   'ffprobe-static',
-  'webtorrent-hybrid',
-  'wrtc',
   'pkg',
   'node-pre-gyp',
   '@mapbox', // node-pre-gyp scope
@@ -87,6 +91,46 @@ function copyNodeModules() {
   console.log(`  node_modules: copied ${copied} packages, pruned ${pruned}`);
 }
 
+// Fail the build if the bundle can't actually boot.
+//
+// The failure this catches is silent and expensive: the bundler happily produces a complete-
+// looking 36 MB assets dir, Gradle packages it, the APK installs — and only on-device does
+// Node die at require() time, leaving the UI stuck on "Starting Uplayer…" with the real error
+// buried in logcat. A missing entry in INCLUDE costs a full rebuild + install to discover.
+//
+// So: scan the bundled sources for local `require('./x')` targets and assert each resolves
+// INSIDE the bundle. Static (regex, no execution) because requiring server.js here would
+// start a listener and pull in the desktop node_modules we deliberately pruned.
+function verifyBundle() {
+  const missing = new Set();
+  const scan = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === 'public') continue;
+        scan(full);
+        continue;
+      }
+      if (!entry.name.endsWith('.js')) continue;
+      const src = fs.readFileSync(full, 'utf8');
+      for (const m of src.matchAll(/require\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g)) {
+        const target = path.resolve(path.dirname(full), m[1]);
+        if (fs.existsSync(target) || fs.existsSync(`${target}.js`) ||
+            fs.existsSync(path.join(target, 'index.js'))) continue;
+        missing.add(`${path.relative(DEST, full)} -> ${m[1]}`);
+      }
+    }
+  };
+  scan(DEST);
+  if (missing.size) {
+    console.error('\nBundle is broken — these requires do not resolve inside the bundle:');
+    for (const m of missing) console.error('  ', m);
+    console.error('\nAdd the missing file/dir to INCLUDE at the top of this script.');
+    process.exit(1);
+  }
+  console.log('  verified: every local require resolves inside the bundle');
+}
+
 function main() {
   console.log('Building Android assets ->', DEST);
   rmrf(DEST);
@@ -109,7 +153,10 @@ function main() {
   // 3. Pruned dependencies.
   copyNodeModules();
 
-  // 4. Version stamp so the app re-extracts when the bundle changes.
+  // 4. Prove it can boot before we let Gradle package it.
+  verifyBundle();
+
+  // 5. Version stamp so the app re-extracts when the bundle changes.
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   const stamp = `${pkg.version}-${Date.now()}`;
   fs.writeFileSync(path.join(DEST, '.bundle-version'), stamp);

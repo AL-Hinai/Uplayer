@@ -1,7 +1,24 @@
+import groovy.json.JsonSlurper
+
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
 }
+
+// The APK version comes from the repo-root package.json — the same single source the
+// desktop (pkg) build uses, so a version bump there flows into the APK automatically
+// instead of drifting (the hard-coded value sat at 0.16.0 while the repo was on 0.17.0).
+def appVersionName = new JsonSlurper()
+        .parse(new File(rootProject.projectDir.parentFile, 'package.json')).version
+
+// Android only accepts an upgrade when versionCode increases, so derive an integer from
+// the semver rather than hand-maintaining it: 0.17.0 -> 1700. Budgets 99 minor + 99 patch
+// per major, and stays monotonic as long as neither exceeds that.
+def appVersionCode = {
+    def m = (appVersionName =~ /^(\d+)\.(\d+)\.(\d+)/)
+    if (!m) throw new GradleException("Cannot parse a semver from package.json version '${appVersionName}'")
+    return m[0][1].toInteger() * 10000 + m[0][2].toInteger() * 100 + m[0][3].toInteger()
+}()
 
 android {
     namespace 'com.uplayer.app'
@@ -12,8 +29,8 @@ android {
         applicationId "com.uplayer.app"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "0.16.0"
+        versionCode appVersionCode
+        versionName appVersionName
 
         // Ship arm64 only by default (covers virtually all modern phones). Add
         // 'armeabi-v7a' / 'x86_64' here AND provide matching libnode.so + ffmpeg
@@ -88,13 +105,15 @@ tasks.register('bundleNodeAssets', Exec) {
         commandLine 'node', bundleScript
     }
 }
-// The large native libs (libnode.so, libffmpeg.so, libffprobe.so + nodejs-mobile
-// headers) are gitignored, so a fresh clone lacks them. This restores them from the
-// local cache (seeded via `npm run setup:android-libs:save`) before the native build,
-// failing fast with guidance if they're absent. Skip with -PskipNodeLibs.
+// The large native libs (libnode.so, libffmpeg.so, libffprobe.so, libtorrserver.so +
+// nodejs-mobile headers) are gitignored, so a fresh clone lacks them. This restores them
+// from the local cache (seeded via `npm run setup:android-libs:save`) before the native
+// build — and downloads libtorrserver.so outright if the cache misses, since a missing
+// torrent engine otherwise builds clean and fails only at runtime. Fails fast with
+// guidance if anything is still absent. Skip with -PskipNodeLibs.
 tasks.register('ensureNodeLibs', Exec) {
     group = 'build'
-    description = 'Ensure Android native libs (libnode/ffmpeg/ffprobe + headers) are present; restores from cache.'
+    description = 'Ensure Android native libs (libnode/ffmpeg/ffprobe/torrserver + headers) are present; restores from cache.'
     workingDir repoRoot
     def setupScript = new File(repoRoot, 'scripts/setup-android-libs.js').absolutePath
     if (isWindows) {

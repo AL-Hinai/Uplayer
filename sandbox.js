@@ -460,6 +460,16 @@ class SandboxManager {
       process.exit(0);
     });
     process.on('uncaughtException', (err) => {
+      // Client-disconnect / broken-pipe errors are normal for a streaming server
+      // (browser seeks, VLC stops, a cast device drops). They must NOT tear down
+      // the whole app — just ignore them and keep serving.
+      const benign = err && (err.code === 'EPIPE' || err.code === 'ECONNRESET'
+        || err.code === 'ERR_STREAM_DESTROYED' || err.code === 'ECONNABORTED'
+        || err.code === 'ERR_STREAM_PREMATURE_CLOSE');
+      if (benign) {
+        console.warn('Ignoring benign stream disconnect:', err.code);
+        return;
+      }
       console.error('Uncaught exception:', err);
       cleanup();
       process.exit(1);

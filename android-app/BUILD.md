@@ -124,6 +124,52 @@ Then:
 
 ---
 
+## Step 2b — TorrServer engine (aarch64, the torrent engine)
+
+Uplayer's torrent engine is the **TorrServer** binary (it replaced WebTorrent). It
+ships exactly like ffmpeg — a `lib*.so` in `jniLibs` the app execs from
+`nativeLibraryDir`.
+
+**This is automatic** — it's an official prebuilt, so both `scripts/build-android.sh`
+and the Gradle build (via `:app:ensureNodeLibs` → `setup-android-libs.js restore`)
+download it for you when it's missing. You only need this step to fetch it by hand,
+e.g. to refresh to a newer TorrServer release. From the **repo root**:
+
+```bash
+npm run setup:torrserver:android
+```
+
+This downloads the official `arm64` + `arm7` TorrServer binaries and writes:
+- `app/src/main/jniLibs/arm64-v8a/libtorrserver.so`
+- `app/src/main/jniLibs/armeabi-v7a/libtorrserver.so`
+
+`main.js` points the app at it via `UPLAYER_TORRSERVER_PATH` (the extracted
+native-lib path); the in-process `TorrServerClient` spawns it and talks to it over
+`localhost:8090`. No WebRTC / `wrtc` needed — that whole class of ARM build problems
+is gone. Verify on-device if in doubt:
+
+```bash
+adb push libtorrserver.so /data/local/tmp/ts
+adb shell chmod 755 /data/local/tmp/ts && adb shell /data/local/tmp/ts --help
+```
+
+---
+
+## Step 2c — Optional: subtitle auto-sync (alass) + generation (whisper)
+
+These are **optional** quality features. Unlike ffmpeg/TorrServer there are **no
+official Android prebuilts**, so they must be built from source for `aarch64` — or
+skipped entirely (the app hides the features when the binaries are absent):
+- Build/obtain `alass-cli` → `jniLibs/arm64-v8a/libalass.so`
+- Build/obtain `whisper-cli` → `jniLibs/arm64-v8a/libwhisper.so`, plus a ggml model
+  (e.g. `ggml-tiny.en.bin`) in the app's files dir.
+
+`main.js` wires `UPLAYER_ALASS_PATH` / `UPLAYER_WHISPER_PATH` / `UPLAYER_WHISPER_MODEL`
+from those when present. On desktop, `npm run setup:subtitle-tools` fetches the
+Windows/Linux prebuilts automatically.
+
+---
+
 ## Step 3 — Bundle the Node app into assets
 
 From the **repo root**:
@@ -177,8 +223,8 @@ The `.bundle-version` stamp makes the app re-extract assets on next launch.
 Manual / Android Studio:
 
 1. Open the **`android-app/`** folder in Android Studio. Let Gradle sync.
-2. Confirm `jniLibs/arm64-v8a/` has **three** files: `libnode.so`, `libffmpeg.so`,
-   `libffprobe.so`. And `cpp/nodejs-mobile/include/node/node.h` exists.
+2. Confirm `jniLibs/arm64-v8a/` has **four** files: `libnode.so`, `libffmpeg.so`,
+   `libffprobe.so`, `libtorrserver.so`. And `cpp/nodejs-mobile/include/node/node.h` exists.
 3. Run on a device (▶). First launch extracts the Node project (a few seconds), the
    spinner shows, then the Uplayer UI loads.
 
@@ -216,7 +262,7 @@ adb logcat -s Uplayer Uplayer/Node Uplayer/Main Uplayer/Cast Uplayer/JNI chromiu
 | `UnsatisfiedLinkError: node::Start` | header/libnode version mismatch (Step 1 note). |
 | Cast button does nothing / no devices | Device lacks Play services, or phone+TV not on same network. Check `Uplayer/Cast`. |
 | TV can't load the stream | `castUrl` must be the LAN IP, not localhost. Ensure Wi-Fi is connected (we pass the IP to `UPLAYER_PUBLIC_HOST`). Check the TV can reach `:8000` (AP isolation off). |
-| Torrents find no peers | Plain WebTorrent has no WebRTC peers — fine for normal movie torrents (TCP/uTP/DHT). |
+| Torrents find no peers / slow | Check `libtorrserver.so` is present + exec; TorrServer logs land in `boot.log` (look for "TorrServer configured"). Thin swarms are just slow. |
 
 ## Limitations / notes
 
@@ -228,3 +274,10 @@ adb logcat -s Uplayer Uplayer/Node Uplayer/Main Uplayer/Cast Uplayer/JNI chromiu
   cleaned by the existing sandbox lifecycle.
 - **Background:** `NodeService` is a `mediaPlayback` foreground service so streaming
   survives screen-off; Android may still throttle aggressively on some OEMs.
+- **Quitting:** three paths fully shut down — backing out of the app, swiping it from
+  Recents, and the notification's **Stop** button. All three converge on
+  `NodeService.shutdown()`, which wipes `sandbox` + `uplayer-tmp` and kills the process
+  (the only way to stop the embedded Node runtime — `node::Start` blocks for its whole
+  life with no shutdown hook). Home / screen-off deliberately does *not* stop anything,
+  so casting and background playback keep working; tapping the notification returns to
+  the running session. Force Stop should never be necessary.

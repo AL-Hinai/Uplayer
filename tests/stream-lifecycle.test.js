@@ -54,16 +54,41 @@ function testStructuredPlayerReadyPayload() {
     playerUrl: payload.url,
     playerReadyData: payload,
     exited: false,
+    playback: null,
+    streamHealth: null,
+    targets: [],
   });
   assert.deepStrictEqual(events, [
     { event: 'player_ready', data: payload },
   ]);
 }
 
+function testPlaybackEvents() {
+  const events = [];
+  const lifecycle = new StreamLifecycleState((event, data) => {
+    events.push({ event, data });
+  });
+
+  const playing = { kind: 'vlc', state: 'playing', positionSec: 42, ended: false };
+  assert.strictEqual(lifecycle.playback(playing), true);
+  assert.strictEqual(lifecycle.status().playback, playing, 'status should surface the latest playback');
+  assert.strictEqual(lifecycle.playbackError({ kind: 'vlc', reason: 'closed' }), true);
+
+  assert.strictEqual(lifecycle.exit(0), true);
+  assert.strictEqual(lifecycle.playback(playing), false, 'playback must stop after exit');
+  assert.strictEqual(lifecycle.playbackError({}), false, 'playback errors must stop after exit');
+
+  assert.deepStrictEqual(
+    events.map((e) => e.event),
+    ['playback', 'playback_error', 'exit']
+  );
+}
+
 function main() {
   testOrderingAndIdempotency();
   testExitBeforeReady();
   testStructuredPlayerReadyPayload();
+  testPlaybackEvents();
   console.log('stream-lifecycle.test.js passed');
 }
 

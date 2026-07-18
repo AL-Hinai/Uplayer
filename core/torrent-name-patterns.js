@@ -180,18 +180,28 @@ function classify(parsed, expected) {
   const hasContradictingSeason =
     parsed.seasonTag != null && parsed.seasonTag !== season;
 
+  // A bare per-season episode number ("- 02", "Episode 2") is only trustworthy
+  // for the requested season when that season is actually pinned down: either
+  // it's season 1 / unknown, or the name carries a season tag equal to it.
+  // Anime trackers (SubsPlease/Erai) leave season-1 releases untagged and tag
+  // only later seasons, so an untagged "- 02" on a season>=2 request is really
+  // S01E02 (or an absolute number) — never the requested S02E02. In that case
+  // only the absolute-episode branch may match.
+  const perSeasonEpisodeTrusted =
+    season == null || season <= 1 || parsed.seasonTag === season;
+
   const episodeOnlyMatch =
     !exactSEMatch &&
     !hasContradictingSeason &&
     parsed.episodeTag != null &&
-    (parsed.episodeTag === episode ||
+    ((perSeasonEpisodeTrusted && parsed.episodeTag === episode) ||
       (isAnime && absoluteEpisode != null && parsed.episodeTag === absoluteEpisode));
 
   const animeDashMatch =
     !exactSEMatch &&
     !hasContradictingSeason &&
     parsed.animeDashEpisode != null &&
-    (parsed.animeDashEpisode === episode ||
+    ((perSeasonEpisodeTrusted && parsed.animeDashEpisode === episode) ||
       (isAnime && absoluteEpisode != null && parsed.animeDashEpisode === absoluteEpisode));
 
   // For long-running anime (One Piece, Detective Conan, Doraemon) releasers
@@ -246,6 +256,32 @@ function isMatch(parsed, expected) {
   return false;
 }
 
+// Quality tier from the release name: 2160p/4K → 4, 1080p → 3, 720p → 2,
+// SD tokens (480/540/576p) → 1, unknown → 0. Drives the picker's quality badge
+// and the preferred-quality filter, which falls back to the unfiltered set when
+// no release matches — so an untagged release (tier 0) is never silently lost.
+const QUALITY_LABELS = { 4: '2160p', 3: '1080p', 2: '720p', 1: 'SD' };
+function qualityTier(rawName) {
+  const name = String(rawName || '').toLowerCase();
+  if (/\b(?:2160p|4320p)\b/.test(name) || /\b(?:4k|uhd)\b/.test(name)) return 4;
+  if (/\b1080p?\b/.test(name)) return 3;
+  if (/\b720p?\b/.test(name)) return 2;
+  if (/\b(?:480|540|576)p\b/.test(name)) return 1;
+  return 0;
+}
+const qualityLabel = (tier) => QUALITY_LABELS[tier] || null;
+
+// BitTorrent infohash out of a magnet link (hex or base32 form), lowercased hex
+// where possible so the same torrent from two indexers dedupes to one key.
+// Non-magnet links (page/.torrent URLs) return null — no infohash to compare.
+function extractInfohash(link) {
+  const m = String(link || '').match(/xt=urn:btih:([a-z0-9]{32,40})/i);
+  if (!m) return null;
+  const hash = m[1].toLowerCase();
+  if (/^[0-9a-f]{40}$/.test(hash)) return hash;
+  return hash; // base32 form — still a stable dedupe key, just not hex-normalized
+}
+
 module.exports = {
   SEASON_TAG_RE,
   SE_PAIR_RE,
@@ -258,4 +294,7 @@ module.exports = {
   parseName,
   classify,
   isMatch,
+  qualityTier,
+  qualityLabel,
+  extractInfohash,
 };

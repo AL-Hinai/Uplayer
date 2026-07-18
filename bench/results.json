@@ -1,0 +1,74 @@
+[
+  {
+    "when": "2026-07-07 19:44",
+    "label": "One Piece 1165 (1080p anime)",
+    "link": "magnet:?xt=urn:btih:NUOCMTJW26BSPOVZJ53JHNEFCBPM7NQV&dn=%5BSubsPlease%5D%20One%2",
+    "webtorrent": {
+      "file": "[SubsPlease] One Piece - 1165 (1080p) [53DFF167].mkv",
+      "fileLen": 1443088094,
+      "ttfbMs": 2155,
+      "mbps": "23.31",
+      "peers": 54,
+      "peakRssMB": "472.2",
+      "growthMB": "411.8",
+      "note": "avg dl-speed over 30s"
+    },
+    "torrserver": {
+      "file": "[SubsPlease] One Piece - 1165 (1080p) [53DFF167].mkv",
+      "fileLen": 1443088094,
+      "ttfbMs": 3625,
+      "mbps": "2.35",
+      "peers": 22,
+      "peakRssMB": "173.2",
+      "note": "avg dl-speed over 30s"
+    }
+  },
+  {
+    "when": "2026-07-07 19:45",
+    "label": "Matrix Revolutions 2160p UHD",
+    "link": "magnet:?xt=urn:btih:C7A9C79C46DE90B464DC11107724EFCE2A58DC95&dn=The%20Matrix%20R",
+    "webtorrent": {
+      "file": "The Matrix Revolutions 2003.UHD.BluRay.2160p.x265.HDR.Atmos.7.1.[En+Hi]-DTOne.mkv",
+      "fileLen": 21840203222,
+      "ttfbMs": 7537,
+      "mbps": "9.89",
+      "peers": 8,
+      "peakRssMB": "535.4",
+      "growthMB": "391.7",
+      "note": "avg dl-speed over 30s"
+    },
+    "torrserver": {
+      "file": "The Matrix Revolutions 2003.UHD.BluRay.2160p.x265.HDR.Atmos.7.1.[En+Hi]-DTOne.mkv",
+      "fileLen": 21840203222,
+      "ttfbMs": 4332,
+      "mbps": "0.60",
+      "peers": 9,
+      "peakRssMB": "112.8",
+      "note": "avg dl-speed over 30s"
+    }
+  },
+  {
+    "when": "2026-07-07 19:52",
+    "label": "LotR Return of the King 1080p EXT",
+    "link": "magnet:?xt=urn:btih:F3B2ADA3E0AF06D166ACBA3C4C4127DDA32A5A21&dn=The.Lord.of.the.",
+    "webtorrent": {
+      "file": "The.Lord.of.the.Rings.The.Return.of.the.King.2003.EXTENDED.REMASTERED.1080p.BluRay.x264.TrueHD.7.1.Atmos-FGT.mkv",
+      "fileLen": 29768930685,
+      "ttfbMs": 6170,
+      "mbps": "3.69",
+      "peers": 3,
+      "peakRssMB": "442.9",
+      "growthMB": "382.4",
+      "note": "avg dl-speed over 30s"
+    },
+    "torrserver": {
+      "file": "The.Lord.of.the.Rings.The.Return.of.the.King.2003.EXTENDED.REMASTERED.1080p.BluRay.x264.TrueHD.7.1.Atmos-FGT.mkv",
+      "fileLen": 29768930685,
+      "ttfbMs": 25326,
+      "mbps": "0.22",
+      "peers": 2,
+      "peakRssMB": "123.1",
+      "note": "avg dl-speed over 30s"
+    }
+  }
+]

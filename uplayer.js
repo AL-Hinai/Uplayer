@@ -1,23 +1,8 @@
 #!/usr/bin/env node
 
-// Torrent engine loader.
-//   - Desktop: webtorrent-hybrid (adds native WebRTC peer support via wrtc).
-//   - Android / embedded (nodejs-mobile): wrtc has no ARM build, so fall back to
-//     plain webtorrent (TCP/uTP/DHT peers — what movie torrents actually use).
-// Force with UPLAYER_TORRENT_ENGINE=webtorrent to skip the hybrid attempt.
-const WebTorrent = (function loadWebTorrent() {
-  const resolve = (mod) => (mod && mod.default ? mod.default : mod);
-  const engine = String(process.env.UPLAYER_TORRENT_ENGINE || '').toLowerCase();
-  if (engine === 'webtorrent' || engine === 'plain') {
-    return resolve(require('webtorrent'));
-  }
-  try {
-    return resolve(require('webtorrent-hybrid'));
-  } catch (err) {
-    console.warn(`[uplayer] webtorrent-hybrid unavailable (${err.message}); using plain webtorrent`);
-    return resolve(require('webtorrent'));
-  }
-})();
+// Torrent engine: TorrServer sidecar (see core/torrserver-client.js). The previous
+// in-process WebTorrent client was removed in favour of TorrServer, which downloads
+// from the swarm and serves the file over HTTP — the same engine on desktop and Android.
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { program } = require('commander');
@@ -25,1668 +10,44 @@ const chalk = require('chalk');
 const inquirer = require('inquirer');
 const open = require('open');
 const http = require('http');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { EventEmitter } = require('events');
 const OpenSubtitles = require('opensubtitles.com');
-const { loadEnvFileOnce } = require('./core/config');
+const { loadEnvFileOnce, getEnv } = require('./core/config');
 const { createTmdbClient } = require('./core/tmdb-client');
 const { createSharedServices } = require('./core/shared-services');
 const { buildAccessibleUrls } = require('./core/network-address');
-const { parseName, classify } = require('./core/torrent-name-patterns');
+const { parseName, classify, qualityTier, qualityLabel, extractInfohash } = require('./core/torrent-name-patterns');
+const { MIN_POSITION_SEC } = require('./core/playback-target');
+const { normalizeProbe, legacyProbeAlias, toVideoFormat } = require('./core/media-facts');
+const { StreamHealth, legacyProgressPayload } = require('./core/stream-health');
+const { MemoryTracker } = require('./core/memory-tracker');
+const { dedupeTorrentResults, filterByPreferredQuality } = require('./core/torrent-filters');
+const { TorrentScraper } = require('./core/torrent-scraper');
+const { MediaSearcher } = require('./core/media-searcher');
+const { SubtitleManager } = require('./core/subtitle-manager');
+const {
+  streamHub, hiddenChildProcessOptions, waitForServerReady, probeExistingWebServer,
+} = require('./core/stream-hub');
 
 loadEnvFileOnce();
-
-function hiddenChildProcessOptions(options = {}) {
-  return {
-    shell: false,
-    ...options,
-    ...(process.platform === 'win32' ? { windowsHide: true } : {}),
-  };
-}
-
-function waitForServerReady(server) {
-  if (server.listening) {
-    return Promise.resolve(server);
-  }
-  return new Promise((resolve, reject) => {
-    const onListening = () => {
-      server.off('error', onError);
-      resolve(server);
-    };
-    const onError = (error) => {
-      server.off('listening', onListening);
-      reject(error);
-    };
-    server.once('listening', onListening);
-    server.once('error', onError);
-  });
-}
-
-function probeExistingWebServer(port) {
-  return new Promise((resolve) => {
-    const req = http.get({
-      hostname: '127.0.0.1',
-      port,
-      path: '/api/stream/status',
-      timeout: 2000,
-    }, (res) => {
-      resolve(res.statusCode === 200);
-      res.resume();
-    });
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(false);
-    });
-    req.on('error', () => resolve(false));
-  });
-}
-
-// Media searcher - searches TMDB using API only (like Elementum/Kodi approach)
-class MediaSearcher {
-  constructor(options = {}) {
-    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
-    // Use injected or system-config API key.
-    this.tmdb = options.tmdbClient || createTmdbClient(process.env.TMDB_API_KEY);
-    
-    if (!this.tmdb.hasApiKey()) {
-      console.warn(chalk.yellow('TMDB API key not set. Configure TMDB_API_KEY in core/system-config.js.'));
-    }
-  }
-  
-  // TMDB API search for movies - clean and simple
-  async searchMoviesAPI(query) {
-    if (!this.tmdb.hasApiKey()) {
-      throw new Error('TMDB API key is required. Configure TMDB_API_KEY in core/system-config.js.');
-    }
-    
-    try {
-      const response = await this.tmdb.get('/search/movie', {
-        query: query,
-        language: 'en-US',
-        include_adult: false
-      });
-
-      const results = [];
-      for (const movie of (response.results || []).slice(0, 10)) {
-        results.push({
-          id: movie.id,
-          title: movie.title,
-          year: movie.release_date ? movie.release_date.substring(0, 4) : null,
-          type: 'movie',
-          displayTitle: `${movie.title}${movie.release_date ? ` (${movie.release_date.substring(0, 4)})` : ''} [Movie]`,
-          tmdbId: movie.id.toString(),
-          overview: movie.overview || ''
-        });
-      }
-      return results;
-    } catch (error) {
-      throw new Error(`Failed to search TMDB: ${error.message}`);
-    }
-  }
-  
-  // TMDB API search for TV shows - clean and simple
-  async searchTVShowsAPI(query) {
-    if (!this.tmdb.hasApiKey()) {
-      throw new Error('TMDB API key is required. Configure TMDB_API_KEY in core/system-config.js.');
-    }
-    
-    try {
-      const response = await this.tmdb.get('/search/tv', {
-        query: query,
-        language: 'en-US',
-        include_adult: false
-      });
-
-      const results = [];
-      for (const tv of (response.results || []).slice(0, 10)) {
-        results.push({
-          id: tv.id,
-          title: tv.name,
-          year: tv.first_air_date ? tv.first_air_date.substring(0, 4) : null,
-          type: 'tv',
-          displayTitle: `${tv.name}${tv.first_air_date ? ` (${tv.first_air_date.substring(0, 4)})` : ''} [TV Show]`,
-          tmdbId: tv.id.toString(),
-          overview: tv.overview || ''
-        });
-      }
-      return results;
-    } catch (error) {
-      throw new Error(`Failed to search TMDB: ${error.message}`);
-    }
-  }
-  
-  // Get TV show details with seasons using TMDB API - clean and reliable
-  async getTVShowDetailsAPI(tvShowId) {
-    if (!this.tmdb.hasApiKey()) {
-      throw new Error('TMDB API key is required.');
-    }
-    
-    try {
-      const tv = await this.tmdb.get(`/tv/${tvShowId}`, {
-        language: 'en-US'
-      });
-      // The API returns all seasons in the seasons array - this is the most reliable method
-      const allSeasons = tv.seasons || [];
-      
-      return {
-        id: tv.id,
-        title: tv.name,
-        overview: tv.overview || '',
-        seasons: allSeasons.map(s => ({
-          season_number: s.season_number || 0,
-          episode_count: s.episode_count || 0,
-          name: s.name || `Season ${s.season_number || 0}`
-        })),
-        number_of_seasons: tv.number_of_seasons || allSeasons.length
-      };
-    } catch (error) {
-      throw new Error(`Failed to get TV show details: ${error.message}`);
-    }
-  }
-  
-  // Get season episodes using TMDB API - clean and reliable
-  async getSeasonEpisodesAPI(tvShowId, seasonNumber) {
-    if (!this.tmdb.hasApiKey()) {
-      throw new Error('TMDB API key is required.');
-    }
-    
-    try {
-      const season = await this.tmdb.get(`/tv/${tvShowId}/season/${seasonNumber}`, {
-        language: 'en-US'
-      });
-
-      return (season.episodes || []).map(ep => ({
-        episode_number: ep.episode_number || 0,
-        name: ep.name || `Episode ${ep.episode_number || 0}`,
-        air_date: ep.air_date || '',
-        overview: ep.overview || ''
-      }));
-    } catch (error) {
-      throw new Error(`Failed to get season episodes: ${error.message}`);
-    }
-  }
-
-  // Simple API-only search for movies
-  async searchMovies(query) {
-    return await this.searchMoviesAPI(query);
-  }
-
-  // Simple API-only search for TV shows
-  async searchTVShows(query) {
-    return await this.searchTVShowsAPI(query);
-  }
-
-  // Enhanced scraper method - works without API key (multiple selectors for better results)
-  async searchMoviesScraper(query) {
-    try {
-      // Try multiple search URL formats
-      const searchUrls = [
-        `https://www.themoviedb.org/search?query=${encodeURIComponent(query)}&type=movie`,
-        `https://www.themoviedb.org/search/movie?query=${encodeURIComponent(query)}`
-      ];
-      
-      for (const searchUrl of searchUrls) {
-        try {
-          const response = await axios.get(searchUrl, {
-            headers: { 
-              'User-Agent': this.userAgent,
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5'
-            },
-            timeout: 15000
-          });
-
-          const $ = cheerio.load(response.data);
-          const results = [];
-          const seenTitles = new Set();
-
-          // Try multiple selectors for different page layouts
-          const selectors = [
-            '.card',
-            '.search_result',
-            '.result',
-            '[class*="card"]',
-            'article',
-            '.media',
-            'a[href*="/movie/"]'
-          ];
-
-          for (const selector of selectors) {
-            $(selector).slice(0, 15).each((i, elem) => {
-              const $card = $(elem);
-              
-              // Try multiple title selectors
-              const $titleLink = $card.find('h2 a, .title a, a[href*="/movie/"]').first();
-              let title = $titleLink.text().trim();
-              let href = $titleLink.attr('href');
-              
-              // If no title, try alternative
-              if (!title) {
-                title = $card.find('h2, .title, [class*="title"]').first().text().trim();
-              }
-              
-              // Extract year from multiple possible locations
-              let year = $card.find('.release_date, .date, [class*="date"], [class*="year"]').text().trim();
-              if (year && year.length > 4) {
-                year = year.substring(0, 4);
-              }
-              
-              // Extract TMDB ID from href
-              let tmdbId = null;
-              if (href) {
-                const idMatch = href.match(/\/movie\/(\d+)/);
-                if (idMatch) {
-                  tmdbId = idMatch[1];
-                }
-              }
-              
-              // Clean and validate
-              if (title && title.length > 0 && !seenTitles.has(title.toLowerCase())) {
-                seenTitles.add(title.toLowerCase());
-                if (year && (isNaN(year) || year.length !== 4)) {
-                  year = null;
-                }
-                
-                results.push({
-                  id: tmdbId ? parseInt(tmdbId) : null,
-                  title: title,
-                  year: year || null,
-                  type: 'movie',
-                  displayTitle: `${title}${year ? ` (${year})` : ''} [Movie]`,
-                  tmdbId: tmdbId
-                });
-              }
-            });
-            
-            if (results.length > 0) break; // Found results, stop trying other selectors
-          }
-
-          if (results.length > 0) {
-            return results.slice(0, 10);
-          }
-        } catch (err) {
-          continue; // Try next URL
-        }
-      }
-
-      return [];
-    } catch (error) {
-      return [];
-    }
-  }
-
-  // Enhanced scraper method for TV shows - works without API key
-  async searchTVShowsScraper(query) {
-    try {
-      // Try multiple search URL formats
-      const searchUrls = [
-        `https://www.themoviedb.org/search?query=${encodeURIComponent(query)}&type=tv`,
-        `https://www.themoviedb.org/search/tv?query=${encodeURIComponent(query)}`
-      ];
-      
-      for (const searchUrl of searchUrls) {
-        try {
-          const response = await axios.get(searchUrl, {
-            headers: { 
-              'User-Agent': this.userAgent,
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5'
-            },
-            timeout: 15000
-          });
-
-          const $ = cheerio.load(response.data);
-          const results = [];
-          const seenTitles = new Set();
-
-          // Try multiple selectors for different page layouts
-          const selectors = [
-            '.card',
-            '.search_result',
-            '.result',
-            '[class*="card"]',
-            'article',
-            '.media',
-            'a[href*="/tv/"]'
-          ];
-
-          for (const selector of selectors) {
-            $(selector).slice(0, 15).each((i, elem) => {
-              const $card = $(elem);
-              
-              // Try multiple title selectors
-              const $titleLink = $card.find('h2 a, .title a, a[href*="/tv/"]').first();
-              let title = $titleLink.text().trim();
-              let href = $titleLink.attr('href');
-              
-              // If no title from link, try other methods
-              if (!title) {
-                title = $card.find('h2, .title, [class*="title"]').first().text().trim();
-                if (!href) {
-                  href = $card.find('a[href*="/tv/"]').first().attr('href');
-                }
-              }
-              
-              // Extract year from multiple possible locations
-              let year = $card.find('.first_air_date, .release_date, .date, [class*="date"], [class*="year"]').text().trim();
-              if (year && year.length > 4) {
-                year = year.substring(0, 4);
-              }
-              
-              // Extract TMDB ID from href
-              let tmdbId = null;
-              if (href) {
-                const idMatch = href.match(/\/tv\/(\d+)/);
-                if (idMatch) {
-                  tmdbId = idMatch[1];
-                } else {
-                  // Fallback: try to find number in href
-                  const parts = href.split('/').filter(p => p && !isNaN(p));
-                  if (parts.length > 0) {
-                    tmdbId = parts[0];
-                  }
-                }
-              }
-              
-              // Clean and validate
-              if (title && title.length > 0 && !seenTitles.has(title.toLowerCase())) {
-                seenTitles.add(title.toLowerCase());
-                if (year && (isNaN(year) || year.length !== 4)) {
-                  year = null;
-                }
-                
-                results.push({
-                  id: tmdbId ? parseInt(tmdbId) : null,
-                  title: title,
-                  year: year || null,
-                  type: 'tv',
-                  displayTitle: `${title}${year ? ` (${year})` : ''} [TV Show]`,
-                  tmdbId: tmdbId
-                });
-              }
-            });
-            
-            if (results.length > 0) break; // Found results, stop trying other selectors
-          }
-
-          if (results.length > 0) {
-            return results.slice(0, 10);
-          }
-        } catch (err) {
-          continue; // Try next URL
-        }
-      }
-
-      return [];
-    } catch (error) {
-      return [];
-    }
-  }
-
-  // Get TV show details including seasons (like Elementum - API first, then scraping)
-  async getTVShowSeasons(tmdbId) {
-    // Try API first (like Elementum) - this is the best method
-    const apiResult = await this.getTVShowDetailsAPI(tmdbId);
-    if (apiResult && apiResult.seasons && apiResult.seasons.length > 0) {
-      // Filter out season 0 (specials) and sort
-      const seasons = apiResult.seasons
-        .filter(s => s.season_number > 0)
-        .map(s => ({
-          number: s.season_number,
-          name: s.name,
-          displayName: s.name || `Season ${s.season_number}`,
-          episode_count: s.episode_count
-        }))
-        .sort((a, b) => b.number - a.number); // Latest first
-      
-      if (seasons.length > 0) {
-        return seasons;
-      }
-    }
-    
-    // Fallback to web scraping - use the /seasons page to get all seasons
-    try {
-      // First, get the TV show page to find the slug
-      const tvUrl = `https://www.themoviedb.org/tv/${tmdbId}`;
-      const tvResponse = await axios.get(tvUrl, {
-        headers: { 'User-Agent': this.userAgent },
-        timeout: 15000
-      });
-      
-      // Extract slug from URL or page
-      const $tv = cheerio.load(tvResponse.data);
-      let slug = null;
-      const canonicalLink = $tv('link[rel="canonical"]').attr('href');
-      if (canonicalLink) {
-        const slugMatch = canonicalLink.match(/\/tv\/(\d+[^\/]*)/);
-        if (slugMatch) {
-          slug = slugMatch[1];
-        }
-      }
-      
-      // If no slug found, construct it from ID
-      if (!slug) {
-        slug = tmdbId;
-      }
-      
-      // Now get the seasons page which lists all seasons
-      const seasonsUrl = `https://www.themoviedb.org/tv/${slug}/seasons`;
-      const response = await axios.get(seasonsUrl, {
-        headers: { 'User-Agent': this.userAgent },
-        timeout: 15000
-      });
-
-      const $ = cheerio.load(response.data);
-      const seasons = [];
-      const seenSeasons = new Set();
-
-      // Find all season links on the seasons page
-      $('a[href*="/season/"]').each((i, elem) => {
-        const $link = $(elem);
-        const href = $link.attr('href');
-        const text = $link.text().trim();
-        
-        // Extract season number from href (format: /tv/106379-fallout/season/1)
-        const seasonMatch = href ? href.match(/\/season\/(\d+)/) : null;
-        const seasonNum = seasonMatch ? parseInt(seasonMatch[1]) : null;
-        
-        if (seasonNum !== null && seasonNum > 0 && !seenSeasons.has(seasonNum)) {
-          seenSeasons.add(seasonNum);
-          seasons.push({
-            number: seasonNum,
-            name: text || `Season ${seasonNum}`,
-            displayName: text || `Season ${seasonNum}`
-          });
-        }
-      });
-
-      // Also look for season cards or items
-      $('[class*="season"], [data-season]').each((i, elem) => {
-        const $elem = $(elem);
-        const href = $elem.find('a').attr('href') || $elem.attr('href');
-        const text = $elem.text().trim();
-        
-        if (href) {
-          const seasonMatch = href.match(/\/season\/(\d+)/);
-          const seasonNum = seasonMatch ? parseInt(seasonMatch[1]) : null;
-          
-          if (seasonNum !== null && seasonNum > 0 && !seenSeasons.has(seasonNum)) {
-            seenSeasons.add(seasonNum);
-            const nameMatch = text.match(/season[_\s]?(\d+)/i);
-            const displayName = nameMatch ? text : `Season ${seasonNum}`;
-            
-            seasons.push({
-              number: seasonNum,
-              name: displayName,
-              displayName: displayName
-            });
-          }
-        }
-      });
-
-      // Sort by season number (latest first)
-      seasons.sort((a, b) => b.number - a.number);
-      
-      return seasons;
-    } catch (error) {
-      // If /seasons page fails, try the main TV page as fallback
-      try {
-        const tvUrl = `https://www.themoviedb.org/tv/${tmdbId}`;
-        const response = await axios.get(tvUrl, {
-          headers: { 'User-Agent': this.userAgent },
-          timeout: 15000
-        });
-
-        const $ = cheerio.load(response.data);
-        const seasons = [];
-        const seenSeasons = new Set();
-
-        $('a[href*="/season/"]').each((i, elem) => {
-          const $link = $(elem);
-          const href = $link.attr('href');
-          const seasonMatch = href ? href.match(/\/season\/(\d+)/) : null;
-          const seasonNum = seasonMatch ? parseInt(seasonMatch[1]) : null;
-          
-          if (seasonNum !== null && seasonNum > 0 && !seenSeasons.has(seasonNum)) {
-            seenSeasons.add(seasonNum);
-            seasons.push({
-              number: seasonNum,
-              name: `Season ${seasonNum}`,
-              displayName: `Season ${seasonNum}`
-            });
-          }
-        });
-
-        seasons.sort((a, b) => b.number - a.number);
-        return seasons;
-      } catch (error2) {
-        return [];
-      }
-    }
-  }
-
-  // Get episodes for a specific season using API only - clean and simple
-  async getSeasonEpisodes(tmdbId, seasonNumber) {
-    try {
-      const apiEpisodes = await this.getSeasonEpisodesAPI(tmdbId, seasonNumber);
-      return apiEpisodes.map(ep => ({
-        number: ep.episode_number,
-        name: ep.name,
-        displayName: `${ep.episode_number}. ${ep.name || `Episode ${ep.episode_number}`}`
-      }));
-    } catch (error) {
-      throw error; // Let the caller handle the error
-    }
-  }
-}
-
-// Subtitle Manager - searches and downloads subtitles from multiple sources
-// Supports OpenSubtitles.com and Addic7ed
-// Credentials should be configured in core/system-config.js (env still supported as fallback).
-class SubtitleManager {
-  constructor(options = {}) {
-    const creds = options.openSubtitles || {};
-    this.apiKey = creds.apiKey || process.env.OPENSUBTITLES_API_KEY || '';
-    this.username = creds.username || process.env.OPENSUBTITLES_USERNAME || '';
-    this.password = creds.password || process.env.OPENSUBTITLES_PASSWORD || '';
-
-    this.client = new OpenSubtitles({
-      apikey: this.apiKey,
-      useragent: 'TemporaryUserAgent'
-    });
-    this.loggedIn = false;
-    this.token = null;
-    this.userAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-    this.addic7edHeaders = {
-      'User-Agent': this.userAgent,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': 'https://www.addic7ed.com/'
-    };
-  }
-
-  async login() {
-    if (this.loggedIn && this.token) {
-      return true;
-    }
-
-    if (!this.apiKey || !this.username || !this.password) {
-      console.error(chalk.yellow('OpenSubtitles credentials are missing. Configure credentials in core/system-config.js.'));
-      return false;
-    }
-    
-    try {
-      await this.client.login({
-        username: this.username,
-        password: this.password
-      });
-      this.loggedIn = true;
-      return true;
-    } catch (error) {
-      console.error(chalk.yellow(`OpenSubtitles login error: ${error.message}`));
-      return false;
-    }
-  }
-
-  // Search OpenSubtitles with enhanced TMDB metadata
-  async searchOpenSubtitles(query, language = 'en', season = null, episode = null, year = null, tmdbId = null, mediaType = null) {
-    try {
-      const loggedIn = await this.login();
-      if (!loggedIn) {
-        return [];
-      }
-
-      // Build search params using OpenSubtitles API fields
-      const searchParams = {
-        languages: language
-      };
-
-      // Priority 1: Use TMDB ID for most accurate results (if available)
-      if (tmdbId && mediaType) {
-        if (mediaType === 'movie') {
-          searchParams.tmdb_id = parseInt(tmdbId);
-          console.log(`   Searching with TMDB Movie ID: ${tmdbId}`);
-        } else if (mediaType === 'tv') {
-          searchParams.parent_tmdb_id = parseInt(tmdbId);
-          console.log(`   Searching with TMDB TV ID: ${tmdbId}`);
-        }
-      }
-
-      // Priority 2: Use query (title) - always include
-      searchParams.query = query;
-
-      // Priority 3: Add year for better filtering
-      if (year) {
-        searchParams.year = parseInt(year);
-        console.log(`   Filtering by year: ${year}`);
-      }
-
-      // Priority 4: Add season/episode for TV shows
-      if (season !== null) {
-        searchParams.season_number = parseInt(season);
-        console.log(`   Season: ${season}`);
-      }
-      if (episode !== null) {
-        searchParams.episode_number = parseInt(episode);
-        console.log(`   Episode: ${episode}`);
-      }
-
-      // Set media type for better filtering
-      if (mediaType === 'movie') {
-        searchParams.type = 'movie';
-      } else if (mediaType === 'tv') {
-        searchParams.type = 'episode';
-      }
-
-      console.log(`   OpenSubtitles search params:`, JSON.stringify(searchParams, null, 2));
-
-      // Try subtitles() method (the correct method for opensubtitles.com library)
-      const results = await this.client.subtitles(searchParams);
-      
-      if (!results || !results.data) {
-        return [];
-      }
-
-      return results.data.map(item => ({
-        id: item.id,
-        title: item.attributes.release || item.attributes.file_name || 'Unknown',
-        language: item.attributes.language || language,
-        downloadCount: item.attributes.download_count || 0,
-        fileId: item.attributes.files?.[0]?.file_id || null,
-        source: 'OpenSubtitles',
-        attributes: item.attributes
-      }));
-    } catch (error) {
-      console.error(`   OpenSubtitles error: ${error.message}`);
-      return [];
-    }
-  }
-
-  // Search Addic7ed
-  async searchAddic7ed(query, language = 'en', season = null, episode = null) {
-    try {
-      const searchUrl = `https://www.addic7ed.com/search.php?search=${encodeURIComponent(query)}`;
-      const response = await axios.get(searchUrl, {
-        headers: this.addic7edHeaders,
-        timeout: 15000
-      });
-
-      const $ = cheerio.load(response.data);
-      const results = [];
-      const showLinks = [];
-
-      // Find show links
-      $('table.tabel95 tbody tr').each((i, row) => {
-        const $row = $(row);
-        const $link = $row.find('a[href*="/show/"]');
-        if ($link.length > 0) {
-          const href = $link.attr('href');
-          const name = $link.text().trim();
-          if (href && name) {
-            showLinks.push({
-              name: name,
-              url: href.startsWith('http') ? href : `https://www.addic7ed.com${href}`
-            });
-          }
-        }
-      });
-
-      // If we have season/episode, find specific episode
-      if (showLinks.length > 0 && season !== null && episode !== null) {
-        const showUrl = showLinks[0].url;
-        const showResponse = await axios.get(showUrl, {
-          headers: this.addic7edHeaders,
-          timeout: 15000
-        });
-
-        const $show = cheerio.load(showResponse.data);
-        $show('table.tabel95 tbody tr').each((i, row) => {
-          const $row = $show(row);
-          const cells = $row.find('td');
-          
-          if (cells.length >= 4) {
-            try {
-              const rowSeason = parseInt($row.find('td').eq(0).text().trim());
-              const rowEpisode = parseInt($row.find('td').eq(1).text().trim());
-              const version = $row.find('td').eq(2).text().trim();
-              const lang = $row.find('td').eq(3).text().trim();
-              const $downloadLink = $row.find('a[href*="/original/"]');
-              
-              if (rowSeason === season && rowEpisode === episode && $downloadLink.length > 0) {
-                const downloadHref = $downloadLink.attr('href');
-                if (downloadHref) {
-                  const idMatch = downloadHref.match(/\/original\/(\d+)/);
-                  results.push({
-                    id: idMatch ? idMatch[1] : `addic7ed_${results.length}`,
-                    source: 'Addic7ed',
-                    title: `${showLinks[0].name} - S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')} - ${version}`,
-                    language: lang || 'English',
-                    downloadCount: 0,
-                    downloadUrl: downloadHref.startsWith('http') ? downloadHref : `https://www.addic7ed.com${downloadHref}`,
-                    attributes: {
-                      release: `${showLinks[0].name} - S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')} - ${version}`,
-                      language: lang || 'English',
-                      download_count: 0,
-                      addic7ed_url: downloadHref.startsWith('http') ? downloadHref : `https://www.addic7ed.com${downloadHref}`
-                    }
-                  });
-                }
-              }
-            } catch (e) {
-              // Skip invalid rows
-            }
-          }
-        });
-      }
-
-      return results;
-    } catch (error) {
-      return [];
-    }
-  }
-
-  // Search SubsPlease (for anime)
-  async searchSubsPlease(query, language = 'en', season = null, episode = null) {
-    try {
-      const searchUrl = `https://subsplease.org/?s=${encodeURIComponent(query)}`;
-      const response = await axios.get(searchUrl, {
-        headers: this.addic7edHeaders,
-        timeout: 15000
-      });
-
-      const $ = cheerio.load(response.data);
-      const results = [];
-      const showLinks = [];
-
-      // Find show links
-      $('.shows-wrapper .show, .archive-wrapper .show, article').each((i, elem) => {
-        const $elem = $(elem);
-        const $link = $elem.find('a').first();
-        const href = $link.attr('href');
-        
-        if (href && href.includes('/shows/')) {
-          const name = $link.text().trim() || $elem.find('h2, .title').text().trim();
-          if (name) {
-            showLinks.push({
-              name: name,
-              url: href.startsWith('http') ? href : `https://subsplease.org${href}`
-            });
-          }
-        }
-      });
-
-      // If we have season/episode, find specific episode
-      if (showLinks.length > 0 && season !== null && episode !== null) {
-        const showUrl = showLinks[0].url;
-        const showResponse = await axios.get(showUrl, {
-          headers: this.addic7edHeaders,
-          timeout: 15000
-        });
-
-        const $show = cheerio.load(showResponse.data);
-        $show('.episode, .episodes-list li, table tbody tr').each((i, row) => {
-          const $row = $show(row);
-          const episodeText = $row.text();
-          const $downloadLink = $row.find('a[href*=".srt"], a[href*=".ass"], a[href*="download"]');
-          
-          if ($downloadLink.length > 0) {
-            // Try to match season/episode
-            const seasonMatch = episodeText.match(/S(\d{1,2})/i);
-            const episodeMatch = episodeText.match(/E(\d{1,4})|Episode\s+(\d{1,4})/i);
-            
-            if (seasonMatch && episodeMatch) {
-              const rowSeason = parseInt(seasonMatch[1]);
-              const rowEpisode = parseInt(episodeMatch[1] || episodeMatch[2]);
-              
-              if (rowSeason === season && rowEpisode === episode) {
-                const downloadHref = $downloadLink.attr('href');
-                if (downloadHref) {
-                  results.push({
-                    id: `subsplease_${results.length}_${Date.now()}`,
-                    source: 'SubsPlease',
-                    title: `${showLinks[0].name} - S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`,
-                    language: 'English',
-                    downloadCount: 0,
-                    downloadUrl: downloadHref.startsWith('http') ? downloadHref : `https://subsplease.org${downloadHref}`,
-                    attributes: {
-                      release: `${showLinks[0].name} - S${season.toString().padStart(2, '0')}E${episode.toString().padStart(2, '0')}`,
-                      language: 'English',
-                      download_count: 0,
-                      subsplease_url: downloadHref.startsWith('http') ? downloadHref : `https://subsplease.org${downloadHref}`
-                    }
-                  });
-                }
-              }
-            }
-          }
-        });
-      }
-
-      return results;
-    } catch (error) {
-      return [];
-    }
-  }
-
-  // Search all subtitle sources (unified method)
-  async searchSubtitles(query, language = 'en', season = null, episode = null, year = null, tmdbId = null, mediaType = null) {
-    const results = [];
-    
-    // Build enhanced query with year for other sources (Addic7ed, SubsPlease)
-    const enhancedQuery = year ? `${query} ${year}` : query;
-    
-    // Search all sources in parallel
-    // OpenSubtitles gets full TMDB metadata for best results
-    // Other sources get enhanced query string
-    const [openSubtitlesResults, addic7edResults, subsPleaseResults] = await Promise.all([
-      this.searchOpenSubtitles(query, language, season, episode, year, tmdbId, mediaType),
-      this.searchAddic7ed(enhancedQuery, language, season, episode),
-      this.searchSubsPlease(enhancedQuery, language, season, episode)
-    ]);
-
-    results.push(...openSubtitlesResults);
-    results.push(...addic7edResults);
-    results.push(...subsPleaseResults);
-
-    // Sort by download count
-    results.sort((a, b) => {
-      const aCount = a.downloadCount || a.attributes?.download_count || 0;
-      const bCount = b.downloadCount || b.attributes?.download_count || 0;
-      return bCount - aCount;
-    });
-
-    return results.slice(0, 25); // Return top 25
-  }
-
-  // Download from OpenSubtitles
-  async downloadOpenSubtitles(fileId, outputPath) {
-    try {
-      const loggedIn = await this.login();
-      if (!loggedIn) {
-        return false;
-      }
-
-      const download = await this.client.download({
-        file_id: fileId
-      });
-
-      if (download && download.link) {
-        const response = await axios.get(download.link, {
-          responseType: 'arraybuffer',
-          timeout: 30000
-        });
-
-        fs.writeFileSync(outputPath, response.data);
-        return true;
-      }
-      return false;
-    } catch (error) {
-      return false;
-    }
-  }
-
-  // Download from Addic7ed
-  async downloadAddic7ed(url, outputPath) {
-    try {
-      const fullUrl = url.startsWith('http') ? url : `https://www.addic7ed.com${url}`;
-      const response = await axios.get(fullUrl, {
-        headers: this.addic7edHeaders,
-        responseType: 'arraybuffer',
-        timeout: 15000
-      });
-
-      if (response.status === 200) {
-        fs.writeFileSync(outputPath, response.data);
-        return true;
-      }
-      return false;
-    } catch (error) {
-      return false;
-    }
-  }
-
-  // Download from SubsPlease
-  async downloadSubsPlease(url, outputPath) {
-    try {
-      const fullUrl = url.startsWith('http') ? url : `https://subsplease.org${url}`;
-      const response = await axios.get(fullUrl, {
-        headers: this.addic7edHeaders,
-        responseType: 'arraybuffer',
-        timeout: 15000
-      });
-
-      if (response.status === 200) {
-        fs.writeFileSync(outputPath, response.data);
-        return true;
-      }
-      return false;
-    } catch (error) {
-      return false;
-    }
-  }
-
-  // Unified download method
-  async downloadSubtitle(subtitleId, outputPath, source = 'OpenSubtitles', downloadUrl = null) {
-    if (source === 'Addic7ed' || (downloadUrl && downloadUrl.toLowerCase().includes('addic7ed'))) {
-      return await this.downloadAddic7ed(downloadUrl || subtitleId, outputPath);
-    } else if (source === 'SubsPlease' || (downloadUrl && downloadUrl.toLowerCase().includes('subsplease'))) {
-      return await this.downloadSubsPlease(downloadUrl || subtitleId, outputPath);
-    } else {
-      return await this.downloadOpenSubtitles(subtitleId, outputPath);
-    }
-  }
-}
-
-// Scraper class for finding torrent links
-class TorrentScraper {
-  constructor() {
-    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
-  }
-
-  async search(query) {
-    const results = [];
-    
-    // Try multiple sources
-    const sources = [
-      () => this.search1337x(query),
-      () => this.searchYTS(query),
-      () => this.searchPirateBay(query),
-      () => this.searchNyaa(query)
-    ];
-
-    for (const source of sources) {
-      try {
-        const sourceResults = await source();
-        if (sourceResults && sourceResults.length > 0) {
-          results.push(...sourceResults);
-        }
-    } catch (error) {
-        // Continue to next source if one fails
-        continue;
-      }
-      }
-
-      return results;
-  }
-
-  /**
-   * Search every torrent source and return scored, filtered results.
-   *
-   * Modern signature:
-   *   searchAllSources(query, { season, episode, isAnime, absoluteEpisode })
-   * Legacy positional signature (kept for old callers):
-   *   searchAllSources(query, year, season, episode)
-   *
-   * Strategy (data-driven, see scripts/data/torrent-naming-report.md):
-   * 1. Build provider-specific queries — `Title S##E##` for live-action
-   *    sources (PirateBay/1337x have ~91% SE_PAIR results), and an extra
-   *    `Title {absoluteEp}` for anime sources (Nyaa/SubsPlease) so we hit
-   *    the absolute-numbering anime releases like `[SubsPlease] One Piece - 1163`.
-   * 2. Use the shared classifier in core/torrent-name-patterns.js to decide
-   *    whether each result actually matches the requested S/E. The same
-   *    rules drive the corpus survey, the regression test, and this filter.
-   * 3. Hard-drop wrong-season results (unless the anime absolute path
-   *    redeems them) instead of the old `seeders > 200` catch-all that
-   *    let live-action S02 packs through for anime S23 queries.
-   */
-  async searchAllSources(query, ...rest) {
-    // ---- Argument parsing (modern + legacy) ---------------------------------
-    let season = null;
-    let episode = null;
-    let isAnime = false;
-    let absoluteEpisode = null;
-    let onPartial = null;
-    let altTitles = [];
-
-    if (rest.length === 1 && rest[0] && typeof rest[0] === 'object' && !Array.isArray(rest[0])) {
-      const opts = rest[0];
-      season = opts.season != null ? Number(opts.season) : null;
-      episode = opts.episode != null ? Number(opts.episode) : null;
-      isAnime = !!opts.isAnime;
-      absoluteEpisode = opts.absoluteEpisode != null ? Number(opts.absoluteEpisode) : null;
-      onPartial = typeof opts.onPartial === 'function' ? opts.onPartial : null;
-      if (Array.isArray(opts.altTitles)) altTitles = opts.altTitles;
-    } else {
-      // legacy: (query, year, season, episode)
-      season = rest[1] != null ? Number(rest[1]) : null;
-      episode = rest[2] != null ? Number(rest[2]) : null;
-    }
-
-    // Backfill from the query string if no S/E was provided explicitly.
-    if (season == null || episode == null) {
-      const m = String(query).match(/\b[sS](\d{1,3})[\s_]*[eE](\d{1,5})\b/);
-      if (m) {
-        if (season == null) season = parseInt(m[1], 10);
-        if (episode == null) episode = parseInt(m[2], 10);
-      }
-    }
-
-    // Extract bare show name (strip any S/E or "Season N" suffix from the query).
-    const showName = String(query)
-      .replace(/\b[sS]\d{1,3}[\s_]*[eE]\d{1,5}\b.*$/, '')
-      .replace(/\bSeason\s+\d{1,3}\b.*$/i, '')
-      .trim() || String(query);
-
-    const pad2 = (n) => String(n).padStart(2, '0');
-    const seTag = season != null && episode != null ? `S${pad2(season)}E${pad2(episode)}` : null;
-
-    // Anime trackers (Nyaa/SubsPlease) index shows by their romaji title, not the
-    // English TMDB title (e.g. "Witch Hat Atelier" is listed as "Tongari Boushi no
-    // Atelier"). Search every known title variant so we don't miss the show.
-    const cleanTitle = (t) => String(t || '')
-      .replace(/\b[sS]\d{1,3}[\s_]*[eE]\d{1,5}\b.*$/, '')
-      .replace(/\bSeason\s+\d{1,3}\b.*$/i, '')
-      .trim();
-    const titleVariants = [];
-    const seenTitle = new Set();
-    for (const t of [showName, ...altTitles]) {
-      const c = cleanTitle(t);
-      const key = c.toLowerCase();
-      if (c && !seenTitle.has(key)) {
-        seenTitle.add(key);
-        titleVariants.push(c);
-      }
-    }
-
-    // ---- Provider-specific query plan --------------------------------------
-    // Per the corpus survey: PirateBay/1337x respond well to `Title S##E##`,
-    // SubsPlease only carries anime and searches by show name (appending an
-    // episode number returns nothing), Nyaa needs both S##E## and absolute forms.
-    const queriesPerSource = {
-      '1337x': seTag ? [`${showName} ${seTag}`] : [showName],
-      'YTS': season == null ? [showName] : [],
-      'PirateBay': seTag ? [`${showName} ${seTag}`, showName] : [showName],
-      'Nyaa': [],
-      'SubsPlease': [],
-    };
-
-    // Nyaa: formatted-SE and (for anime) absolute-episode queries, across every
-    // title variant so romaji-only listings are found.
-    for (const t of titleVariants) {
-      if (seTag) queriesPerSource.Nyaa.push(`${t} ${seTag}`);
-      if (isAnime && absoluteEpisode != null) {
-        queriesPerSource.Nyaa.push(`${t} ${absoluteEpisode}`);
-      }
-    }
-    if (queriesPerSource.Nyaa.length === 0) {
-      for (const t of titleVariants) queriesPerSource.Nyaa.push(t);
-    }
-
-    // SubsPlease: anime-only. Search by show name only (no episode number) — the
-    // API returns the show's episodes and scoring picks the right one.
-    if (isAnime || season == null) {
-      for (const t of titleVariants) queriesPerSource.SubsPlease.push(t);
-    }
-
-    // Dedupe queries per source to avoid redundant requests.
-    for (const k of Object.keys(queriesPerSource)) {
-      queriesPerSource[k] = [...new Set(queriesPerSource[k])];
-    }
-
-    const sources = [
-      { name: '1337x', fn: (q) => this.search1337x(q) },
-      { name: 'YTS', fn: (q) => this.searchYTS(q) },
-      { name: 'PirateBay', fn: (q) => this.searchPirateBay(q) },
-      { name: 'Nyaa', fn: (q) => this.searchNyaa(q) },
-      { name: 'SubsPlease', fn: (q) => this.searchSubsPlease(q) },
-    ];
-
-    const totalQueries = Object.values(queriesPerSource).reduce((s, arr) => s + arr.length, 0);
-    console.log(
-      chalk.cyan(
-        `\nSearching ${totalQueries} query/source combinations` +
-          (isAnime ? ' (anime: absolute-episode enabled)' : '')
-      )
-    );
-
-    // Dedupe + classify + score + sort a set of raw results. Pure over its input
-    // so it can be re-run on the growing accumulator as each source returns.
-    const expected = { season, episode, isAnime, absoluteEpisode };
-    const rankResults = (rawResults) => {
-      // ---- Dedupe by (name|source) -----------------------------------------
-      const seen = new Set();
-      const uniqueResults = [];
-      for (const r of rawResults) {
-        if (!r || !r.name) continue;
-        const key = `${r.name}|${r.source}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        uniqueResults.push(r);
-      }
-
-      // ---- No S/E filtering needed (movie or freeform query) ---------------
-      if (season == null || episode == null) {
-        uniqueResults.sort((a, b) => {
-          if ((b.seeders || 0) !== (a.seeders || 0)) return (b.seeders || 0) - (a.seeders || 0);
-          return String(a.name).localeCompare(String(b.name));
-        });
-        return uniqueResults;
-      }
-
-      // ---- Classify and score using the shared rule set --------------------
-      const scored = uniqueResults.map((result) => {
-        const parsed = parseName(result.name);
-        const verdict = classify(parsed, expected);
-
-        let score = result.seeders || 0;
-        let exactMatch = false;
-        let hasSeason = false;
-        let hasEpisode = false;
-
-        if (verdict.exactSEMatch || verdict.longformMatch) {
-          score += 2000;
-          exactMatch = true;
-          hasSeason = true;
-          hasEpisode = true;
-        } else if (verdict.absoluteMatch) {
-          // Anime absolute-episode hit (e.g. `One Piece - 1163`, `EP1163`).
-          score += 1500;
-          hasEpisode = true;
-        } else if (verdict.animeDashMatch) {
-          score += 1000;
-          hasEpisode = true;
-        } else if (verdict.episodeOnlyMatch) {
-          // Episode tagged but no season tag, no contradicting season —
-          // implicit-season match. Trustworthy per the survey data.
-          score += 800;
-          hasEpisode = true;
-        }
-
-        return { ...result, score, exactMatch, hasSeason, hasEpisode, verdict };
-      });
-
-      // ---- Filter: only keep real matches; drop wrong-season hard ----------
-      const filtered = scored.filter((r) => {
-        if (r.verdict.wrongSeason && !r.verdict.absoluteMatch) return false;
-        if (r.verdict.hasContradictingSeason && !r.verdict.absoluteMatch) return false;
-        return (
-          r.verdict.exactSEMatch ||
-          r.verdict.longformMatch ||
-          r.verdict.absoluteMatch ||
-          r.verdict.animeDashMatch ||
-          r.verdict.episodeOnlyMatch
-        );
-      });
-
-      filtered.sort((a, b) => {
-        // Pin SubsPlease to the top for anime searches (no seeders to rank on).
-        if (isAnime) {
-          const aSub = a.source === 'SubsPlease' ? 1 : 0;
-          const bSub = b.source === 'SubsPlease' ? 1 : 0;
-          if (aSub !== bSub) return bSub - aSub;
-        }
-        if (b.score !== a.score) return b.score - a.score;
-        return (b.seeders || 0) - (a.seeders || 0);
-      });
-
-      return filtered;
-    };
-
-    // ---- Issue all queries in parallel; rank+emit as each source returns ---
-    // Callers can pass opts.onPartial to receive a freshly-ranked snapshot every
-    // time a source resolves, so the UI can show results without waiting for all.
-    const accumulated = [];
-    const tasks = [];
-    for (const src of sources) {
-      const qs = queriesPerSource[src.name] || [];
-      for (const q of qs) {
-        tasks.push(
-          src.fn(q)
-            .catch(() => [])
-            .then((res) => {
-              if (Array.isArray(res) && res.length) {
-                for (const r of res) accumulated.push(r);
-              }
-              if (onPartial) {
-                try { onPartial(rankResults(accumulated)); } catch (e) { /* ignore */ }
-              }
-            })
-        );
-      }
-    }
-    await Promise.all(tasks);
-
-    return rankResults(accumulated);
-  }
-
-  async search1337x(query) {
-    try {
-      const searchUrl = `https://1337x.to/search/${encodeURIComponent(query)}/1/`;
-      const response = await axios.get(searchUrl, {
-        headers: { 'User-Agent': this.userAgent },
-        timeout: 10000
-      });
-
-        const $ = cheerio.load(response.data);
-        const results = [];
-
-      $('table.table-list tbody tr').each((i, elem) => {
-        if (i >= 10) return false; // Limit to 10 results
-            
-            const $row = $(elem);
-        const name = $row.find('td.name a').last().text().trim();
-        const seeders = parseInt($row.find('td.seeds').text().trim()) || 0;
-        const leechers = parseInt($row.find('td.leeches').text().trim()) || 0;
-        const size = $row.find('td.size').text().trim();
-        const link = $row.find('td.name a').last().attr('href');
-
-            if (name && link && seeders > 0) {
-              results.push({
-                name,
-                seeders,
-                leechers,
-            size,
-            link: `https://1337x.to${link}`,
-                source: '1337x'
-              });
-            }
-          });
-          
-          return results;
-      } catch (error) {
-      return [];
-      }
-  }
-
-  async searchYTS(query) {
-      try {
-      const searchUrl = `https://yts.mx/api/v2/list_movies.json?query_term=${encodeURIComponent(query)}&sort_by=seeds&order_by=desc`;
-        const response = await axios.get(searchUrl, {
-          headers: { 'User-Agent': this.userAgent },
-        timeout: 10000
-        });
-
-        const results = [];
-        const movies = response.data?.data?.movies || [];
-
-        for (const movie of movies.slice(0, 10)) {
-        for (const torrent of movie.torrents || []) {
-          if (torrent.seeds > 0) {
-              results.push({
-              name: `${movie.title} (${movie.year}) - ${torrent.quality}`,
-              seeders: torrent.seeds,
-              leechers: torrent.peers,
-              size: `${(torrent.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB`,
-                link: torrent.url,
-                source: 'YTS'
-              });
-            }
-          }
-        }
-
-          return results;
-      } catch (error) {
-      return [];
-      }
-  }
-
-  async searchPirateBay(query) {
-    try {
-      // Using proxy or alternative domain
-      const searchUrl = `https://apibay.org/q.php?q=${encodeURIComponent(query)}&cat=200`;
-      const response = await axios.get(searchUrl, {
-        headers: { 'User-Agent': this.userAgent },
-        timeout: 10000
-      });
-
-      const results = [];
-      const data = Array.isArray(response.data) ? response.data : [];
-
-      for (const item of data.slice(0, 10)) {
-        if (item.seeders > 0) {
-          const magnet = `magnet:?xt=urn:btih:${item.info_hash}&dn=${encodeURIComponent(item.name)}`;
-          results.push({
-            name: item.name,
-            seeders: parseInt(item.seeders) || 0,
-            leechers: parseInt(item.leechers) || 0,
-            size: `${(item.size / 1024 / 1024 / 1024).toFixed(2)} GB`,
-            link: magnet,
-            source: 'PirateBay'
-          });
-        }
-      }
-
-      return results;
-    } catch (error) {
-      return [];
-    }
-  }
-
-  async searchNyaa(query) {
-    try {
-      // Search Nyaa.si (for anime)
-      const domains = ['https://nyaa.si', 'https://www.nyaa.si'];
-      const results = [];
-
-      for (const domain of domains) {
-        try {
-          const searchUrl = `${domain}/?q=${encodeURIComponent(query)}`;
-          const response = await axios.get(searchUrl, {
-            headers: { 'User-Agent': this.userAgent },
-            timeout: 10000
-          });
-
-          const $ = cheerio.load(response.data);
-
-          $('table.torrent-list tbody tr').each((i, elem) => {
-            if (i >= 15) return false; // Limit to 15 results
-
-            const $row = $(elem);
-            const name = $row.find('td:nth-child(2) a:last-child').text().trim();
-            const seeders = parseInt($row.find('td:nth-child(6)').text().trim()) || 0;
-            const leechers = parseInt($row.find('td:nth-child(7)').text().trim()) || 0;
-            const size = $row.find('td:nth-child(4)').text().trim();
-            const magnet = $row.find('td:nth-child(3) a[href^="magnet:"]').attr('href');
-
-            if (name && magnet && seeders >= 0) {
-              results.push({
-                name,
-                seeders,
-                leechers,
-                size: size || 'Unknown',
-                link: magnet,
-                source: 'Nyaa'
-              });
-            }
-          });
-
-          if (results.length > 0) {
-            break; // Successfully got results from this domain
-          }
-        } catch (error) {
-          continue; // Try next domain
-        }
-      }
-
-      return results;
-    } catch (error) {
-      return [];
-    }
-  }
-
-  async searchSubsPlease(query) {
-    try {
-      const apiUrl = `https://subsplease.org/api/?f=search&tz=UTC&s=${encodeURIComponent(query)}`;
-      const response = await axios.get(apiUrl, {
-        headers: { 'User-Agent': this.userAgent, 'Accept': 'application/json' },
-        timeout: 10000,
-      });
-
-      const data = response.data;
-      if (!data || typeof data !== 'object' || Array.isArray(data)) return [];
-
-      const results = [];
-      for (const key of Object.keys(data)) {
-        const entry = data[key];
-        if (!entry || !Array.isArray(entry.downloads)) continue;
-
-        const showName = entry.show || key;
-        const episode = entry.episode != null ? String(entry.episode) : '';
-
-        for (const dl of entry.downloads) {
-          if (!dl || !dl.magnet) continue;
-          const res = dl.res ? `${dl.res}p` : '';
-          const name = `[SubsPlease] ${showName}${episode ? ` - ${episode}` : ''}${res ? ` (${res})` : ''}`;
-          results.push({
-            name,
-            // SubsPlease is a trusted anime release source but its API exposes no
-            // peer counts — leave them null instead of inventing numbers.
-            seeders: null,
-            leechers: null,
-            size: null,
-            link: dl.magnet,
-            source: 'SubsPlease',
-          });
-          if (results.length >= 30) break;
-        }
-        if (results.length >= 30) break;
-      }
-      return results;
-    } catch (error) {
-      return [];
-    }
-  }
-
-  async getMagnetLink(torrentResult) {
-    if (torrentResult.link.startsWith('magnet:')) {
-      return torrentResult.link;
-    }
-
-    // For 1337x, we need to get the actual magnet link
-    if (torrentResult.source === '1337x') {
-      try {
-        const response = await axios.get(torrentResult.link, {
-          headers: { 'User-Agent': this.userAgent },
-          timeout: 10000
-        });
-
-        const $ = cheerio.load(response.data);
-        const magnetLink = $('a[href^="magnet:"]').attr('href');
-        
-        if (magnetLink) {
-          return magnetLink;
-        }
-      } catch (error) {
-        console.error(chalk.red('Error fetching magnet link from 1337x'));
-      }
-    }
-
-    // For YTS, the link should be direct
-    if (torrentResult.source === 'YTS') {
-        return torrentResult.link;
-    }
-
-    // For Nyaa, PirateBay, and SubsPlease, link should already be a magnet link
-    if (torrentResult.source === 'Nyaa' || torrentResult.source === 'PirateBay' || torrentResult.source === 'SubsPlease') {
-      return torrentResult.link;
-    }
-
-      return torrentResult.link;
-  }
-}
-
-// Memory Tracker - Monitors memory usage and helps identify crash causes
-class MemoryTracker {
-  constructor(enabled = false) {
-    this.enabled = enabled;
-    this.snapshots = [];
-    this.maxSnapshots = 100;
-    this.startTime = Date.now();
-    this.startMemory = null;
-    this.warningThreshold = 500 * 1024 * 1024; // 500MB warning
-    this.criticalThreshold = 800 * 1024 * 1024; // 800MB critical
-    this.interval = null;
-    
-    if (this.enabled) {
-      this.startMemory = process.memoryUsage();
-      console.log(chalk.cyan('\nMemory tracking enabled'));
-      this.logMemory('Initial');
-      
-      // Start periodic monitoring
-      this.interval = setInterval(() => {
-        this.checkMemory();
-      }, 5000); // Check every 5 seconds
-    }
-  }
-  
-  formatBytes(bytes) {
-    return (bytes / 1024 / 1024).toFixed(2) + ' MB';
-  }
-  
-  logMemory(label = 'Current') {
-    if (!this.enabled) return;
-    
-    const usage = process.memoryUsage();
-    const timestamp = Date.now() - this.startTime;
-    
-    const snapshot = {
-      timestamp,
-      label,
-      heapUsed: usage.heapUsed,
-      heapTotal: usage.heapTotal,
-      external: usage.external,
-      rss: usage.rss,
-      arrayBuffers: usage.arrayBuffers
-    };
-    
-    this.snapshots.push(snapshot);
-    
-    // Keep only last N snapshots
-    if (this.snapshots.length > this.maxSnapshots) {
-      this.snapshots.shift();
-    }
-    
-    console.log(chalk.blue(`\n[${label}] Memory at ${(timestamp / 1000).toFixed(1)}s:`));
-    console.log(chalk.white(`   Heap Used:     ${this.formatBytes(usage.heapUsed)}`));
-    console.log(chalk.white(`   Heap Total:    ${this.formatBytes(usage.heapTotal)}`));
-    console.log(chalk.white(`   RSS:           ${this.formatBytes(usage.rss)}`));
-    console.log(chalk.white(`   External:      ${this.formatBytes(usage.external)}`));
-    console.log(chalk.white(`   ArrayBuffers:  ${this.formatBytes(usage.arrayBuffers || 0)}`));
-    
-    // Calculate delta from start
-    if (this.startMemory) {
-      const delta = usage.heapUsed - this.startMemory.heapUsed;
-      const deltaColor = delta > 0 ? chalk.red : chalk.green;
-      console.log(deltaColor(`   Delta:         ${this.formatBytes(Math.abs(delta))} (${delta > 0 ? '+' : '-'})`));
-    }
-  }
-  
-  checkMemory() {
-    if (!this.enabled) return;
-    
-    const usage = process.memoryUsage();
-    
-    // Warning threshold
-    if (usage.heapUsed > this.warningThreshold && usage.heapUsed < this.criticalThreshold) {
-      console.log(chalk.yellow(`\nMemory warning: ${this.formatBytes(usage.heapUsed)} heap used`));
-      this.logMemory('Warning');
-    }
-    
-    // Critical threshold
-    if (usage.heapUsed > this.criticalThreshold) {
-      console.log(chalk.red(`\nCRITICAL: High memory usage: ${this.formatBytes(usage.heapUsed)}`));
-      this.logMemory('Critical');
-      
-      // Suggest actions
-      console.log(chalk.yellow('   Suggestions:'));
-      console.log(chalk.yellow('      - Stop and restart the current stream'));
-      console.log(chalk.yellow('      - Pick a torrent with fewer/lighter files'));
-      console.log(chalk.yellow('      - Close other applications'));
-      console.log(chalk.yellow('      - Keep only one active player tab'));
-    }
-  }
-  
-  generateReport() {
-    if (!this.enabled || this.snapshots.length === 0) return;
-    
-    console.log(chalk.cyan('\n\n' + '='.repeat(60)));
-    console.log(chalk.cyan('MEMORY TRACKING REPORT'));
-    console.log(chalk.cyan('='.repeat(60)));
-    
-    const first = this.snapshots[0];
-    const last = this.snapshots[this.snapshots.length - 1];
-    const peak = this.snapshots.reduce((max, s) => s.heapUsed > max.heapUsed ? s : max, first);
-    
-    console.log(chalk.white('\nSummary:'));
-    console.log(chalk.white(`   Duration:      ${(last.timestamp / 1000 / 60).toFixed(1)} minutes`));
-    console.log(chalk.white(`   Snapshots:     ${this.snapshots.length}`));
-    console.log(chalk.white(`   Start Memory:  ${this.formatBytes(first.heapUsed)}`));
-    console.log(chalk.white(`   End Memory:    ${this.formatBytes(last.heapUsed)}`));
-    console.log(chalk.white(`   Peak Memory:   ${this.formatBytes(peak.heapUsed)} at ${(peak.timestamp / 1000).toFixed(1)}s`));
-    
-    const growth = last.heapUsed - first.heapUsed;
-    const growthRate = (growth / last.timestamp) * 1000; // bytes per second
-    
-    if (growth > 0) {
-      console.log(chalk.red(`   Memory Growth: +${this.formatBytes(growth)}`));
-      console.log(chalk.yellow(`   Growth Rate:   ${this.formatBytes(growthRate)}/sec`));
-      
-      // Estimate time to crash
-      const remainingMemory = this.criticalThreshold - last.heapUsed;
-      if (growthRate > 0 && remainingMemory > 0) {
-        const timeToFull = remainingMemory / growthRate;
-        console.log(chalk.red(`   Est. Crash In: ${(timeToFull / 60).toFixed(1)} minutes (if growth continues)`));
-      }
-    } else {
-      console.log(chalk.green(`   Memory Growth: ${this.formatBytes(growth)} (stable)`));
-    }
-    
-    // Identify potential issues
-    console.log(chalk.white('\nPotential Issues:'));
-    
-    const avgArrayBuffers = this.snapshots.reduce((sum, s) => sum + (s.arrayBuffers || 0), 0) / this.snapshots.length;
-    if (avgArrayBuffers > 100 * 1024 * 1024) {
-      console.log(chalk.yellow(`   High ArrayBuffer usage (${this.formatBytes(avgArrayBuffers)})`));
-      console.log(chalk.yellow('      ? Likely video buffering issue'));
-      console.log(chalk.yellow('      ? Restart stream and choose a higher-seeder torrent'));
-    }
-    
-    const avgExternal = this.snapshots.reduce((sum, s) => sum + s.external, 0) / this.snapshots.length;
-    if (avgExternal > 200 * 1024 * 1024) {
-      console.log(chalk.yellow(`   High external memory (${this.formatBytes(avgExternal)})`));
-      console.log(chalk.yellow('      ? Likely WebTorrent buffering'));
-      console.log(chalk.yellow('      ? Reduce peer connections'));
-    }
-    
-    if (growth > 100 * 1024 * 1024) {
-      console.log(chalk.red(`   Memory leak detected!`));
-      console.log(chalk.yellow('      ? Memory growing over time'));
-      console.log(chalk.yellow('      ? Check browser developer console for errors'));
-    }
-    
-    // Save to file
-    const reportPath = path.join(require('os').tmpdir(), `stream-memory-report-${Date.now()}.json`);
-    try {
-      fs.writeFileSync(reportPath, JSON.stringify({
-        summary: {
-          duration: last.timestamp,
-          snapshots: this.snapshots.length,
-          startMemory: first.heapUsed,
-          endMemory: last.heapUsed,
-          peakMemory: peak.heapUsed,
-          growth,
-          growthRate
-        },
-        snapshots: this.snapshots
-      }, null, 2));
-      console.log(chalk.green(`\nReport saved: ${reportPath}`));
-    } catch (err) {
-      console.log(chalk.red(`\n? Could not save report: ${err.message}`));
-    }
-    
-    console.log(chalk.cyan('\n' + '='.repeat(60) + '\n'));
-  }
-  
-  stop() {
-    if (this.interval) {
-      clearInterval(this.interval);
-      this.interval = null;
-    }
-    
-    if (this.enabled) {
-      this.logMemory('Final');
-      this.generateReport();
-    }
-  }
-}
 
 // Stream manager
 class StreamManager extends EventEmitter {
   constructor(lowMemoryMode = false, memoryTracker = null) {
     super();
-    // Create WebTorrent client with NO LIMITS for maximum speed
-    // All artificial restrictions removed to allow full download speed
+    // Torrent engine: TorrServer sidecar (downloads from the swarm + serves the file
+    // over HTTP). On Android the native side may launch the arm binary and set
+    // UPLAYER_TORRSERVER_EXTERNAL=1; otherwise this client spawns the bundled binary.
     
-    this.client = new WebTorrent({
-      maxConns: 100,             // INCREASED: Allow up to 100 peer connections for maximum speed
-      downloadLimit: -1,         // No download limit (unlimited)
-      uploadLimit: -1,           // No upload limit (unlimited) - helps with peer exchange
-      dht: true,                 // Enable DHT
-      tracker: true,             // Enable trackers
-      utp: true,                 // Enable uTP
-      webSeeds: true,            // Enable web seeds
-    });
+    // One shared, long-lived TorrServer for the whole app (started at boot, stopped on
+    // exit) — NOT a per-stream process. Every StreamManager talks to the same engine, so
+    // starting/stopping a stream never spawns or kills it.
+    const { getSharedClient } = require('./core/torrserver-client');
+    this.tsClient = getSharedClient();
+    this.currentHash = null;
     
     this.lowMemoryMode = lowMemoryMode;
     this.memoryTracker = memoryTracker;
@@ -1748,6 +109,10 @@ class StreamManager extends EventEmitter {
     // Cache ffmpeg/ffprobe paths
     this.ffmpegPath = this.findFFmpegBinary('ffmpeg');
     this.ffprobePath = this.findFFmpegBinary('ffprobe');
+
+    // Live byte-supply state for this stream. Fed by the TorrServer stats tick; the
+    // playhead crosses in from whichever target is playing (see the registry fan-out).
+    this.streamHealth = new StreamHealth();
   }
 
   // Emit a log line to EventEmitter listeners AND write to stdout (CLI behaviour preserved)
@@ -1865,8 +230,34 @@ class StreamManager extends EventEmitter {
     return null;
   }
   
-  // Convert SRT subtitle format to WebVTT format
+  // Convert SRT/VTT subtitle content to WebVTT.
+  // Primary path uses the maintained `subtitle` library, which tolerates partially
+  // downloaded/streaming files (subtitles are written progressively as the torrent
+  // downloads, so the input is sometimes truncated mid-cue). A permissive inline
+  // SRT parser remains as a defensive fallback for the rare case the library throws.
   convertSRTtoVTT(srtContent) {
+    if (!srtContent || srtContent.trim() === '') {
+      return 'WEBVTT\n\n';
+    }
+    if (srtContent.trim().startsWith('WEBVTT')) {
+      return srtContent;
+    }
+
+    try {
+      const { parseSync, stringifySync } = require('subtitle');
+      const converted = stringifySync(parseSync(srtContent), { format: 'WebVTT' });
+      if (converted && converted.trim().startsWith('WEBVTT')) {
+        return converted;
+      }
+    } catch (err) {
+      // Library couldn't parse (often a partially-downloaded file) — fall back.
+    }
+
+    return this._legacySrtToVtt(srtContent);
+  }
+
+  // Tolerant inline SRT->VTT fallback (kept permissive for truncated streaming files).
+  _legacySrtToVtt(srtContent) {
     if (srtContent.trim().startsWith('WEBVTT')) {
       return srtContent;
     }
@@ -1908,267 +299,95 @@ class StreamManager extends EventEmitter {
   }
 
   // Extract embedded subtitles from video file during streaming (works with partially downloaded files)
-  async extractEmbeddedSubtitlesStreaming(videoFile, torrent) {
+  // Total duration (seconds) of the media at `url`, via ffprobe. Reads the container
+  // header only (fast) — used to build the full on-demand HLS playlist.
+  _probeDurationSeconds(url) {
     return new Promise((resolve) => {
-      const { spawn } = require('child_process');
-      
-      if (!this.ffmpegPath || !this.ffprobePath) {
-        resolve([]);
-        return;
-      }
-
-      let checkAttempts = 0;
-      const maxAttempts = 60;
-      
-      const tryExtraction = () => {
-        checkAttempts++;
-        
-        const minSize = 10 * 1024 * 1024;
-        const downloaded = torrent.downloaded || 0;
-        const availableSize = Math.min(downloaded, videoFile.length);
-        
-        if (availableSize < minSize) {
-          if (checkAttempts < maxAttempts) {
-            setTimeout(tryExtraction, 500);
-            return;
-          }
-        }
-        
-        const sampleSize = Math.min(availableSize, 50 * 1024 * 1024);
-        const samplePath = path.join(this.tempDir, `sample_${Date.now()}.tmp`);
-        const sampleStream = videoFile.createReadStream({ start: 0, end: sampleSize });
-        const writeStream = fs.createWriteStream(samplePath);
-        
-        sampleStream.on('error', () => {
-          if (checkAttempts < maxAttempts) {
-            setTimeout(tryExtraction, 1000);
-            return;
-          }
-          resolve([]);
-        });
-        
-        sampleStream.pipe(writeStream);
-        
-        writeStream.on('finish', () => {
-          const ffprobe = spawn(this.ffprobePath, [
-            '-v', 'error',
-            '-select_streams', 's',
-            '-show_entries', 'stream=index:stream_tags=language,title',
-            '-of', 'json',
-            samplePath
-          ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
-
-          let probeOutput = '';
-          ffprobe.stdout.on('data', (data) => {
-            probeOutput += data.toString();
-          });
-
-          ffprobe.on('close', (code) => {
-            try {
-              if (fs.existsSync(samplePath)) {
-                fs.unlinkSync(samplePath);
-              }
-            } catch (e) {}
-            
-            if (code !== 0 || !probeOutput) {
-              resolve([]);
-              return;
-            }
-
-            try {
-              const probeData = JSON.parse(probeOutput);
-              const subtitleStreams = probeData.streams || [];
-              
-              if (subtitleStreams.length === 0) {
-                resolve([]);
-                return;
-              }
-
-              console.log(chalk.cyan(`\nFound ${subtitleStreams.length} embedded subtitle track(s) - extracting during download...`));
-              
-              // Create placeholder entries immediately so they appear in HTML
-              subtitleStreams.forEach((stream, index) => {
-                const trackIndex = stream.index;
-                const language = stream.tags?.language || 'unknown';
-                const title = stream.tags?.title || `Subtitle ${index + 1}`;
-                const outputPath = path.join(this.tempDir, `subtitle_${trackIndex}_${Date.now()}.vtt`);
-                
-                const placeholderInfo = {
-                  path: outputPath,
-                  source: 'embedded',
-                  language: language,
-                  label: `${title} (${language})`,
-                  codec: 'webvtt',
-                  trackIndex: trackIndex,
-                  isPlaceholder: true
-                };
-                
-                const exists = this.subtitlePaths.some(s => s.trackIndex === trackIndex && s.source === 'embedded');
-                if (!exists) {
-                  this.subtitlePaths.push(placeholderInfo);
-                  if (!this.subtitlePath) {
-                    this.subtitlePath = outputPath;
-                  }
-                  console.log(chalk.gray(`   Reserved slot for: ${placeholderInfo.label} (will be available during streaming)`));
-                }
-              });
-              
-              // Extract each subtitle track
-              const extractionPromises = subtitleStreams.map((stream, index) => {
-                return new Promise((resolveTrack) => {
-                  const trackIndex = stream.index;
-                  const language = stream.tags?.language || 'unknown';
-                  const title = stream.tags?.title || `Subtitle ${index + 1}`;
-                  const outputPath = path.join(this.tempDir, `subtitle_${trackIndex}_${Date.now()}.vtt`);
-                  
-                  let subtitleInfo = null;
-                  let extractionStarted = false;
-                  
-                  const attemptExtraction = () => {
-                    if (extractionStarted) return;
-                    extractionStarted = true;
-                    
-                    const ffmpeg = spawn(this.ffmpegPath, [
-                      '-i', 'pipe:0',
-                      '-map', `0:s:${index}`,
-                      '-c:s', 'webvtt',
-                      outputPath,
-                      '-y',
-                      '-loglevel', 'error',
-                      '-fflags', '+genpts'
-                    ], hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
-
-                    const videoStream = videoFile.createReadStream();
-                    videoStream.pipe(ffmpeg.stdin);
-
-                    let checkCount = 0;
-                    let messageLogged = false;
-                    const checkInterval = setInterval(() => {
-                      checkCount++;
-                      if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-                        const existingEntry = this.subtitlePaths.find(s => 
-                          s.trackIndex === trackIndex && s.source === 'embedded' && s.isPlaceholder
-                        );
-                        
-                        if (existingEntry && !messageLogged) {
-                          existingEntry.path = outputPath;
-                          existingEntry.isPlaceholder = false;
-                          subtitleInfo = existingEntry;
-                          messageLogged = true;
-                          // Don't log here - wait for ffmpeg to complete for final message
-                          clearInterval(checkInterval);
-                          resolveTrack(subtitleInfo);
-                        }
-                      }
-                      
-                      if (checkCount > 30 || torrent.progress === 1) {
-                        clearInterval(checkInterval);
-                      }
-                    }, 1000);
-
-                    ffmpeg.on('close', (code) => {
-                      clearInterval(checkInterval);
-
-                      if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-                        if (!subtitleInfo) {
-                          const existingEntry = this.subtitlePaths.find(s =>
-                            s.trackIndex === trackIndex && s.source === 'embedded' && s.isPlaceholder
-                          );
-
-                          if (existingEntry) {
-                            existingEntry.path = outputPath;
-                            existingEntry.isPlaceholder = false;
-                            subtitleInfo = existingEntry;
-                            // Don't log individual extractions - they'll be shown in batch at the end
-                          }
-                        }
-                        // ffmpeg finished reading the whole stream: this track is now fully
-                        // extracted, so clients can stop re-fetching it.
-                        if (subtitleInfo) {
-                          subtitleInfo.complete = true;
-                        }
-                        resolveTrack(subtitleInfo);
-                      } else {
-                        resolveTrack(null);
-                      }
-                    });
-
-                    ffmpeg.on('error', () => {
-                      clearInterval(checkInterval);
-                      extractionStarted = false;
-                      if (!subtitleInfo && torrent.progress < 0.95) {
-                        setTimeout(attemptExtraction, 5000);
-                      } else {
-                        resolveTrack(null);
-                      }
-                    });
-
-                    videoStream.on('error', () => {
-                      clearInterval(checkInterval);
-                      extractionStarted = false;
-                      ffmpeg.kill();
-                      if (!subtitleInfo && torrent.progress < 0.95) {
-                        setTimeout(attemptExtraction, 5000);
-                      } else {
-                        resolveTrack(null);
-                      }
-                    });
-                  };
-                  
-                  setTimeout(attemptExtraction, 2000);
-                });
-              });
-
-              Promise.all(extractionPromises).then((results) => {
-                const extracted = results.filter(r => r !== null);
-                if (extracted.length > 0) {
-                  // Print all extracted subtitles in one batch to avoid interleaving with download progress
-                  process.stdout.write('\r\x1b[K'); // Clear any progress line
-                  console.log(chalk.green(`\n? Successfully extracted ${extracted.length} subtitle track(s):`));
-                  extracted.forEach(sub => {
-                    if (sub && sub.label) {
-                      console.log(chalk.green(`   ? ${sub.label}`));
-                    }
-                  });
-                  console.log(chalk.cyan('   Subtitles are available during streaming\n'));
-                }
-                resolve(extracted);
-              });
-            } catch (err) {
-              resolve([]);
-            }
-          });
-
-          ffprobe.on('error', () => {
-            try {
-              if (fs.existsSync(samplePath)) {
-                fs.unlinkSync(samplePath);
-              }
-            } catch (e) {}
-            resolve([]);
-          });
-        });
-
-        writeStream.on('error', () => {
-          try {
-            if (fs.existsSync(samplePath)) {
-              fs.unlinkSync(samplePath);
-            }
-          } catch (e) {}
-          if (checkAttempts < maxAttempts) {
-            setTimeout(tryExtraction, 1000);
-          } else {
-            resolve([]);
-          }
-        });
-      };
-      
-      setTimeout(tryExtraction, 1000);
+      if (!this.ffprobePath || !url) return resolve(0);
+      const { execFile } = require('child_process');
+      execFile(this.ffprobePath, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', url],
+        { timeout: 30000 }, (e, out) => { const d = parseFloat(String(out || '').trim()); resolve(Number.isFinite(d) && d > 0 ? d : 0); });
     });
   }
 
+  async extractEmbeddedSubtitlesStreaming(videoFile, torrent) {
+    const { spawn } = require('child_process');
+    if (!this.ffmpegPath || !this.ffprobePath || !this._torrserverStreamUrl) return [];
+    const url = this._torrserverStreamUrl;
+
+    // DETECT subtitle tracks straight from the LIVE TorrServer stream. The old path
+    // probed a truncated byte-sample (gated on TorrServer's preloaded_bytes), which
+    // frequently failed to parse — so the file's subtitles were never detected and
+    // none ever appeared. A direct probe of the stream URL reads just the header and
+    // is reliable.
+    const streams = await new Promise((resolve) => {
+      const p = spawn(this.ffprobePath, [
+        '-v', 'error', '-select_streams', 's',
+        '-show_entries', 'stream=index:stream_tags=language,title',
+        '-of', 'json', url,
+      ], hiddenChildProcessOptions({ stdio: ['ignore', 'pipe', 'pipe'] }));
+      let out = '';
+      p.stdout.on('data', (d) => { out += d.toString(); });
+      p.on('close', () => { try { resolve(JSON.parse(out).streams || []); } catch (e) { resolve([]); } });
+      p.on('error', () => resolve([]));
+    });
+    if (!streams.length) { this._log('No embedded subtitle tracks in this file.'); return []; }
+    this._log(`Found ${streams.length} embedded subtitle track(s); extracting to WebVTT…`);
+
+    // EXTRACT each track to WebVTT in TWO passes. ffmpeg's webvtt writer only emits its
+    // cues at the very END of a run (it doesn't flush as it goes), so a single full pass
+    // means subtitles don't appear until the whole file has been read ≈ fully downloaded.
+    // Instead we do a quick first pass over the opening few minutes (`-t`) so subtitles
+    // show within seconds, then a full pass that replaces it with every cue. The player's
+    // /api/subtitles poll loads the early file, then reloads once `complete` flips true.
+    streams.forEach((stream, i) => {
+      const language = (stream.tags && stream.tags.language) || 'und';
+      const title = (stream.tags && stream.tags.title) || `Subtitle ${i + 1}`;
+      const outputPath = path.join(this.tempDir, `subtitle_${stream.index}_${Date.now()}_${i}.vtt`);
+      let info = this.subtitlePaths.find((s) => s.source === 'embedded' && s.trackIndex === stream.index);
+      if (!info) {
+        info = { path: outputPath, source: 'embedded', language, label: `${title} (${language})`, codec: 'webvtt', trackIndex: stream.index, isPlaceholder: true, complete: false };
+        this.subtitlePaths.push(info);
+        if (!this.subtitlePath) this.subtitlePath = outputPath;
+      } else {
+        info.path = outputPath;
+      }
+
+      // Extract subtitles for [0, limitSec] (or the whole file when limitSec is 0) and
+      // atomically swap the result into outputPath. Returns true if it produced cues.
+      const extract = (limitSec) => new Promise((resolve) => {
+        const tmp = `${outputPath}.${limitSec || 'full'}.tmp`;
+        const args = ['-i', url];
+        if (limitSec) args.push('-t', String(limitSec));
+        // -f webvtt is mandatory here: `tmp` ends in .tmp, so ffmpeg cannot infer the
+        // muxer from the extension and aborts with "Unable to choose an output format".
+        args.push('-map', `0:s:${i}`, '-c:s', 'webvtt', '-f', 'webvtt', '-fflags', '+genpts', '-loglevel', 'error', '-y', tmp);
+        const proc = spawn(this.ffmpegPath, args, hiddenChildProcessOptions({ stdio: ['ignore', 'ignore', 'pipe'] }));
+        this.activeStreams.add(proc);
+        let stderr = '';
+        if (proc.stderr) proc.stderr.on('data', (d) => { stderr = (stderr + d.toString()).slice(-500); });
+        proc.on('close', () => {
+          this.activeStreams.delete(proc);
+          try { if (fs.existsSync(tmp) && fs.statSync(tmp).size > 24) { fs.renameSync(tmp, outputPath); resolve(true); return; } } catch (e) {}
+          try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e) {}
+          // Surface the reason — a silent failure here leaves the track stuck at
+          // ready:false for the whole session, with no retry and nothing in the log.
+          if (stderr.trim()) this._log(`Subtitle extraction failed (${info.label}): ${stderr.trim().split('\n')[0]}`);
+          resolve(false);
+        });
+        proc.on('error', () => { this.activeStreams.delete(proc); resolve(false); });
+      });
+
+      (async () => {
+        if (await extract(180)) { info.isPlaceholder = false; this._log(`Subtitle ready (first minutes): ${info.label}`); }
+        if (await extract(0)) { info.isPlaceholder = false; info.complete = true; this._log(`Subtitle complete: ${info.label}`); }
+      })();
+    });
+
+    return this.subtitlePaths.filter((s) => s.source === 'embedded');
+  }
+
   async stream(magnetLink, options = {}) {
-    // Determine if we are running in server/in-process mode (EventEmitter listeners attached)
     const serverMode = this.listenerCount('line') > 0 || this.listenerCount('progress') > 0;
 
     const log = (text) => {
@@ -2181,435 +400,330 @@ class StreamManager extends EventEmitter {
     };
 
     return new Promise((resolve, reject) => {
-      if (!this.client) {
-        reject(new Error('Stream client is not available'));
-        return;
-      }
-
-      const client = this.client;
       let settled = false;
-      let errorHandler = null;
-      let connectionTimeout = null;
-      let progressInterval = null;
-      let cancelPendingStream = null;
-
-      const clearPendingSetup = () => {
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout);
-          connectionTimeout = null;
-        }
-        if (progressInterval) {
-          clearInterval(progressInterval);
-          progressInterval = null;
-        }
-        if (errorHandler && client && typeof client.removeListener === 'function') {
-          client.removeListener('error', errorHandler);
-        }
-        if (this._cancelPendingStream === cancelPendingStream) {
-          this._cancelPendingStream = null;
-        }
-      };
-
+      let statsInterval = null;
+      const cleanup = () => { if (statsInterval) { clearInterval(statsInterval); statsInterval = null; } };
       const finish = (fn, value) => {
         if (settled) return;
         settled = true;
-        clearPendingSetup();
+        cleanup();
+        this._cancelPendingStream = null;
         fn(value);
       };
+      this._cancelPendingStream = (message = 'Stream manager destroyed') => finish(reject, new Error(message));
 
-      cancelPendingStream = (message = 'Stream manager destroyed') => {
-        finish(reject, new Error(message));
-      };
-
-      log('Adding torrent...');
-
-      if (this.memoryTracker) {
-        this.memoryTracker.logMemory('Before adding torrent');
-      }
-
-      // Set up error handler BEFORE adding torrent
-      errorHandler = (err) => {
-        log(`? WebTorrent error: ${err.message}`);
-        finish(reject, err);
-      };
-      client.once('error', errorHandler);
-      this._cancelPendingStream = cancelPendingStream;
-
-      // Add extra trackers to help find more peers
-      const extraTrackers = [
-        'udp://tracker.opentrackr.org:1337/announce',
-        'udp://tracker.openbittorrent.com:6969/announce',
-        'udp://tracker.bittor.pw:1337/announce',
-        'udp://tracker.dler.org:6969/announce',
-        'udp://tracker.torrent.eu.org:451/announce',
-        'udp://tracker.skynetcloud.tk:6969/announce',
-        'udp://tracker.internetwarriors.net:1337/announce',
-        'udp://retracker.lanta-net.ru:2710/announce',
-        'udp://exodus.desync.com:6969/announce',
-        'udp://tracker.tiny-vps.com:6969/announce',
-        'udp://tracker.filemail.com:6969/announce',
-        'udp://tracker.leech.ie:1337/announce',
-        'wss://tracker.openwebtorrent.com',
-        'wss://tracker.btorrent.xyz',
-        'wss://tracker.fastcast.nz'
-      ];
-
-      // Parse magnet link and add extra trackers
-      let enhancedMagnet = magnetLink;
-      try {
-        const magnetParts = magnetLink.split('&');
-        const hasTrailer = magnetParts.some(p => p.startsWith('tr='));
-        
-        if (!hasTrailer) {
-          // No trackers in original magnet, add all extra ones
-          extraTrackers.forEach(tracker => {
-            enhancedMagnet += `&tr=${encodeURIComponent(tracker)}`;
-          });
-          log('   Added 15 extra trackers to magnet link');
-        } else {
-          // Add only web trackers (wss://) to existing magnet
-          const webTrackers = extraTrackers.filter(t => t.startsWith('wss://'));
-          webTrackers.forEach(tracker => {
-            enhancedMagnet += `&tr=${encodeURIComponent(tracker)}`;
-          });
-          log('   Added 3 web trackers to existing magnet link');
-        }
-      } catch (e) {
-        log('   Warning: Could not enhance magnet link, using original');
-      }
-
-      // Add timeout for torrent connection (5 minutes)
-      connectionTimeout = setTimeout(() => {
-        const peerCount = client.torrents && client.torrents.length > 0 
-          ? client.torrents[0].numPeers 
-          : 0;
-        log(`? Timeout: Could not connect to torrent after 5 minutes`);
-        log(`   Peers found: ${peerCount}`);
-        log('Try:');
-        log('   1. Check your internet connection');
-        log('   2. Try a different torrent');
-        log('   3. Make sure no other torrent client is running');
-        log('   4. Wait longer - some torrents take time to find peers');
-        finish(reject, new Error('Torrent connection timeout'));
-      }, 300000);
-
-      // Show connection progress with peer count
-      log('   Connecting to DHT and trackers to find peers...');
-      let connectionTimer = 0;
-      progressInterval = setInterval(() => {
-        connectionTimer += 5;
-        const peerCount = client.torrents && client.torrents.length > 0 
-          ? client.torrents[0].numPeers 
-          : 0;
-        
-        if (connectionTimer >= 15 && connectionTimer % 5 === 0) {
-          if (connectionTimer === 15) {
-            log('Taking longer than expected...');
-            log('   This can happen if:');
-            log('   - Torrent metadata is being downloaded');
-            log('   - DHT/trackers are slow to respond');
-            log('   - Network connection issues');
-            log('   Please wait - finding peers...');
-          }
-          log(`   ? Still connecting... (${connectionTimer}s) | Peers: ${peerCount}`);
-        }
-      }, 5000);
-
-      // Store torrent data in our sandbox dir. WebTorrent otherwise defaults to
-      // /tmp/webtorrent (it picks /tmp whenever it merely *exists*), which is not
-      // writable on Android -> EACCES. An explicit path bypasses that default.
-      client.add(enhancedMagnet, { path: this.tempDir }, async (torrent) => {
-        clearPendingSetup();
-        if (settled) return;
-
+      (async () => {
         try {
-          this.currentTorrent = torrent;
-        
-        if (this.memoryTracker) {
-          this.memoryTracker.logMemory('After adding torrent');
-        }
-        
-        log(`? Torrent added: ${torrent.name}`);
-        log(`Files: ${torrent.files.length}`);
-        log(`Peers: ${torrent.numPeers}`);
-        
-        // CRITICAL: Deselect all files first to prevent memory allocation
-        // Analysis shows 138MB ArrayBuffer spike when torrent is added
-        torrent.files.forEach(file => file.deselect());
-        
-        // Find video file
-        const videoFile = torrent.files.find(file => {
-          const ext = path.extname(file.name).toLowerCase();
-          return ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v'].includes(ext);
-        });
+          log('Starting torrent engine (TorrServer)...');
+          await this.tsClient.start();
+          if (settled) return;
 
-        if (!videoFile) {
-          finish(reject, new Error('No video file found in torrent'));
-          return;
-        }
-        
-        // CRITICAL: Select ONLY the video file to prevent unnecessary memory allocation
-        videoFile.select();
-        
-        // WebTorrent's file.select() already enables sequential downloading
-        // and prioritizes pieces needed for streaming
-        log('Sequential streaming enabled (WebTorrent auto-prioritization)');
-        
-        // OPTIONAL: In low-memory mode, implement piece cleanup to free memory
-        let lastCleanupPiece = 0;
-        
-        const pieceManagementInterval = setInterval(() => {
-          if (!this.currentTorrent) {
-            clearInterval(pieceManagementInterval);
-            return;
-          }
-          
-          // CLEANUP: Only in low-memory mode, deselect old pieces to free memory
-          if (this.lowMemoryMode && videoFile._torrent) {
-            const torrent = videoFile._torrent;
-            const downloaded = torrent.downloaded;
-            const pieceLength = torrent.pieceLength;
-            const currentPiece = Math.floor(downloaded / pieceLength);
-            
-            // Deselect pieces that are far behind current position
-            const cleanupThreshold = 200; // Keep 200 pieces (~100-400MB) before cleanup
-            if (currentPiece > lastCleanupPiece + cleanupThreshold) {
-              // Calculate byte ranges for old pieces
-              const startByte = lastCleanupPiece * pieceLength;
-              const endByte = (currentPiece - cleanupThreshold) * pieceLength;
-              
-              if (endByte > startByte) {
-                try {
-                  // Deselect byte range (this is the correct WebTorrent API)
-                  videoFile.deselect(startByte, endByte);
-                  lastCleanupPiece = currentPiece - cleanupThreshold;
-                  
-                  if (this.memoryTracker) {
-                    this.memoryTracker.logMemory(`Cleaned up pieces ${lastCleanupPiece} to ${currentPiece - cleanupThreshold}`);
-                  }
-                } catch (e) {
-                  // Ignore cleanup errors
-                }
-              }
-            }
-          }
-        }, 10000); // Check every 10 seconds (cleanup doesn't need to be frequent)
-        
-        // Clean up interval when torrent is removed
-        torrent.on('close', () => {
-          clearInterval(pieceManagementInterval);
-        });
-        
-        log(`Video file: ${videoFile.name}`);
-        log(`Size: ${(videoFile.length / 1024 / 1024 / 1024).toFixed(2)} GB`);
-        log('Other files deselected to save memory');
-        
-        if (this.memoryTracker) {
-          this.memoryTracker.logMemory('Video file found');
-        }
-        
-        // Extract embedded subtitles as video downloads (streaming extraction)
-        if (this.ffmpegPath && this.ffprobePath) {
-          log('Extracting embedded subtitles...');
-          this.extractEmbeddedSubtitlesStreaming(videoFile, torrent).then(() => {
-            if (this.memoryTracker) {
-              this.memoryTracker.logMemory('After subtitle extraction');
-            }
-          }).catch(() => {
-            // Ignore extraction errors
-          });
-        } else {
-          log('Embedded subtitle extraction unavailable: ffmpeg/ffprobe not found in PATH');
-          log('   Install ffmpeg (with ffprobe) to load subtitles from multisub torrents in browser');
-        }
+          log('Adding torrent...');
+          const hash = await this.tsClient.add(magnetLink, options.title || '');
+          this.currentHash = hash;
 
-        // Add external subtitle if provided
-        if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
-          const subtitleInfo = {
-            path: options.subtitlePath,
-            source: 'external',
-            language: 'en',
-            label: 'External Subtitle',
-            codec: 'srt',
-            complete: true
+          log('Resolving files (waiting for metadata)...');
+          const fileInfo = await this.tsClient.resolveLargestFile(hash);
+          if (settled) return;
+
+          const videoFile = this.createTorrServerFile(hash, fileInfo);
+          this._torrserverStreamUrl = this.tsClient.streamUrl(hash, fileInfo.id, fileInfo.path);
+          log(`Video file: ${videoFile.name}`);
+          log(`Size: ${(videoFile.length / 1024 / 1024 / 1024).toFixed(2)} GB`);
+
+          // Stats shim so existing code that reads torrent.downloaded/downloadSpeed keeps working.
+          const torrentLike = {
+            downloaded: 0, downloadSpeed: 0, progress: 0,
+            pieceLength: 4 * 1024 * 1024, numPeers: 0,
+            files: [videoFile], name: videoFile.name,
+            on() {}, once() {}, removeListener() {},
           };
-          this.subtitlePaths.push(subtitleInfo);
-          if (!this.subtitlePath) {
-            this.subtitlePath = options.subtitlePath;
-          }
-        }
-        
-        // Start HTTP server for streaming
-        await this.startStreamingServer(videoFile, async (url, urls, videoPath, originalVideoPath, streamMeta = {}) => {
-          if (this.memoryTracker) {
-            this.memoryTracker.logMemory('Streaming server started');
-          }
+          this.streamHealth.attachSource({ sizeBytes: videoFile.length });
+          statsInterval = setInterval(async () => {
+            try {
+              const s = await this.tsClient.stats(hash);
+              const health = this.streamHealth.report(s);
 
-          const subtitleManifestUrl = `${String(url).replace(/\/$/, '')}/api/subtitles`;
-          if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
-            log(`Subtitle available: ${subtitleManifestUrl}`);
-            log('   Subtitles are available inside the native JS player track menu');
-          } else if (this.ffmpegPath && this.ffprobePath) {
-            log(`Subtitle manifest (embedded / streaming): ${subtitleManifestUrl}`);
-          }
-          log('Streaming server started!');
-          log(`Stream URL: ${url}`);
-          if (urls && urls.localhost && urls.localhost !== url) {
-            log(`Local fallback: ${urls.localhost}`);
-          }
+              // torrentLike is the WebTorrent-compatibility shim; keep it fed.
+              torrentLike.downloaded = health.downloadedBytes;
+              torrentLike.downloadSpeed = health.downloadSpeedBps;
+              torrentLike.numPeers = health.peers;
+              torrentLike.progress = health.percent;
 
-          // Build full video URLs
-          // videoPath is for web player (may be transcoded for HEVC)
-          // originalVideoPath is for VLC (always original format - VLC can play anything)
-          const fullVideoUrl = videoPath ? `${url.replace(/\/$/, '')}${videoPath}` : url;
-          const fullOriginalVideoUrl = originalVideoPath ? `${url.replace(/\/$/, '')}${originalVideoPath}` : fullVideoUrl;
-
-          // WAIT for torrent to have enough data for smooth playback
-          // This prevents VLC from connecting before there's data to stream
-          const minPiecesWait = 10; // Wait for at least 10 pieces to be downloaded
-          const maxWaitTime = 30000; // Max wait time: 30 seconds
-          const checkInterval = 500; // Check every 500ms
-
-          log(`⏳ Waiting for torrent to buffer (${minPiecesWait} pieces minimum)...`);
-
-          const waitForBuffer = new Promise((waitResolve) => {
-            const startTime = Date.now();
-            
-            const checkReady = () => {
-              const elapsed = Date.now() - startTime;
-              const downloadedPieces = Math.floor(torrent.downloaded / torrent.pieceLength);
-              
-              if (downloadedPieces >= minPiecesWait) {
-                log(`✅ Buffer ready: ${downloadedPieces} pieces downloaded (${(torrent.downloaded / 1024 / 1024).toFixed(1)} MB)`);
-                waitResolve();
-                return;
+              if (serverMode) {
+                // `progress` is the startup download bar and its shape is frozen —
+                // legacyProgressPayload is the only producer of those pre-formatted
+                // strings. This interval dies at finish() (i.e. when the player appears),
+                // which is exactly the bar's intended life.
+                this.emit('progress', legacyProgressPayload(health));
+                this.emit('stream_health', health);
               }
-              
-              if (elapsed >= maxWaitTime) {
-                log(`⚠️  Buffer timeout: Only ${downloadedPieces} pieces after ${maxWaitTime/1000}s (proceeding anyway)`);
-                waitResolve();
-                return;
-              }
-              
-              setTimeout(checkReady, checkInterval);
-            };
-            
-            checkReady();
-          });
-          
-          await waitForBuffer;
+            } catch (e) { /* ignore poll errors */ }
+          }, 1000);
 
-          log('Opening native JS player...');
-          log('   Press Ctrl+C to stop streaming');
-
-          // Emit structured player_ready event for server mode
-          if (serverMode) {
-            const playerRoot = String(url || '').replace(/\/?$/, '/');
-            // Keep playerUrl as the server root so the web app opens the HTML player, not raw video.
-            const playerReadyData = {
-              url: playerRoot,
-              urls,
-              playerUrl: playerRoot,
-              vlcUrl: fullOriginalVideoUrl,
-              mediaUrl: fullOriginalVideoUrl,
-              castUrl: fullVideoUrl,
-              subtitleManifestUrl,
-              videoFormat: streamMeta.videoFormat || null,
-            };
-            this.emit('player_ready', playerReadyData);
-          }
-
-          // Open in default player (force new tab for better memory management)
-          if (options.openPlayer !== false) {
-            open(url, { newInstance: true, wait: false }).catch(() => {
-              log('Could not auto-open player. Copy the URL above and open it in your browser.');
-            });
-          }
-
-          finish(resolve, {
-            url,
-            urls,
-            torrent,
-            videoFile,
-            subtitlePath: options.subtitlePath,
-            videoPath,
-            originalVideoPath,
-            vlcUrl: fullOriginalVideoUrl,
-            mediaUrl: fullOriginalVideoUrl,
-            castUrl: fullVideoUrl,
-            subtitleManifestUrl,
-          });
-        }, options.subtitlePath);
-
-        // Show download progress with throttling to prevent terminal spam
-        let downloadCount = 0;
-        let downloadComplete = false;
-        let lastProgressUpdate = 0;
-        const progressUpdateInterval = 100; // Update progress every 100ms (10 times per second)
-        
-        torrent.on('download', () => {
-          // Stop showing progress updates once download is complete
-          if (downloadComplete) return;
-          
-          downloadCount++;
-          
-          // Throttle progress updates to prevent excessive terminal redraws
-          const now = Date.now();
-          if (now - lastProgressUpdate < progressUpdateInterval) {
-            return; // Skip this update
-          }
-          lastProgressUpdate = now;
-          
-          const progress = (torrent.progress * 100).toFixed(1);
-          const downloaded = (torrent.downloaded / 1024 / 1024).toFixed(2);
-          const speed = (torrent.downloadSpeed / 1024 / 1024).toFixed(2);
-          
-          // Log memory every 500 download events (~every 500 MB typically)
-          if (this.memoryTracker && downloadCount % 500 === 0) {
-            if (!serverMode) process.stdout.write('\r\x1b[K\n');
-            this.memoryTracker.logMemory(`Download progress: ${progress}%`);
-          }
-          
-          if (serverMode) {
-            // Emit structured progress event for the browser
-            this.emit('progress', {
-              percent: parseFloat(progress),
-              speed: `${speed} MB/s`,
-              downloaded: `${downloaded} MB`,
-            });
+          // Embedded subtitle extraction (reads videoFile.createReadStream + torrentLike.downloaded)
+          if (this.ffmpegPath && this.ffprobePath) {
+            log('Extracting embedded subtitles...');
+            this.extractEmbeddedSubtitlesStreaming(videoFile, torrentLike).catch(() => {});
           } else {
-            // Always draw progress on same line (clearing previous content)
-            process.stdout.write(`\r\x1b[K${chalk.cyan(`Progress: ${progress}% | Downloaded: ${downloaded} MB | Speed: ${speed} MB/s`)}`);
+            log('Embedded subtitle extraction unavailable: ffmpeg/ffprobe not found');
           }
-        });
 
-        torrent.on('done', () => {
-          downloadComplete = true;
-          if (!serverMode) process.stdout.write('\r\x1b[K'); // Clear the progress line
-          log('? Download complete!');
-          if (this.memoryTracker) {
-            this.memoryTracker.logMemory('Download complete');
+          // External subtitle if provided
+          if (options.subtitlePath && fs.existsSync(options.subtitlePath)) {
+            this.subtitlePaths.push({ path: options.subtitlePath, source: 'external', language: 'en', label: 'External Subtitle', codec: 'srt', complete: true });
+            if (!this.subtitlePath) this.subtitlePath = options.subtitlePath;
           }
-        });
+
+          // Burn-in: when requested, the external subtitle is rendered into the cast
+          // transcode (for TVs/receivers that can't display a separate subtitle track).
+          this._burnSubtitlePath = (options.burnSubtitle && options.subtitlePath && fs.existsSync(options.subtitlePath))
+            ? options.subtitlePath : null;
+
+          await this.startStreamingServer(videoFile, async (url, urls, videoPath, originalVideoPath, streamMeta = {}) => {
+            const subtitleManifestUrl = `${String(url).replace(/\/$/, '')}/api/subtitles`;
+            log('Streaming server started!');
+            log(`Stream URL: ${url}`);
+            const fullVideoUrl = videoPath ? `${url.replace(/\/$/, '')}${videoPath}` : url;
+            const fullOriginalVideoUrl = originalVideoPath ? `${url.replace(/\/$/, '')}${originalVideoPath}` : fullVideoUrl;
+
+            // VLC / external players seek best against TorrServer's NATIVE stream
+            // endpoint — it preloads around the seek position — so point them straight
+            // at it instead of proxying raw bytes (capped 10MB/request) through :8000.
+            let vlcDirectUrl = fullOriginalVideoUrl;
+            try {
+              var lanHost = new URL(String(url)).hostname || '127.0.0.1';
+              vlcDirectUrl = this.tsClient.streamUrl(hash, fileInfo.id, fileInfo.path, lanHost);
+            } catch (e) { /* fall back to proxied URL */ }
+
+            // Show the player / cast / VLC buttons THE MOMENT the stream server is up.
+            // Every URL is already known here, so there's no reason to make the user wait
+            // for a download threshold first (that "stuck waiting at 0.6%" feeling). The
+            // player — and TorrServer's own preload — buffer when the stream is actually
+            // opened. We still warm TorrServer's cache from the start in the BACKGROUND
+            // (below) so a cushion is usually ready by the time they click, but it no
+            // longer gates the UI.
+            if (serverMode) {
+              const playerRoot = String(url || '').replace(/\/?$/, '/');
+              this.emit('player_ready', {
+                url: playerRoot, urls, playerUrl: playerRoot,
+                vlcUrl: vlcDirectUrl, mediaUrl: vlcDirectUrl, castUrl: fullVideoUrl,
+                subtitleManifestUrl, videoFormat: streamMeta.videoFormat || null,
+                mediaFacts: streamMeta.mediaFacts || null,
+              });
+              // The stats tick above is about to be cleared by finish(), because the
+              // download bar's job ends when the player appears. Stream health outlives
+              // it by design: the interesting question during playback is how far ahead
+              // of the PLAYHEAD the cache is, and the playhead doesn't exist until now.
+              this._startHealthTicker(hash);
+            }
+
+            if (options.openPlayer !== false) {
+              open(url, { newInstance: true, wait: false }).catch(() => log('Could not auto-open player. Open the URL in your browser.'));
+            }
+
+            finish(resolve, {
+              url, urls, torrent: torrentLike, videoFile, subtitlePath: options.subtitlePath,
+              videoPath, originalVideoPath, vlcUrl: vlcDirectUrl, mediaUrl: vlcDirectUrl,
+              castUrl: fullVideoUrl, subtitleManifestUrl,
+            });
+
+            // Background cache warm-up (NON-blocking): drive TorrServer's download from the
+            // start so a cushion is buffered ahead of when the user opens the player. This
+            // does NOT gate the buttons — it just runs ahead, then stops once the target is
+            // reached; TorrServer's read-ahead takes over once playback begins.
+            //   UPLAYER_PREBUFFER_MB  how much to pre-warm, MB (default 16; set 0 to disable)
+            let warmMB = Number(process.env.UPLAYER_PREBUFFER_MB);
+            if (!Number.isFinite(warmMB)) warmMB = 16;
+            warmMB = Math.max(0, warmMB);
+            if (warmMB > 0) {
+              const warmBytes = warmMB * 1024 * 1024;
+              log(`Warming ~${warmMB} MB of cache in the background…`);
+              let got = 0;
+              const warm = videoFile.createReadStream({ start: 0 });
+              this.activeStreams.add(warm);
+              const endWarm = () => { this.activeStreams.delete(warm); try { warm.destroy(); } catch (e) {} };
+              warm.on('data', (d) => { got += d.length; if (got >= warmBytes) endWarm(); });
+              warm.on('error', endWarm);
+              warm.on('end', endWarm);
+            }
+          }, options.subtitlePath);
         } catch (err) {
           finish(reject, err);
         }
-      });
+      })();
     });
   }
 
-  // Probe video codec from webtorrent file (HEVC/H.265 not supported in browsers - needs transcoding)
+  // TorrServer-backed file object exposing the same surface (createReadStream/length/name)
+  // the streaming/transcode/subtitle code previously relied on from a WebTorrent file.
+  createTorrServerFile(hash, fileInfo) {
+    const ts = this.tsClient;
+    const streamPath = ts.streamPath(hash, fileInfo.id, fileInfo.path);
+    const port = ts.port;
+    const name = require('path').basename(fileInfo.path || 'video');
+    const fileLength = fileInfo.length || 0;
+    return {
+      name,
+      length: fileLength,
+      _torrent: null,
+      select() {},
+      deselect() {},
+      // RESILIENT read stream. TorrServer's /stream response can end EARLY — when the
+      // reader hits a piece the swarm hasn't delivered yet it may return a clean EOF
+      // rather than blocking. A naive `res.pipe(out)` forwards that as end-of-stream,
+      // and a consumer reading from a non-resumable pipe (the HLS-remux ffmpeg, fed via
+      // stdin) takes it as "file finished" and exits after ~one segment → the web /
+      // Chromecast player gets ~6s then stalls forever. So instead of piping once, we
+      // track how many bytes were delivered and, if the upstream ends before the
+      // requested range is complete and the consumer still wants data, transparently
+      // RECONNECT from the next byte and keep feeding. The consumer sees one continuous
+      // stream; transient swarm stalls become invisible reconnects, not a false EOF.
+      createReadStream(opts = {}) {
+        const { PassThrough } = require('stream');
+        const http = require('http');
+        const out = new PassThrough(opts.highWaterMark ? { highWaterMark: opts.highWaterMark } : {});
+        const start = opts.start || 0;
+        const hasEnd = opts.end != null && opts.end !== Infinity;
+        const finalEnd = hasEnd ? opts.end : (fileLength ? fileLength - 1 : null); // inclusive target byte
+        const MAX_EMPTY_RETRIES = 60; // consecutive reconnects with no progress before giving up (~12s)
+        let pos = start;          // next byte we still need
+        let emptyRetries = 0;     // reset whenever data flows, so a slow-but-alive swarm streams forever
+        let closed = false;
+        let curReq = null, curRes = null;
+
+        const teardown = () => { closed = true; try { curRes && curRes.destroy(); } catch (e) {} try { curReq && curReq.destroy(); } catch (e) {} };
+        out.on('error', teardown);
+        out.on('close', teardown);
+        out.on('drain', () => { try { curRes && curRes.resume(); } catch (e) {} });
+
+        const retryOrFail = () => {
+          if (closed) return;
+          if (emptyRetries < MAX_EMPTY_RETRIES) { emptyRetries++; setTimeout(connect, 200); }
+          else { try { out.destroy(new Error('TorrServer stream stalled')); } catch (e) {} }
+        };
+
+        function connect() {
+          if (closed) return;
+          if (finalEnd != null && pos > finalEnd) { try { out.end(); } catch (e) {} return; } // whole range delivered → real EOF
+          const range = `bytes=${pos}-${finalEnd != null ? finalEnd : ''}`;
+          curReq = http.request({ host: '127.0.0.1', port, path: streamPath, method: 'GET', headers: { Range: range } }, (res) => {
+            curRes = res;
+            res.on('data', (d) => { emptyRetries = 0; pos += d.length; if (!out.write(d)) res.pause(); });
+            res.on('end', () => {
+              curRes = null;
+              if (closed) return;
+              if (finalEnd != null && pos <= finalEnd) retryOrFail(); // ended early → resume from pos
+              else { try { out.end(); } catch (e) {} }
+            });
+            res.on('error', () => { curRes = null; retryOrFail(); });
+          });
+          curReq.on('error', () => { curReq = null; retryOrFail(); });
+          curReq.end();
+        }
+
+        connect();
+        return out;
+      },
+    };
+  }
+
+  // Extract mono 16kHz wav from the current TorrServer stream for speech tools.
+  async _extractStreamAudio(outWav, { maxSeconds } = {}) {
+    if (!this.ffmpegPath || !this._torrserverStreamUrl) return false;
+    const { spawn } = require('child_process');
+    const args = ['-y', '-i', this._torrserverStreamUrl];
+    if (maxSeconds) args.push('-t', String(maxSeconds));
+    args.push('-vn', '-ac', '1', '-ar', '16000', outWav);
+    return new Promise((resolve) => {
+      const p = spawn(this.ffmpegPath, args, hiddenChildProcessOptions({ stdio: ['ignore', 'ignore', 'pipe'] }));
+      p.on('close', (code) => resolve(code === 0 && fs.existsSync(outWav)));
+      p.on('error', () => resolve(false));
+    });
+  }
+
+  // Generate subtitles from the stream audio via whisper.cpp; appends to subtitlePaths
+  // so the player's subtitle manifest poll picks them up. Heavy — user-triggered.
+  async generateSubtitles(opts = {}) {
+    const tools = require('./core/subtitle-tools');
+    if (!tools.isWhisperAvailable()) return { ok: false, reason: 'whisper not installed' };
+    const wav = path.join(this.tempDir, `whisper_${Date.now()}.wav`);
+    this._log('Extracting audio for subtitle generation…');
+    if (!(await this._extractStreamAudio(wav, { maxSeconds: opts.maxSeconds }))) return { ok: false, reason: 'audio extraction failed' };
+    this._log('Generating subtitles with whisper (this can take a while)…');
+    const outBase = path.join(this.tempDir, `whisper_${Date.now()}`);
+    const r = await tools.generateSubtitle(wav, outBase, { language: opts.language });
+    try { fs.unlinkSync(wav); } catch (e) {}
+    if (!r.ok) return r;
+    this.subtitlePaths.push({ path: r.output, source: 'whisper', language: opts.language || 'en', label: 'Generated (whisper)', codec: 'srt', complete: true });
+    this._log('Generated subtitles ready.');
+    return { ok: true, index: this.subtitlePaths.length - 1 };
+  }
+
+  // Auto-sync an external subtitle to the stream audio via alass; returns { ok, output }.
+  async syncSubtitle(subPath, opts = {}) {
+    const tools = require('./core/subtitle-tools');
+    if (!tools.isAlassAvailable()) return { ok: false, reason: 'alass not installed' };
+    if (!subPath || !fs.existsSync(subPath)) return { ok: false, reason: 'subtitle missing' };
+    const wav = path.join(this.tempDir, `alass_${Date.now()}.wav`);
+    this._log('Extracting audio for subtitle sync…');
+    if (!(await this._extractStreamAudio(wav, { maxSeconds: opts.maxSeconds }))) return { ok: false, reason: 'audio extraction failed' };
+    const out = path.join(this.tempDir, `synced_${Date.now()}.srt`);
+    const r = await tools.syncSubtitle(wav, subPath, out);
+    try { fs.unlinkSync(wav); } catch (e) {}
+    return r;
+  }
+
+  // Probe video codec from the stream (HEVC/H.265 not supported in browsers - needs transcoding)
   async probeVideoCodec(videoFile) {
     const probe = await this.probeMediaStreams(videoFile);
     return probe ? probe.vcodec : null;
   }
 
-  // Sample first ~10MB of the file and ffprobe it for video + audio + format info.
-  // Returns { vcodec, vlevel, vprofile, acodec, achannels, container, durationSec } or null.
+  // Probe the file for video + audio + format info, returning
+  // { vcodec, vlevel, vprofile, acodec, achannels, container, durationSec } or null.
+  //
+  // Codec/container info lives in the header (the MP4 `moov` / MKV header), which is a
+  // few MB at most — so we sample a SMALL front chunk first to keep time-to-playable low
+  // (this probe runs before the player buttons appear, so a 10 MB sample on a cold swarm
+  // was the main "stuck waiting" delay). Only if the small sample yields no video codec
+  // (e.g. an unusually large/late header) do we retry with a bigger sample, so correctness
+  // is preserved. Tunable via UPLAYER_PROBE_SAMPLE_MB (default 4).
   async probeMediaStreams(videoFile) {
+    if (!this.ffprobePath) return null;
+    // Duration reaches streamHealth from here (see the tail of this method): without it
+    // there's no average bitrate, so no buffer-ahead estimate — and the estimate stays
+    // null rather than becoming a guess.
+
+    // Deliberately sample the front of the file rather than ffprobe the URL directly.
+    // A URL probe is faster in isolation (~265ms vs downloading a sample) BUT it reads
+    // only what ffprobe wants and seeks to the end for the Matroska index, so it leaves
+    // very little of the file START cached. The sample below pulls the opening MBs
+    // sequentially through the resilient reader — those are exactly the bytes the HLS
+    // remux reads next, so the "waste" is really a prebuffer. Losing it starves the
+    // remux on a cold swarm: TorrServer answers with a clean early EOF, ffmpeg treats
+    // that as end-of-file and exits, and the Chromecast plays a few seconds then stops.
+    const smallMB = Math.max(1, Number(process.env.UPLAYER_PROBE_SAMPLE_MB) || 4);
+    const smallBytes = smallMB * 1024 * 1024;
+    let r = await this._probeSample(videoFile, smallBytes);
+    if ((!r || !r.vcodec) && videoFile.length > smallBytes) {
+      r = (await this._probeSample(videoFile, Math.min(10 * 1024 * 1024, videoFile.length))) || r;
+    }
+    if (r && r.mediaFacts) {
+      this.streamHealth.attachSource({
+        sizeBytes: r.mediaFacts.sizeBytes,
+        durationSec: r.mediaFacts.durationSec,
+      });
+    }
+    return r;
+  }
+
+  // ffprobe the first `sampleSize` bytes (downloaded to a temp file so ffprobe never hangs
+  // on a growing stream). Returns the same shape as probeMediaStreams, or null.
+  async _probeSample(videoFile, sampleSize) {
     const { spawn } = require('child_process');
     if (!this.ffprobePath) return null;
-    const sampleSize = Math.min(10 * 1024 * 1024, videoFile.length);
+    sampleSize = Math.min(sampleSize, videoFile.length);
     const samplePath = path.join(this.tempDir, `probe_${Date.now()}.tmp`);
     return new Promise((resolve) => {
       const readStream = videoFile.createReadStream({ start: 0, end: sampleSize - 1 });
@@ -2631,21 +745,14 @@ class StreamManager extends EventEmitter {
           try { fs.unlinkSync(samplePath); } catch (e) {}
           if (code !== 0 || !out) return resolve(null);
           try {
-            const parsed = JSON.parse(out);
-            const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
-            const video = streams.find((s) => s.codec_type === 'video');
-            const audio = streams.find((s) => s.codec_type === 'audio');
-            const format = parsed.format || {};
-            const duration = Number.parseFloat(format.duration);
-            resolve({
-              vcodec: video && video.codec_name ? String(video.codec_name).toLowerCase() : null,
-              vprofile: video && video.profile ? String(video.profile).toLowerCase() : null,
-              vlevel: video && Number.isFinite(Number(video.level)) ? Number(video.level) : null,
-              acodec: audio && audio.codec_name ? String(audio.codec_name).toLowerCase() : null,
-              achannels: audio && Number.isFinite(Number(audio.channels)) ? Number(audio.channels) : null,
-              container: format && format.format_name ? String(format.format_name).toLowerCase() : null,
-              durationSec: Number.isFinite(duration) ? duration : null,
-            });
+            // The full probe: resolution, bitrate, frame rate and the real track lists
+            // were always in this JSON and were being dropped on the floor. videoFile.length
+            // is passed because `format.size`/`format.bit_rate` describe the truncated
+            // SAMPLE on disk, not the real file — reading them would report ~4 MB.
+            const facts = normalizeProbe(JSON.parse(out), videoFile.length);
+            // The 7 flat keys callers already read (decidePlaybackStrategy, the !vcodec
+            // retry gate) ride along on the same object, so both shapes share one owner.
+            resolve(Object.assign({ mediaFacts: facts }, legacyProbeAlias(facts)));
           } catch (e) {
             resolve(null);
           }
@@ -2776,9 +883,12 @@ class StreamManager extends EventEmitter {
 
   // Build ffmpeg video encoding args. Inserts -vf scale (even dimensions) and -pix_fmt yuv420p
   // so GPU encoders (NVENC, QSV, AMF) don't fail with "Error while opening encoder".
-  _encoderArgs(enc) {
+  _encoderArgs(enc, burnFilter = null) {
+    const filters = [];
+    if (burnFilter) filters.push(`subtitles=${burnFilter}`); // burn subtitles into the picture (libass)
+    filters.push('scale=trunc(iw/2)*2:trunc(ih/2)*2');
     const scaleAndPix = [
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-vf', filters.join(','),
       '-pix_fmt', 'yuv420p',
     ];
     if (!enc) {
@@ -2801,6 +911,13 @@ class StreamManager extends EventEmitter {
     if (strategyInfo.strategy !== 'directplay' && !this.ffmpegPath) {
       console.log(chalk.yellow('\nNon-MP4 / non-AAC content - install ffmpeg for HLS remux/transcode. Falling back to direct-play.'));
       strategyInfo = { strategy: 'directplay' };
+    }
+
+    // Burn-in subtitles requires re-encoding the video — force the transcode tier
+    // (you can't stream-copy and overlay text at the same time).
+    if (this._burnSubtitlePath && this.ffmpegPath) {
+      strategyInfo = { strategy: 'transcode', audioArgs: ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'] };
+      this._log('Burn-in subtitles enabled — forcing full transcode.');
     }
 
     // Detect best H.264 encoder up front for Tier 3 only.
@@ -2832,6 +949,46 @@ class StreamManager extends EventEmitter {
     if (useHls) {
       const sessionDir = path.join(this.tempDir, `hls_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
       try { fs.mkdirSync(sessionDir, { recursive: true }); } catch (e) {}
+
+      // ON-DEMAND VOD: we know the total duration up front, so the player gets a COMPLETE
+      // playlist (full seek bar from second 0, no "LIVE" badge) and each segment is made
+      // on demand — seeking anywhere runs `ffmpeg -ss <t>` against the :8090 stream.
+      //   • copy tiers (remux/remux-audio): stream-copy → original quality.
+      //   • transcode (HEVC/etc.): per-segment re-encode with the detected encoder.
+      // Burn-in subtitles still use the old sequential pipeline (the overlay needs one
+      // continuous filter graph).
+      const isCopyTier = strategyInfo.strategy === 'remux' || strategyInfo.strategy === 'remux-audio';
+      const isTranscode = strategyInfo.strategy === 'transcode' && !this._burnSubtitlePath;
+      const canOnDemand = isCopyTier || isTranscode;
+      let durationSec = 0;
+      if (canOnDemand) {
+        // probe already carries format.duration when it came from the URL (or a sample
+        // big enough to hold the header) — no need to spend another ffprobe round on it.
+        if (probe && Number.isFinite(probe.durationSec) && probe.durationSec > 0) {
+          durationSec = probe.durationSec;
+        } else {
+          try { durationSec = await this._probeDurationSeconds(this._torrserverStreamUrl); } catch (e) {}
+        }
+      }
+      // On-demand VOD is OFF by default because its playlist is a promise `-c copy` can't
+      // keep. It declares a uniform 6.000s grid up front, but stream copy can only cut on
+      // keyframes — measured on a SubsPlease release, keyframes sit on a ~6.006s grid, so
+      // seg1 really starts at 4.004s and runs 8.007s. Segments overlap ~2s while claiming
+      // to be back-to-back. hls.js silently remaps the timestamps (which is why the web
+      // player never showed it), but Chromecast's receiver trusts the playlist, sees the
+      // timeline jump backwards after the first segment, decides the stream ended and
+      // drops to its backdrop — "plays a few seconds, then the Chromecast logo".
+      //
+      // The continuous pipeline cuts on real keyframes as it reaches them and writes each
+      // #EXTINF from the segment it actually produced, so the playlist matches the media
+      // and strict receivers are happy. Cost: the seek window covers what's been remuxed
+      // so far rather than the whole file from second zero.
+      //
+      // UPLAYER_HLS_ONDEMAND=1 restores the old seek-anywhere behaviour — only safe when
+      // nothing strict (Chromecast) will ever play this stream.
+      const onDemand = process.env.UPLAYER_HLS_ONDEMAND === '1' && canOnDemand && durationSec > 0;
+      const segDur = 6;
+
       hlsState = {
         dir: sessionDir,
         indexPath: path.join(sessionDir, 'index.m3u8'),
@@ -2839,7 +996,19 @@ class StreamManager extends EventEmitter {
         starting: false,
         started: false,
         startError: null,
+        // on-demand VOD fields
+        onDemand,
+        segDur,
+        duration: durationSec,
+        totalSegs: onDemand ? Math.max(1, Math.ceil(durationSec / segDur)) : 0,
+        videoArgs: isTranscode ? this._encoderArgs(selectedEncoder, null) : (strategyInfo.videoArgs || ['-c:v', 'copy']),
+        audioArgs: strategyInfo.audioArgs || (isTranscode ? ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'] : ['-c:a', 'copy']),
+        url: this._torrserverStreamUrl,
+        producer: null,
       };
+      this._log(onDemand
+        ? `HLS: on-demand VOD — ${Math.round(durationSec)}s, ${hlsState.totalSegs} segments, ${isTranscode ? 'transcode' : 'copy'} (full seek bar, seek anywhere)`
+        : 'HLS: sequential pipeline');
     }
 
     const startHlsPipeline = () => {
@@ -2862,6 +1031,7 @@ class StreamManager extends EventEmitter {
       const GOP_FRAMES = HLS_SEGMENT_SECS * ASSUMED_FPS;
       let videoArgs;
       let audioArgs;
+      let spawnCwd;
       if (strategyInfo.strategy === 'transcode') {
         // Force a keyframe every HLS_SEGMENT_SECS so HLS segments line up exactly with
         // GOPs. Without this, the encoder reuses source GOPs (often 10 s+) which makes
@@ -2875,8 +1045,18 @@ class StreamManager extends EventEmitter {
         //   -sc_threshold 0                  libx264: no extra keyframes on scene cuts
         //   -force_key_frames expr:…         demuxer-level keyframe hint
         //   -forced-idr 1                    NVENC: turn forced keyframes into real IDR frames
+        let burnFilter = null;
+        if (this._burnSubtitlePath) {
+          try {
+            const ext = (path.extname(this._burnSubtitlePath) || '.srt').toLowerCase();
+            fs.copyFileSync(this._burnSubtitlePath, path.join(this.tempDir, 'burnsub' + ext));
+            spawnCwd = this.tempDir;        // run ffmpeg here so the subtitles= path needs no escaping
+            burnFilter = 'burnsub' + ext;
+            this._log('Burning subtitles into the cast stream: ' + path.basename(this._burnSubtitlePath));
+          } catch (e) { this._log('Burn-in copy failed: ' + e.message); }
+        }
         videoArgs = [
-          ...this._encoderArgs(selectedEncoder),
+          ...this._encoderArgs(selectedEncoder, burnFilter),
           '-g', String(GOP_FRAMES),
           '-keyint_min', '1',
           '-sc_threshold', '0',
@@ -2915,7 +1095,7 @@ class StreamManager extends EventEmitter {
       ];
 
       const inputStream = videoFile.createReadStream();
-      const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'] }));
+      const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, hiddenChildProcessOptions({ stdio: ['pipe', 'pipe', 'pipe'], cwd: spawnCwd }));
       hlsState.process = ffmpeg;
       hlsState.starting = false;
       this.activeStreams.add(ffmpeg);
@@ -2943,6 +1123,76 @@ class StreamManager extends EventEmitter {
       });
     };
 
+    // --- on-demand VOD helpers (copy tiers) --------------------------------
+    const padSeg = (n) => `seg${String(n).padStart(5, '0')}.ts`;
+
+    // A COMPLETE VOD playlist for the whole episode — built from the known duration, so
+    // the player shows the full seek bar (no "LIVE") immediately. Segments are produced
+    // lazily as the player requests them.
+    const buildVodPlaylist = () => {
+      const { segDur, totalSegs, duration } = hlsState;
+      let m = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:' + (segDur + 1)
+        + '\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n';
+      for (let i = 0; i < totalSegs; i++) {
+        const segLen = (i === totalSegs - 1) ? Math.max(0.1, duration - i * segDur) : segDur;
+        m += '#EXTINF:' + segLen.toFixed(3) + ',\n' + padSeg(i) + '\n';
+      }
+      return m + '#EXT-X-ENDLIST\n';
+    };
+
+    // Produce ONE segment independently and atomically. ffmpeg -ss jumps straight to the
+    // segment's 6 s boundary — which is a keyframe, since the source GOP is 2 s — and
+    // stream-copies 6 s to a temp file that's renamed in only once complete (so the player
+    // never reads a half-written segment). -copyts keeps the real, continuous timestamps,
+    // so the timeline stays seamless across segments and across seeks. This per-segment
+    // model is fast (~1-2 s) and reliable; the previous single rolling ffmpeg could hang.
+    const pending = new Map(); // K -> in-flight production promise (dedup)
+    const produceSegment = (K) => new Promise((resolve) => {
+      const { spawn } = require('child_process');
+      const segPath = path.join(hlsState.dir, padSeg(K));
+      const tmp = path.join(hlsState.dir, `.seg${K}.${Math.random().toString(36).slice(2, 8)}.tmp`);
+      const segLen = (K === hlsState.totalSegs - 1)
+        ? Math.max(0.5, hlsState.duration - K * hlsState.segDur)
+        : hlsState.segDur;
+      // -output_ts_offset puts the segment's timestamps at its real position (K*segDur)
+      // so the timeline is continuous across segments and seeks. (-copyts would do that
+      // too, but it breaks -t — ffmpeg measures the duration against the shifted clock
+      // and stops "in the past", producing an empty file → the seek would hang.)
+      const args = [
+        '-ss', String(K * hlsState.segDur), '-i', hlsState.url,
+        '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+        ...hlsState.videoArgs, ...hlsState.audioArgs,
+        '-t', String(segLen), '-output_ts_offset', String(K * hlsState.segDur),
+        '-muxdelay', '0', '-muxpreload', '0',
+        '-f', 'mpegts', '-loglevel', 'error', '-y', tmp,
+      ];
+      const proc = spawn(this.ffmpegPath, args, hiddenChildProcessOptions({ stdio: ['ignore', 'ignore', 'pipe'] }));
+      this.activeStreams.add(proc);
+      let tail = '';
+      proc.stderr.on('data', (d) => { tail = (tail + d.toString()).slice(-500); });
+      const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (e) {} }, 45000);
+      proc.on('close', (code) => {
+        clearTimeout(timer); this.activeStreams.delete(proc);
+        try {
+          if (code === 0 && fs.existsSync(tmp) && fs.statSync(tmp).size > 0) { fs.renameSync(tmp, segPath); resolve(segPath); return; }
+        } catch (e) {}
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e) {}
+        if (tail) this._log(`HLS seg${K} produce failed: ${tail.slice(-160)}`);
+        resolve(null);
+      });
+      proc.on('error', () => { clearTimeout(timer); try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e) {} resolve(null); });
+    });
+
+    const ensureSegment = (K) => {
+      const segPath = path.join(hlsState.dir, padSeg(K));
+      try { if (fs.existsSync(segPath) && fs.statSync(segPath).size > 0) return Promise.resolve(segPath); } catch (e) {}
+      if (pending.has(K)) return pending.get(K);
+      const pr = produceSegment(K);
+      pending.set(K, pr);
+      pr.then(() => pending.delete(K), () => pending.delete(K));
+      return pr;
+    };
+
     // Web player + Cast URL: HLS playlist when remuxing/transcoding, raw file when direct-play.
     const videoUrl = useHls ? '/hls/index.m3u8' : `/video${videoExt}`;
     // Original file URL for VLC (VLC can play any format, no transcoding needed)
@@ -2955,7 +1205,7 @@ class StreamManager extends EventEmitter {
     );
     const htmlVideoType = `type="${contentType}"`;
 
-    this.server = http.createServer((req, res) => {
+    const requestHandler = (req, res) => {
       // Handle root request - serve unified native JS player page
       if (req.url === '/' || req.url === '/index.html') {
         const html = this.getNativePlayerHTML(videoUrl, htmlVideoType, videoName, serveTranscoded);
@@ -2964,6 +1214,23 @@ class StreamManager extends EventEmitter {
           'Access-Control-Allow-Origin': '*'
         });
         res.end(html);
+        return;
+      }
+
+      // Serve vendored player libs (Video.js, JASSUB) from public/vendor/.
+      if (req.url.startsWith('/vendor/')) {
+        const rel = req.url.split('?')[0].replace(/^\/+/, '');
+        const file = path.join(__dirname, 'public', path.normalize(rel));
+        const vendorRoot = path.join(__dirname, 'public', 'vendor');
+        if (file.startsWith(vendorRoot) && fs.existsSync(file)) {
+          const ext = path.extname(file).toLowerCase();
+          const types = { '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.wasm': 'application/wasm', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf' };
+          res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' });
+          res.end(fs.readFileSync(file));
+          return;
+        }
+        res.writeHead(404, { 'Access-Control-Allow-Origin': '*' });
+        res.end('');
         return;
       }
 
@@ -3011,7 +1278,7 @@ class StreamManager extends EventEmitter {
           }
           return {
             index,
-            url: `/subtitle_${index}.vtt`,
+            url: `${this.streamBasePath || ''}/subtitle_${index}.vtt`,
             language: sub.language || 'en',
             label: sub.label || `Subtitle ${index + 1}`,
             source: sub.source || 'unknown',
@@ -3020,10 +1287,117 @@ class StreamManager extends EventEmitter {
             complete: sub.complete === true,
           };
         });
-        res.end(JSON.stringify({ subtitles: subtitleList, count: subtitleList.length }));
+        const subTools = require('./core/subtitle-tools');
+        res.end(JSON.stringify({
+          subtitles: subtitleList,
+          count: subtitleList.length,
+          // Which one-click tools the player should offer, and the state of the
+          // currently/last-running job (generate/sync) for button spinners.
+          tools: { alass: subTools.isAlassAvailable(), whisper: subTools.isWhisperAvailable() },
+          job: this._subtitleJob || null,
+        }));
         return;
       }
-      
+
+      // Playback-position pings from the player page (same origin as the player, so
+      // no CORS dance). Emitted as an event; the web server owning this session
+      // persists it to watch history for resume/continue-watching.
+      if (req.url === '/api/progress' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (d) => { body += d; if (body.length > 4096) { try { req.destroy(); } catch (e) {} } });
+        req.on('end', () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            // The same endpoint carries failures, so a dead source reaches the app
+            // instead of dying silently in the player tab.
+            if (data.error && typeof data.error === 'object') {
+              this.emit('playback_error', {
+                code: data.error.code == null ? null : data.error.code,
+                message: String(data.error.message || 'Playback failed'),
+              });
+              res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+              res.end('{"ok":true}');
+              return;
+            }
+            const positionSec = Number(data.positionSec);
+            const durationSec = Number(data.durationSec);
+            if (Number.isFinite(positionSec) && positionSec >= 0) {
+              this.emit('playback_position', {
+                positionSec,
+                durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null,
+                ended: data.ended === true,
+              });
+            }
+          } catch (e) { /* malformed ping — ignore */ }
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end('{"ok":true}');
+        });
+        return;
+      }
+
+      // One-click subtitle tools, called by the player's control-bar buttons. Both are
+      // slow (audio extraction + alass/whisper), so they run as a single background job
+      // and reply immediately; the player watches `job` on /api/subtitles and picks up
+      // the finished track through its normal manifest poll.
+      const startSubtitleJob = (kind, work) => {
+        if (this._subtitleJob && this._subtitleJob.running) {
+          res.writeHead(409, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ ok: false, reason: 'a subtitle job is already running' }));
+          return;
+        }
+        this._subtitleJob = { kind, running: true, error: null, startedAt: Date.now() };
+        work()
+          .then((r) => { this._subtitleJob = { kind, running: false, error: r && r.ok ? null : ((r && r.reason) || 'failed'), startedAt: this._subtitleJob.startedAt }; })
+          .catch((e) => { this._subtitleJob = { kind, running: false, error: e.message, startedAt: this._subtitleJob.startedAt }; });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ ok: true, started: true, kind }));
+      };
+
+      if (req.url === '/api/subtitles/generate' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (d) => { body += d; if (body.length > 4096) { try { req.destroy(); } catch (e) {} } });
+        req.on('end', () => {
+          let language;
+          try { language = (JSON.parse(body || '{}').language || '').trim() || undefined; } catch (e) {}
+          // Cap the transcribed span so whisper-tiny stays in the minutes range even on
+          // long movies; the opening 20 minutes is plenty to judge usefulness.
+          startSubtitleJob('generate', () => this.generateSubtitles({ language, maxSeconds: 1200 }));
+        });
+        return;
+      }
+
+      if (req.url === '/api/subtitles/sync' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (d) => { body += d; if (body.length > 4096) { try { req.destroy(); } catch (e) {} } });
+        req.on('end', () => {
+          let index = -1;
+          try { index = Number(JSON.parse(body || '{}').index); } catch (e) {}
+          const src = Number.isInteger(index) && index >= 0 ? this.subtitlePaths[index] : null;
+          if (!src || !src.path) {
+            res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify({ ok: false, reason: 'no subtitle track at that index' }));
+            return;
+          }
+          startSubtitleJob('sync', async () => {
+            const r = await this.syncSubtitle(src.path, { maxSeconds: 1200 });
+            if (r.ok) {
+              // syncSubtitle returns a file but doesn't self-register — add it as a NEW
+              // track so the player can offer both the original and the synced version.
+              this.subtitlePaths.push({
+                path: r.output,
+                source: 'alass',
+                language: src.language || 'en',
+                label: `${src.label || 'Subtitle'} (synced)`,
+                codec: 'srt',
+                complete: true,
+              });
+            }
+            return r;
+          });
+        });
+        return;
+      }
+
       // Serve subtitle files as WebVTT
       const subtitleMatch = req.url.match(/^\/subtitle_(\d+)\.vtt(\?.*)?$/);
       if (subtitleMatch) {
@@ -3098,66 +1472,79 @@ class StreamManager extends EventEmitter {
           return;
         }
 
-        startHlsPipeline();
-
         const fileName = hlsMatch[1];
-        const resolvedPath = path.join(hlsState.dir, fileName);
-        if (path.relative(hlsState.dir, resolvedPath).startsWith('..')) {
-          res.writeHead(403, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
-          res.end('');
+        const cors = {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+          'Access-Control-Allow-Headers': 'Range',
+        };
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204, Object.assign({ 'Access-Control-Max-Age': '86400' }, cors));
+          res.end();
           return;
         }
 
+        // ON-DEMAND VOD (copy tiers): full playlist served by us; segments produced on
+        // demand so the player has a real seek bar from the start and can jump anywhere.
+        if (hlsState.onDemand) {
+          if (fileName === 'index.m3u8') {
+            const body = buildVodPlaylist();
+            res.writeHead(200, Object.assign({ 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' }, cors));
+            res.end(req.method === 'HEAD' ? undefined : body);
+            return;
+          }
+          const segM = fileName.match(/^seg(\d+)\.ts$/);
+          if (segM) {
+            const K = parseInt(segM[1], 10);
+            ensureSegment(K).then((segPath) => {
+              if (!segPath) { res.writeHead(404, cors); res.end('segment unavailable'); return; }
+              res.writeHead(200, Object.assign({ 'Content-Type': 'video/mp2t', 'Cache-Control': 'public, max-age=300' }, cors));
+              if (req.method === 'HEAD') { res.end(); return; }
+              const fsr = fs.createReadStream(segPath);
+              fsr.on('error', () => { try { res.end(); } catch (e) {} });
+              fsr.pipe(res);
+            }).catch(() => { try { res.writeHead(500, cors); res.end('segment error'); } catch (e) {} });
+            return;
+          }
+          res.writeHead(404, cors); res.end('');
+          return;
+        }
+
+        // TRANSCODE tier: sequential EVENT pipeline (one ffmpeg, segments served as written).
+        startHlsPipeline();
+        const resolvedPath = path.join(hlsState.dir, fileName);
+        if (path.relative(hlsState.dir, resolvedPath).startsWith('..')) {
+          res.writeHead(403, cors); res.end('');
+          return;
+        }
         const isPlaylist = fileName.endsWith('.m3u8');
         const isSegment = fileName.endsWith('.ts');
         const maxWaitMs = isPlaylist ? 15000 : 60000;
         const startedWaiting = Date.now();
-
         const tryServe = () => {
           if (fs.existsSync(resolvedPath)) {
             let mime = 'application/octet-stream';
             if (isPlaylist) mime = 'application/vnd.apple.mpegurl';
             else if (isSegment) mime = 'video/mp2t';
-            res.writeHead(200, {
-              'Content-Type': mime,
-              'Cache-Control': isPlaylist ? 'no-cache' : 'public, max-age=300',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-              'Access-Control-Allow-Headers': 'Range',
-            });
-            if (req.method === 'HEAD') {
-              res.end();
-              return;
-            }
+            res.writeHead(200, Object.assign({ 'Content-Type': mime, 'Cache-Control': isPlaylist ? 'no-cache' : 'public, max-age=300' }, cors));
+            if (req.method === 'HEAD') { res.end(); return; }
             const fileStream = fs.createReadStream(resolvedPath);
             fileStream.on('error', () => { try { res.end(); } catch (e) {} });
             fileStream.pipe(res);
             return;
           }
           if (hlsState.startError) {
-            res.writeHead(500, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+            res.writeHead(500, Object.assign({ 'Content-Type': 'text/plain' }, cors));
             res.end(`HLS pipeline error: ${hlsState.startError}`);
             return;
           }
           if (Date.now() - startedWaiting >= maxWaitMs) {
-            res.writeHead(404, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+            res.writeHead(404, Object.assign({ 'Content-Type': 'text/plain' }, cors));
             res.end('Segment not ready');
             return;
           }
           setTimeout(tryServe, 200);
         };
-
-        if (req.method === 'OPTIONS') {
-          res.writeHead(204, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-            'Access-Control-Allow-Headers': 'Range',
-            'Access-Control-Max-Age': '86400',
-          });
-          res.end();
-          return;
-        }
-
         tryServe();
         return;
       }
@@ -3238,7 +1625,7 @@ class StreamManager extends EventEmitter {
       // Browsers/VLC expect 200 for a plain GET; 206 without a client Range breaks many stacks.
       // Chromecast still gets an honest length (no "wait for full file" hang).
       // With Range: 206 + Content-Range (standard partial content).
-      const maxChunkSize = 10 * 1024 * 1024; // 10MB chunks for fast streaming
+      const maxChunkSize = 10 * 1024 * 1024; // first-chunk cap for plain (no-Range) GETs only
       let start;
       let end;
       let usePartialContent = false;
@@ -3252,9 +1639,18 @@ class StreamManager extends EventEmitter {
       } else {
         const positions = range.replace(/bytes=/, '').split('-');
         start = parseInt(positions[0], 10);
+        // Open-ended range (`bytes=N-`, what a browser <video> and VLC send): stream
+        // straight through to EOF in ONE sequential read instead of capping each
+        // response. TorrServer's reader is sequential with a large read-ahead window,
+        // so a single long-lived stream keeps its cache filled AHEAD of playback. The
+        // old per-response cap forced a brand-new range request — and a fresh TorrServer
+        // reader seek + piece re-prioritisation — every ~10 MB, which is exactly what
+        // produced the periodic stalls/lag while watching. On seek the player tears the
+        // connection down (`res` 'close' → destroyStream), so a seek now costs ONE new
+        // sequential read, not a storm of them. An explicit end is still honoured as-is.
         const requestedEnd = positions[1]
           ? parseInt(positions[1], 10)
-          : Math.min(start + maxChunkSize - 1, videoFile.length - 1);
+          : (videoFile.length - 1);
         end = Math.min(requestedEnd, videoFile.length - 1);
         usePartialContent = true;
       }
@@ -3319,21 +1715,34 @@ class StreamManager extends EventEmitter {
       stream.on('end', () => {
         res.end();
       });
-    });
+    };
 
-    const urls = buildAccessibleUrls(port);
-    this.server.listen(port, urls.bindHost, () => {
-      // Pass the video path so the caller can construct the full video URL
-      // videoUrl is for web player (may be transcoded), originalFileUrl is for VLC (always original format)
-      callback(urls.preferred, urls, videoUrl, originalFileUrl, {
-        videoFormat: {
-          container: (videoExt || '').replace(/^\./, '') || 'unknown',
-          codec: codec || null,
-          acodec: probe && probe.acodec ? probe.acodec : null,
-          playbackStrategy: strategyInfo.strategy,
-        },
-      });
-    });
+    // Register this stream with the shared hub instead of opening a per-stream port.
+    // Every concurrent stream is served from ONE shared HTTP server and told apart by
+    // a unique id in the URL path (http://host:PORT/<streamId>/…), so a single port is
+    // ever opened no matter how many streams run at once. The id is generated once and
+    // reused if the same StreamManager (re)starts.
+    const bindHost = buildAccessibleUrls(port).bindHost;
+    const streamId = this.streamId || (this.streamId = crypto.randomBytes(8).toString('hex'));
+    this.streamBasePath = '/' + streamId;
+    this._hubStreamId = streamId;
+    streamHub.register(streamId, requestHandler, port, bindHost)
+      .then(({ port: actualPort }) => {
+        this.streamPort = actualPort;
+        // The path option prefixes every accessible URL with /<streamId>, so the cast /
+        // VLC / subtitle URLs the caller builds by concatenation inherit it automatically.
+        const urls = buildAccessibleUrls(actualPort, { path: '/' + streamId });
+        // videoUrl is for the web player (may be transcoded), originalFileUrl is for VLC
+        // (always original format); the caller appends them to the prefixed root URL.
+        callback(urls.preferred, urls, videoUrl, originalFileUrl, {
+          // videoFormat is now DERIVED from mediaFacts rather than built separately, so
+          // the two can't drift. Its shape is unchanged — the UI and localStorage still
+          // read the same four keys.
+          videoFormat: toVideoFormat(probe && probe.mediaFacts, videoExt, strategyInfo.strategy),
+          mediaFacts: (probe && probe.mediaFacts) || null,
+        });
+      })
+      .catch((err) => { console.error('Stream hub listen failed:', err && err.message); });
   }
   
   getNativePlayerCSS() {
@@ -3359,6 +1768,12 @@ class StreamManager extends EventEmitter {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
 
+    // Every URL the player requests must carry this stream's id prefix so the shared
+    // hub can route it back here (the page itself is served from /<streamId>/). When
+    // there is no base path (e.g. unit tests) URLs stay root-relative as before.
+    const base = this.streamBasePath || '';
+    const prefix = (u) => (typeof u === 'string' && u.startsWith('/')) ? base + u : u;
+
     const normalizedTracks = this.subtitlePaths.map((sub, index) => {
       const language = (sub.language || 'en').toString().trim().toLowerCase() || 'en';
       return {
@@ -3366,116 +1781,64 @@ class StreamManager extends EventEmitter {
         language,
         label: sub.label || `Subtitle ${index + 1}`,
         source: sub.source || 'unknown',
-        url: `/subtitle_${index}.vtt`,
+        url: `${base}/subtitle_${index}.vtt`,
       };
     });
 
-    const trackTags = normalizedTracks.map((track, index) => {
-      return `<track kind="subtitles" src="/subtitle_${track.index}.vtt" srclang="${esc(track.language)}" label="${esc(track.label)}" ${index === 0 ? 'default' : ''}>`;
-    }).join('\n');
-
-    // With HLS in play, the manifest IS the streaming source — no separate compat fallback.
     const isHlsSource = /\.m3u8(\?|$)/.test(String(videoUrl || ''));
-    const compatFallbackUrl = null;
 
     const config = JSON.stringify({
       transcoding: !!transcoding,
-      compatFallbackUrl,
       isHlsSource,
-      videoUrl,
+      videoUrl: prefix(videoUrl),
       subtitleCount: normalizedTracks.length,
       subtitleTracks: normalizedTracks,
-      subtitleManifestUrl: '/api/subtitles',
+      subtitleManifestUrl: `${base}/api/subtitles`,
+      progressUrl: `${base}/api/progress`,
+      minPositionSec: MIN_POSITION_SEC,
     });
 
-    const hlsScriptTag = isHlsSource
-      ? '<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js" crossorigin="anonymous"></script>'
-      : '';
-
+    // Minimal, clean player: a single full-screen Video.js element with its built-in
+    // control bar (which already provides a subtitles/captions menu). All the subtitle
+    // loading is done in native-player.js; no custom toolbar/sync-popup/overlay.
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${esc(videoName)}</title>
-  <link rel="stylesheet" href="/player.css">
+  <link rel="stylesheet" href="${base}/vendor/videojs/video-js.min.css">
+  <link rel="stylesheet" href="${base}/player.css">
 </head>
 <body>
-  <div class="player-shell">
-    <div class="video-wrap">
-      <video id="videoPlayer" controls preload="auto" playsinline>
-        <source src="${esc(videoUrl)}" ${htmlVideoType}>
-        ${trackTags}
-      </video>
-      <div id="subtitleOverlay" class="subtitle-overlay" aria-live="polite" aria-atomic="true"></div>
-      <button id="subtitleAdjustBtn" class="subtitle-adjust-btn" type="button" title="Adjust subtitle timing" ${normalizedTracks.length > 0 ? '' : 'hidden'}>
-        Sub Sync
-      </button>
-      <div id="subtitleAdjustPopup" class="subtitle-adjust-popup" hidden>
-        <button class="close-btn" id="closePopupBtn" type="button" aria-label="Close subtitle timing controls">x</button>
-        <h3>Subtitle Timing</h3>
-        <p class="sync-hint">Positive values delay subtitles. Negative values show them earlier.</p>
-        <div class="offset-display">
-          <div class="label">Offset</div>
-          <div class="value" id="offsetValue">+0.00s</div>
-        </div>
-        <div class="adjust-controls">
-          <button class="btn adjust-btn" id="subtract1Btn" type="button">-1.0s</button>
-          <button class="btn adjust-btn" id="subtract0_5Btn" type="button">-0.5s</button>
-          <button class="btn adjust-btn" id="add0_5Btn" type="button">+0.5s</button>
-          <button class="btn adjust-btn" id="add1Btn" type="button">+1.0s</button>
-        </div>
-        <div class="adjust-controls">
-          <button class="btn adjust-btn" id="subtract0_1Btn" type="button">-0.1s</button>
-          <button class="btn adjust-btn" id="resetBtn" type="button">Reset</button>
-          <button class="btn adjust-btn" id="add0_1Btn" type="button">+0.1s</button>
-        </div>
-        <div class="subtitle-preview" id="subtitlePreview">
-          <div class="subtitle-empty">Load video to inspect subtitle timing.</div>
-        </div>
-      </div>
-      <div id="errorOverlay" class="error-overlay">
-        <div class="error-card">
-          <h2>Playback issue</h2>
-          <p id="errorMessage">The media could not be played in the current format.</p>
-          <div class="actions">
-            <button class="btn" id="retryBtn" type="button">Retry</button>
-            <button class="btn" id="reloadBtn" type="button">Reload</button>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="toolbar">
-      <div class="meta">
-        <h1>${esc(videoName)}</h1>
-        <p id="statusText">${transcoding ? 'Transcoding in progress...' : 'Loading stream...'}</p>
-      </div>
-      <div class="controls">
-        <select id="subtitleSelect" class="select">
-          <option value="-1">Subtitles: Off</option>
-        </select>
-      </div>
-    </div>
-  </div>
+  <video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto" playsinline crossorigin="anonymous"></video>
   <script>window.__UPLAYER_PLAYER_CONFIG__ = ${config};</script>
-  ${hlsScriptTag}
-  <script src="/player.js"></script>
+  <script src="${base}/vendor/videojs/video.min.js"></script>
+  <script src="${base}/player.js"></script>
 </body>
 </html>`;
   }
-  getHTMLPlayer(videoUrl, htmlVideoType, videoName, transcoding = false) {
-    return this.getNativePlayerHTML(videoUrl, htmlVideoType, videoName, transcoding);
-  }
 
   stop() {
-    if (this.server) {
-      this.server.close();
-      this.server = null;
+    // Unregister from the shared hub (this closes the shared server only if no other
+    // concurrent stream is still registered) instead of closing a per-stream server.
+    if (this._hubStreamId) {
+      streamHub.unregister(this._hubStreamId);
+      this._hubStreamId = null;
     }
-    if (this.currentTorrent) {
-      this.client.remove(this.currentTorrent);
-      this.currentTorrent = null;
-    }
+    this.server = null;
+    const hash = this.currentHash;
+    this.currentHash = null;
+    this._releaseTorrServer(hash);
+  }
+
+  // Remove this stream's torrent from the shared engine. TorrServer is a long-lived
+  // service for the whole app — started once at boot, stopped only on app exit — so we
+  // deliberately NEVER stop it here. Tearing it down per-stream is what caused it to
+  // "open and close every time" and the :8090 restart races ("did not start on :8090").
+  async _releaseTorrServer(hash) {
+    if (!this.tsClient) return;
+    try { if (hash) await this.tsClient.remove(hash); } catch (e) {}
   }
 
   // ENHANCED: Cleanup method to free memory
@@ -3534,37 +1897,19 @@ class StreamManager extends EventEmitter {
     });
     this.activeStreams.clear();
     
-    if (this.server) {
-      try {
-        await new Promise((resolve) => this.server.close(() => resolve()));
-      } catch (e) {
-        // Ignore close failures during teardown
-      }
-      this.server = null;
+    // Unregister from the shared hub — the shared server is closed only when the last
+    // concurrent stream is gone, so tearing down one stream never kills the others.
+    if (this._hubStreamId) {
+      try { streamHub.unregister(this._hubStreamId); } catch (e) { /* ignore */ }
+      this._hubStreamId = null;
     }
+    this.server = null;
 
-    if (this.currentTorrent && this.client) {
-      try {
-        // destroyStore: have WebTorrent delete its own downloaded files, and await it
-        // so handles are released before we wipe the sandbox dir.
-        await new Promise((resolve) => {
-          this.client.remove(this.currentTorrent, { destroyStore: true }, () => resolve());
-        });
-      } catch (e) {
-        // Ignore torrent removal failures during teardown
-      }
-      this.currentTorrent = null;
-    }
+    // Remove this stream's torrent; only kill TorrServer if no other stream still uses it.
+    const hashToRelease = this.currentHash;
+    this.currentHash = null;
+    await this._releaseTorrServer(hashToRelease);
 
-    if (this.client) {
-      try {
-        await new Promise((resolve) => this.client.destroy(() => resolve()));
-      } catch (e) {
-        // Ignore client destroy failures during teardown
-      }
-      this.client = null;
-    }
-    
     // SECURITY: Clean up sandbox
     if (this.sandbox) {
       try {
@@ -4214,11 +2559,10 @@ async function main() {
   program.parse();
 }
 
-module.exports = { TorrentScraper, StreamManager, MediaSearcher, SubtitleManager };
+module.exports = { TorrentScraper, StreamManager, MediaSearcher, SubtitleManager, dedupeTorrentResults, filterByPreferredQuality, _streamHub: streamHub };
 
 // Run if called directly
 if (require.main === module) {
   main().catch(console.error);
 }
-
 

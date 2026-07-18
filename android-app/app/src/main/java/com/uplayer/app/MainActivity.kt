@@ -24,6 +24,8 @@ import java.net.URL
 class MainActivity : AppCompatActivity() {
 
     private val tag = "Uplayer/Main"
+    /** One warning per launch, not one per onResume. */
+    private var notificationWarningShown = false
     private lateinit var binding: ActivityMainBinding
     private lateinit var castBridge: CastBridge
     private val serverUrl = "http://localhost:3000"
@@ -52,7 +54,11 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (binding.webview.canGoBack()) binding.webview.goBack() else finish()
+                // Backing out past the first page means "quit", not "hide": removing the
+                // task fires NodeService.onTaskRemoved, which stops the engine and clears
+                // the notification. Plain finish() would leave both running with no way
+                // out but Force Stop. Home/screen-off deliberately keeps us alive.
+                if (binding.webview.canGoBack()) binding.webview.goBack() else finishAndRemoveTask()
             }
         })
     }
@@ -298,14 +304,87 @@ class MainActivity : AppCompatActivity() {
                 != PackageManager.PERMISSION_GRANTED
             ) {
                 ActivityCompat.requestPermissions(
-                    this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 42
+                    this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS
                 )
             }
         }
     }
 
+    /**
+     * Re-post the service notification once the user answers the permission prompt.
+     *
+     * requestPermissions() is ASYNCHRONOUS: it shows the dialog and returns immediately, so
+     * onCreate goes straight on to NodeService.start() and startForeground() fires while the
+     * permission is still undecided. On Android 13+ that means the notification is silently
+     * SUPPRESSED — the service runs, but invisibly, and the user loses both the way back into
+     * the app and the Stop action, which is the only thing standing between them and Force Stop.
+     *
+     * Re-starting the service here re-posts it under the same NOTIFICATION_ID (an update, not a
+     * duplicate), and NodeRunner.start() is guarded by an AtomicBoolean, so Node is not started
+     * twice. Without this the notification only ever appears on the SECOND launch of the app.
+     */
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_NOTIFICATIONS) return
+        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            Log.i(tag, "Notifications granted - re-posting the service notification")
+            NodeService.start(this, currentWifiIpv4().orEmpty())
+        } else {
+            // Not fatal: streaming still works. But the only in-app way to stop the engine is
+            // gone, so say so plainly in the log rather than leaving it a silent mystery.
+            Log.w(tag, "Notifications denied - the running notification and its Stop action cannot be shown")
+        }
+    }
+
+    /**
+     * Re-assert the service notification every time Uplayer comes to the foreground.
+     *
+     * The contract is "if Uplayer is open, the notification is there" — streaming or not. Posting
+     * it once from onCreate could not deliver that: if the notification was suppressed (permission
+     * still undecided on first run), or the service was killed and restarted by the system, or the
+     * user swiped the notification on an OEM build that allows it, nothing ever put it back.
+     *
+     * Safe to call repeatedly: startForeground() re-posts under the same NOTIFICATION_ID, which is
+     * an update rather than a duplicate, and NodeRunner.start() is guarded by an AtomicBoolean so
+     * the Node runtime is never started twice. Calling from onResume is also the only way this can
+     * be legal on Android 12+, where starting a foreground service from the background throws.
+     */
+    override fun onResume() {
+        super.onResume()
+        NodeService.start(this, currentWifiIpv4().orEmpty())
+        warnIfNotificationsBlocked()
+    }
+
+    /**
+     * A blocked notification is otherwise completely silent: streaming still works, so nothing
+     * looks wrong, but the way back into the app and the Stop action are both gone — which leaves
+     * Force Stop as the only exit, the exact problem the notification exists to solve. Say it out
+     * loud once per launch instead of letting the user discover it by its absence.
+     */
+    private fun warnIfNotificationsBlocked() {
+        if (notificationWarningShown) return
+        if (androidx.core.app.NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+        notificationWarningShown = true
+        Log.w(tag, "Notifications are disabled for Uplayer - status notification and Stop action cannot appear")
+        android.widget.Toast.makeText(
+            this,
+            "Notifications are off for Uplayer, so the running/Stop notification can't be shown. " +
+                "Enable them in Settings > Apps > Uplayer > Notifications.",
+            android.widget.Toast.LENGTH_LONG
+        ).show()
+    }
+
     override fun onDestroy() {
         if (this::castBridge.isInitialized) castBridge.detach()
         super.onDestroy()
+    }
+
+    private companion object {
+        /** requestPermissions code for POST_NOTIFICATIONS; matched in onRequestPermissionsResult. */
+        const val REQ_NOTIFICATIONS = 42
     }
 }

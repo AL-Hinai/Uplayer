@@ -1,0 +1,63 @@
+{
+  "when": "2026-07-07T19:55:45.258Z",
+  "scenarios": [
+    {
+      "scenario": "A",
+      "streams": 1,
+      "perStream": [
+        {
+          "label": "LotR Return of the King 1080p EXT",
+          "sessionId": "stream_1_1783454158714",
+          "ready": false,
+          "exited": false,
+          "timeout": true,
+          "timeToReadyMs": 90000
+        }
+      ],
+      "error": null,
+      "peakNodeRssMB": "81.4",
+      "peakTorrServerRssMB": "144.3"
+    },
+    {
+      "scenario": "B",
+      "streams": 4,
+      "perStream": [
+        {
+          "label": "One Piece 1165 (1080p anime)",
+          "sessionId": "stream_1_1783454255478",
+          "ready": false,
+          "exited": true,
+          "timeout": false,
+          "timeToReadyMs": 1015
+        },
+        {
+          "label": "Matrix Revolutions 2160p UHD",
+          "sessionId": "stream_2_1783454255743",
+          "ready": false,
+          "exited": true,
+          "timeout": false,
+          "timeToReadyMs": 1015
+        },
+        {
+          "label": "LotR Return of the King 1080p EXT",
+          "sessionId": "stream_3_1783454256202",
+          "ready": false,
+          "exited": true,
+          "timeout": false,
+          "timeToReadyMs": 7
+        },
+        {
+          "label": "Sintel (web-seeded sample)",
+          "sessionId": "stream_4_1783454256725",
+          "ready": true,
+          "exited": false,
+          "timeout": false,
+          "timeToReadyMs": 17572
+        }
+      ],
+      "error": null,
+      "peakNodeRssMB": "88.2",
+      "peakTorrServerRssMB": "91.0"
+    }
+  ]
+}

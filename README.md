@@ -70,12 +70,24 @@ Notes:
 ## Scripts
 
 ```bash
-npm run web
-npm run test:core
-npm run test:api-contract
-npm run test:lifecycle
-npm run test:stream-speed
+npm run web            # web flow on :3000
+npm test               # whole suite — globs tests/*.test.js, no registration step
+npm run test:core      # or any single test:<slug>
+npm run bench:stream-speed   # benchmarks live in bench/, not tests/
 ```
+
+## Documentation
+
+| Doc | Answers |
+|---|---|
+| `docs/DOCUMENTATION.md` | Full user manual — install, run, configure |
+| `docs/ARCHITECTURE.md` | Module map, the two design planes, known landmines, migration roadmap |
+| `CLAUDE.md` | Conventions to follow when writing code here |
+| `android-app/BUILD.md` | Building the Android APK |
+| `bench/COMPARISON.md` | Engine/subtitle/concurrency/DLNA benchmark results |
+
+`README.md` and `CLAUDE.md` stay at the repo root by convention (GitHub's entry point, and
+Claude Code auto-loads `CLAUDE.md`); every other prose doc lives with what it documents.
 
 ## API Notes
 

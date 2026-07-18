@@ -336,6 +336,20 @@ echo -e "  ${B}->${N} Running ${INSTALL_CMD[*]} (refreshes on every setup run)"
 run_install_deps
 echo -e "  ${G}OK${N} Dependencies installed / updated"
 
+echo -e "\n${C}[*]${N} Fetching TorrServer engine binary..."
+if "$RUNTIME" "$SCRIPT_DIR/scripts/setup-torrserver.js"; then
+  echo -e "  ${G}OK${N} TorrServer engine ready"
+else
+  echo -e "  ${Y}!${N} TorrServer download failed — run 'npm run setup:torrserver' manually before first use"
+fi
+
+echo -e "\n${C}[*]${N} Fetching subtitle tools (optional: alass auto-sync, whisper generate)..."
+if "$RUNTIME" "$SCRIPT_DIR/scripts/setup-subtitle-tools.js"; then
+  echo -e "  ${G}OK${N} Subtitle tools ready"
+else
+  echo -e "  ${Y}!${N} Subtitle tools skipped — run 'npm run setup:subtitle-tools' to enable auto-sync/generate"
+fi
+
 echo -e "\n${C}[3/5]${N} Creating global command..."
 write_launcher
 echo -e "  ${G}OK${N} Created ${INSTALL_DIR}/uplayer"

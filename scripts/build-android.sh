@@ -5,7 +5,7 @@
 # Counterpart to ./setup.sh (which installs the PC/desktop app). A single, OS-aware
 # entry point that auto-detects everything and:
 #   1. ensures the gitignored native libs are present (restores from cache, or from zero:
-#      downloads libnode + cross-compiles ffmpeg — installing the NDK if needed),
+#      downloads libnode + TorrServer and cross-compiles ffmpeg — installing the NDK if needed),
 #   2. bundles the shared Node core into the APK assets,
 #   3. runs the Gradle build (auto-detected JDK / Gradle / SDK),
 #   4. copies the resulting APK to the repo root as uplayer-debug.apk.
@@ -56,8 +56,9 @@ else
   TOOLCHAIN_DIR="$HOME/android-build"
 fi
 
-have_libnode() { [ -f "$JNI_DIR/libnode.so" ] && [ -d "$HDR_DIR" ] && [ -n "$(ls -A "$HDR_DIR" 2>/dev/null || true)" ]; }
-have_ffmpeg()  { [ -f "$JNI_DIR/libffmpeg.so" ] && [ -f "$JNI_DIR/libffprobe.so" ]; }
+have_libnode()    { [ -f "$JNI_DIR/libnode.so" ] && [ -d "$HDR_DIR" ] && [ -n "$(ls -A "$HDR_DIR" 2>/dev/null || true)" ]; }
+have_ffmpeg()     { [ -f "$JNI_DIR/libffmpeg.so" ] && [ -f "$JNI_DIR/libffprobe.so" ]; }
+have_torrserver() { [ -f "$JNI_DIR/libtorrserver.so" ]; }
 
 # echo the first path argument that exists (globs are expanded by the caller)
 first_existing() { local p; for p in "$@"; do [ -e "$p" ] && { printf '%s\n' "$p"; return 0; }; done; return 1; }
@@ -176,11 +177,20 @@ EOF
   fi
 fi
 
-have_libnode || die "libnode/headers still missing after setup"
-have_ffmpeg  || die "ffmpeg libs still missing after setup"
+# 2d. TorrServer (the torrent engine) — an official prebuilt, so just a download. The
+# cache restore in 2a fetches it automatically; this is the fallback + the hard guard,
+# since a missing engine yields an APK that builds clean and fails only at runtime.
+if ! have_torrserver; then
+  log "Fetching TorrServer engine (libtorrserver.so)"
+  node scripts/setup-torrserver.js android || true
+fi
+
+have_libnode    || die "libnode/headers still missing after setup"
+have_ffmpeg     || die "ffmpeg libs still missing after setup"
+have_torrserver || die "libtorrserver.so still missing after setup — re-run 'npm run setup:torrserver:android' (needs network). See android-app/BUILD.md Step 2b."
 ok "Native libs present"
 
-# 2d. Cache the complete set so future clean checkouts restore instantly.
+# 2e. Cache the complete set so future clean checkouts restore instantly.
 node scripts/setup-android-libs.js save || true
 
 # --- 3. Bundle the shared Node core into the APK assets ----------------------

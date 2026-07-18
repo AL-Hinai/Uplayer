@@ -78,9 +78,6 @@ async function main() {
     const status = await requestJson(`${base}/api/stream/status`);
     assert.strictEqual(status.status, 200);
     assert.ok(Array.isArray(status.data), 'status response should be an array');
-    for (const row of status.data) {
-      assert.strictEqual(row.mode, 'native-js');
-    }
 
     const openVlc = await requestJson(`${base}/api/stream/open-vlc`, {
       method: 'POST',

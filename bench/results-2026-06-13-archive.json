@@ -1,0 +1,105 @@
+[
+  {
+    "when": "2026-06-13 init",
+    "label": "Sintel (web-seeded — biased toward WebTorrent)",
+    "link": "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10 (Sintel)",
+    "webtorrent": {
+      "file": "Sintel.mp4",
+      "ttfbMs": 3400,
+      "mbps": "9.14",
+      "peakRssMB": "196.0",
+      "growthMB": "141.7",
+      "note": "OLD read-rate metric; used HTTP web seed (not representative)"
+    },
+    "torrserver": {
+      "file": "Sintel.mp4",
+      "ttfbMs": 4400,
+      "mbps": "2.43",
+      "peakRssMB": "189.1",
+      "note": "OLD read-rate metric; BT swarm; default 200MB cache"
+    }
+  },
+  {
+    "when": "2026-06-13 init",
+    "label": "Ubuntu 24.04.3 desktop ISO (pure BT, no web seed)",
+    "link": "https://releases.ubuntu.com/24.04/ubuntu-24.04.3-desktop-amd64.iso.torrent",
+    "webtorrent": {
+      "error": "no peer data within timeout (early harness hung before timeouts existed)"
+    },
+    "torrserver": {
+      "error": "not run — WebTorrent phase hung first (since fixed)"
+    }
+  },
+  {
+    "when": "2026-06-13 08:40",
+    "label": "One Piece 1165 (1080p anime)",
+    "link": "magnet:?xt=urn:btih:NUOCMTJW26BSPOVZJ53JHNEFCBPM7NQV&dn=%5BSubsPlease%5D%20One%2",
+    "webtorrent": {
+      "file": "[SubsPlease] One Piece - 1165 (1080p) [53DFF167].mkv",
+      "fileLen": 1443088094,
+      "ttfbMs": 3271,
+      "mbps": "22.00",
+      "peers": 48,
+      "peakRssMB": "270.0",
+      "growthMB": "209.3",
+      "note": "avg dl-speed over 30s"
+    },
+    "torrserver": {
+      "file": "[SubsPlease] One Piece - 1165 (1080p) [53DFF167].mkv",
+      "fileLen": 1443088094,
+      "ttfbMs": 5121,
+      "mbps": "7.28",
+      "peers": 19,
+      "peakRssMB": "191.4",
+      "note": "avg dl-speed over 30s"
+    }
+  },
+  {
+    "when": "2026-06-13 08:41",
+    "label": "Matrix Revolutions 2160p UHD",
+    "link": "magnet:?xt=urn:btih:C7A9C79C46DE90B464DC11107724EFCE2A58DC95&dn=The%20Matrix%20R",
+    "webtorrent": {
+      "file": "The Matrix Revolutions 2003.UHD.BluRay.2160p.x265.HDR.Atmos.7.1.[En+Hi]-DTOne.mkv",
+      "fileLen": 21840203222,
+      "ttfbMs": 5461,
+      "mbps": "2.60",
+      "peers": 5,
+      "peakRssMB": "428.1",
+      "growthMB": "246.6",
+      "note": "avg dl-speed over 30s"
+    },
+    "torrserver": {
+      "file": "The Matrix Revolutions 2003.UHD.BluRay.2160p.x265.HDR.Atmos.7.1.[En+Hi]-DTOne.mkv",
+      "fileLen": 21840203222,
+      "ttfbMs": 3996,
+      "mbps": "0.13",
+      "peers": 8,
+      "peakRssMB": "97.9",
+      "note": "avg dl-speed over 30s"
+    }
+  },
+  {
+    "when": "2026-06-13 08:43",
+    "label": "LotR Return of the King 1080p EXT",
+    "link": "magnet:?xt=urn:btih:F3B2ADA3E0AF06D166ACBA3C4C4127DDA32A5A21&dn=The.Lord.of.the.",
+    "webtorrent": {
+      "file": "The.Lord.of.the.Rings.The.Return.of.the.King.2003.EXTENDED.REMASTERED.1080p.BluRay.x264.TrueHD.7.1.Atmos-FGT.mkv",
+      "fileLen": 29768930685,
+      "ttfbMs": 21762,
+      "mbps": "4.88",
+      "peers": 3,
+      "peakRssMB": "379.7",
+      "growthMB": "201.6",
+      "note": "avg dl-speed over 30s"
+    },
+    "torrserver": {
+      "file": "The.Lord.of.the.Rings.The.Return.of.the.King.2003.EXTENDED.REMASTERED.1080p.BluRay.x264.TrueHD.7.1.Atmos-FGT.mkv",
+      "fileLen": 29768930685,
+      "ttfbMs": 2692,
+      "mbps": "1.13",
+      "peers": 4,
+      "peakRssMB": "143.8",
+      "note": "avg dl-speed over 30s"
+    }
+  }
+]

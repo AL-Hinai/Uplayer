@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-const { StreamManager } = require('./uplayer.js');
+const { StreamManager } = require('../uplayer.js');
 
 const DEFAULT_SERVER_URL = 'http://localhost:3000';
 const DEFAULT_TIMEOUT_MS = 180000;

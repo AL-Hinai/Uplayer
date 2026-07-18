@@ -54,8 +54,27 @@ const ffprobePath = existing(path.join(nativeLibDir, 'libffprobe.so'));
 if (ffmpegPath) process.env.UPLAYER_FFMPEG_PATH = ffmpegPath;
 if (ffprobePath) process.env.UPLAYER_FFPROBE_PATH = ffprobePath;
 
-// --- torrent engine: plain webtorrent (no native wrtc on Android) -----------
-process.env.UPLAYER_TORRENT_ENGINE = 'webtorrent';
+// --- torrent engine: TorrServer (shipped as an extracted native lib) --------
+// Like ffmpeg/ffprobe above, the arm TorrServer binary is renamed to
+// libtorrserver.so at build time so Android extracts it to nativeLibraryDir (the
+// one directory an app may exec from). The StreamManager's TorrServerClient spawns
+// it and talks to it over localhost HTTP.
+const torrserverPath = existing(path.join(nativeLibDir, 'libtorrserver.so'));
+if (torrserverPath) process.env.UPLAYER_TORRSERVER_PATH = torrserverPath;
+const torrserverData = path.join(filesDir, 'torrserver');
+try { fs.mkdirSync(torrserverData, { recursive: true }); } catch (e) { /* ignore */ }
+process.env.UPLAYER_TORRSERVER_DATA = torrserverData;
+
+// --- optional speech tools (alass auto-sync, whisper auto-generate) ----------
+// No official Android prebuilts exist. If you build them and drop libalass.so /
+// libwhisper.so into jniLibs (+ a ggml model alongside main.js or in filesDir), the
+// app uses them. Absent = those features are simply not offered (graceful).
+const alassPath = existing(path.join(nativeLibDir, 'libalass.so'));
+if (alassPath) process.env.UPLAYER_ALASS_PATH = alassPath;
+const whisperPath = existing(path.join(nativeLibDir, 'libwhisper.so'));
+if (whisperPath) process.env.UPLAYER_WHISPER_PATH = whisperPath;
+const whisperModel = existing(path.join(filesDir, 'ggml-tiny.en.bin')) || existing(path.join(__dirname, 'ggml-tiny.en.bin'));
+if (whisperModel) process.env.UPLAYER_WHISPER_MODEL = whisperModel;
 
 // --- writable temp / sandbox dir on app-private storage ---------------------
 const tmpDir = path.join(filesDir, 'uplayer-tmp');
@@ -124,6 +143,7 @@ process.on('unhandledRejection', (reason) => {
 console.log('[uplayer] starting on Android');
 console.log('[uplayer]   ffmpeg :', process.env.UPLAYER_FFMPEG_PATH || '(missing)');
 console.log('[uplayer]   ffprobe:', process.env.UPLAYER_FFPROBE_PATH || '(missing)');
+console.log('[uplayer]   torrsrv:', process.env.UPLAYER_TORRSERVER_PATH || '(missing)');
 console.log('[uplayer]   tmp    :', tmpDir);
 console.log('[uplayer]   host   :', process.env.UPLAYER_PUBLIC_HOST || '(auto)');
 

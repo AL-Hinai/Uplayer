@@ -17,6 +17,7 @@
  * Files managed (arm64-v8a only — see android-app/BUILD.md):
  *   - libnode.so   (nodejs-mobile runtime)
  *   - libffmpeg.so / libffprobe.so  (aarch64 ffmpeg, built via scripts/build-ffmpeg-android.sh)
+ *   - libtorrserver.so  (the torrent engine; a plain download — see AUTO_FETCH below)
  *   - cpp/nodejs-mobile/include/node/  (nodejs-mobile headers, needed by CMake)
  *
  * Cache location: $UPLAYER_ANDROID_LIB_CACHE, else C:\android-build\jnilibs-cache on
@@ -27,11 +28,20 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const JNI_DIR = path.join(ROOT, 'android-app', 'app', 'src', 'main', 'jniLibs', 'arm64-v8a');
 const HEADERS_DIR = path.join(ROOT, 'android-app', 'app', 'src', 'main', 'cpp', 'nodejs-mobile', 'include', 'node');
-const LIBS = ['libnode.so', 'libffmpeg.so', 'libffprobe.so'];
+const LIBS = ['libnode.so', 'libffmpeg.so', 'libffprobe.so', 'libtorrserver.so'];
+
+// Libs that restore can obtain on its own when the cache misses, because they're an
+// official prebuilt download rather than a local cross-compile. Without this, a fresh
+// clone builds an APK whose torrent engine silently doesn't exist (main.js logs
+// "torrsrv: (missing)") — the build looks clean and only fails at runtime.
+const AUTO_FETCH = {
+  'libtorrserver.so': { script: 'scripts/setup-torrserver.js', args: ['android'] },
+};
 
 function cacheDir() {
   if (process.env.UPLAYER_ANDROID_LIB_CACHE) return process.env.UPLAYER_ANDROID_LIB_CACHE;
@@ -66,6 +76,20 @@ function repoStatus() {
   return { miss, headersOk, ok: miss.length === 0 && headersOk };
 }
 
+// Run a provisioning script that fetches a lib we can obtain without a toolchain.
+// Best-effort: a failure here (offline, GitHub down) falls through to the manual help.
+function autoFetch(name) {
+  const spec = AUTO_FETCH[name];
+  if (!spec) return false;
+  console.log('Fetching ' + name + ' via ' + spec.script + ' ...');
+  const r = spawnSync(process.execPath, [path.join(ROOT, spec.script), ...spec.args], {
+    cwd: ROOT,
+    stdio: 'inherit',
+  });
+  if (r.status !== 0) { console.error('  ' + spec.script + ' failed — see the error above.'); return false; }
+  return exists(path.join(JNI_DIR, name));
+}
+
 function printManualHelp() {
   console.error('');
   console.error('To obtain the missing native libs (then re-run `save` to cache them):');
@@ -73,6 +97,7 @@ function printManualHelp() {
   console.error('      https://github.com/nodejs-mobile/nodejs-mobile/releases');
   console.error('      -> bin/arm64-v8a/libnode.so  and  include/node/  (see BUILD.md Step 1)');
   console.error('  - libffmpeg.so / libffprobe.so: build via scripts/build-ffmpeg-android.sh (WSL/Linux)');
+  console.error('  - libtorrserver.so: npm run setup:torrserver:android  (needs network)');
   console.error('  - place them under android-app/app/src/main/jniLibs/arm64-v8a/ and');
   console.error('    android-app/app/src/main/cpp/nodejs-mobile/include/node/, then:');
   console.error('      npm run setup:android-libs:save');
@@ -116,6 +141,11 @@ function doRestore() {
     restored.push('headers');
   }
   if (restored.length) console.log('OK Restored from cache (' + CACHE + '):', restored.join(', '));
+
+  // Anything the cache couldn't supply but we can fetch ourselves (official prebuilts).
+  for (const n of missingLibs(JNI_DIR)) {
+    if (AUTO_FETCH[n] && autoFetch(n)) console.log('OK Fetched', n);
+  }
 
   const after = repoStatus();
   if (after.ok) { console.log('OK Android native libs ready.'); return; }

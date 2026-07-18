@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 let systemConfig = {};
 try {
@@ -60,7 +61,37 @@ function requireEnv(name, options = {}) {
   return value;
 }
 
+// --- user-entered config store ----------------------------------------------
+// Keys entered in the app's Settings popup are saved here so a fresh PC doesn't
+// need a .env / env vars at all — it just asks for what it needs. This store has
+// the HIGHEST priority; env / system-config remain as optional fallbacks.
+let store = null;
+function configStorePath() {
+  const base = process.env.HOME || process.env.USERPROFILE || os.homedir() || __dirname;
+  return path.join(base, '.uplayer-config.json');
+}
+function readConfigStore() {
+  if (store) return store;
+  try { store = JSON.parse(fs.readFileSync(configStorePath(), 'utf8')) || {}; } catch (e) { store = {}; }
+  return store;
+}
+function setConfigValues(values = {}) {
+  const s = readConfigStore();
+  for (const [k, v] of Object.entries(values)) {
+    if (v == null || String(v).trim() === '') delete s[k];
+    else s[k] = String(v).trim();
+  }
+  try { fs.writeFileSync(configStorePath(), JSON.stringify(s, null, 2)); } catch (e) { /* read-only fs */ }
+  store = s;
+  return s;
+}
+
 function getEnv(name, fallback = '') {
+  const fromStore = readConfigStore()[name];
+  if (fromStore != null && String(fromStore).trim()) {
+    return String(fromStore).trim();
+  }
+
   const fromSystem = systemConfig[name];
   if (fromSystem != null && String(fromSystem).trim()) {
     return String(fromSystem).trim();
@@ -70,6 +101,17 @@ function getEnv(name, fallback = '') {
   if (value != null && String(value).trim()) return String(value).trim();
 
   return fallback;
+}
+
+// Which keys are configured (booleans only — never leak the secret values).
+function getConfigStatus() {
+  return {
+    TMDB_API_KEY: !!getEnv('TMDB_API_KEY'),
+    OPENSUBTITLES_API_KEY: !!getEnv('OPENSUBTITLES_API_KEY'),
+    OPENSUBTITLES_USERNAME: !!getEnv('OPENSUBTITLES_USERNAME'),
+    OPENSUBTITLES_PASSWORD: !!getEnv('OPENSUBTITLES_PASSWORD'),
+    PREFERRED_QUALITY: !!getEnv('PREFERRED_QUALITY'),
+  };
 }
 
 function getRuntimeConfig() {
@@ -121,4 +163,7 @@ module.exports = {
   getEnv,
   getRuntimeConfig,
   validateRuntimeConfig,
+  setConfigValues,
+  getConfigStatus,
+  configStorePath,
 };

@@ -510,7 +510,7 @@ function route() {
   });
 
   // Close mobile nav
-  document.getElementById('navLinks').classList.remove('open');
+  document.getElementById('navbar').classList.remove('menu-open');
 
   document.getElementById('app').innerHTML = `<div class="page-loader"><div class="spinner"></div></div>`;
   window.scrollTo(0, 0);
@@ -523,16 +523,66 @@ async function renderHome() {
   const app = document.getElementById('app');
 
   try {
-    const [trending, trendingMovies, trendingTV, newEps] = await Promise.all([
+    const [trending, trendingMovies, trendingTV, newEps, hist] = await Promise.all([
       api('/api/trending?type=all&window=week'),
       api('/api/trending?type=movie&window=week'),
       api('/api/trending?type=tv&window=week'),
       api('/api/newEpisodes').catch(() => []),
+      api('/api/history').catch(() => null),
     ]);
 
     state.newEpisodes = newEps;
 
     const heroHTML = renderHero(trending.results);
+
+    // Continue Watching — history entries with a timestamp-level progress marker
+    // (written by the player's playhead pings), most recently watched first.
+    const cwEntries = [];
+    if (hist) {
+      Object.values(hist.movies || {}).forEach((m) => {
+        if (m.progress && m.progress.positionSec > 0) cwEntries.push({ type: 'movie', item: m });
+      });
+      Object.values(hist.tvShows || {}).forEach((s) => {
+        if (s.progress && s.progress.positionSec > 0) cwEntries.push({ type: 'tv', item: s });
+      });
+      cwEntries.sort((a, b) => new Date(b.item.progress.updatedAt || 0) - new Date(a.item.progress.updatedAt || 0));
+    }
+    let cwHTML = '';
+    if (cwEntries.length > 0) {
+      const cwCards = cwEntries.slice(0, 12).map(({ type, item }) => {
+        const p = item.progress;
+        const pct = p.durationSec ? Math.min(99, Math.round((p.positionSec / p.durationSec) * 100)) : null;
+        const where = type === 'tv' && p.season != null ? `S${p.season}E${p.episode} · ` : '';
+        const timing = p.durationSec
+          ? `${Math.max(1, Math.round((p.durationSec - p.positionSec) / 60))} min left`
+          : `${Math.floor(p.positionSec / 60)} min in`;
+        // The release source this title last streamed from — resume reuses it so the
+        // torrent picker never reappears. Absent on entries watched before this was
+        // recorded; resume then just ranks releases normally.
+        const lastSource = (item.lastPlayback && item.lastPlayback.source) || '';
+        const srcArg = lastSource ? `, '${escape(lastSource).replace(/'/g, '&#39;')}'` : '';
+        return `
+        <div class="new-ep-card cw-card" onclick="resumeFromHistory('${type}', ${Number(item.tmdbId)}, ${p.season != null ? Number(p.season) : 'null'}, ${p.episode != null ? Number(p.episode) : 'null'}, ${Number(p.positionSec)}, '${escape(item.title).replace(/'/g, '&#39;')}'${srcArg})">
+          ${item.poster_path
+            ? `<img class="new-ep-poster" src="https://image.tmdb.org/t/p/w200${item.poster_path}" alt="${escape(item.title)}" loading="lazy" />`
+            : `<div class="new-ep-poster new-ep-poster-placeholder">${type === 'tv' ? 'TV' : 'Film'}</div>`}
+          <div class="new-ep-card-info">
+            <div class="new-ep-card-title">${escape(item.title)}</div>
+            <div class="new-ep-card-detail">${where}${timing}</div>
+            ${pct != null ? `<div class="cw-bar"><div class="cw-bar-fill" style="width:${pct}%"></div></div>` : ''}
+            <div class="new-ep-card-new">Resume &#9654;</div>
+          </div>
+        </div>`;
+      }).join('');
+      cwHTML = `
+        <div class="section new-episodes-section">
+          <div class="section-header">
+            <h2 class="section-title">Continue Watching</h2>
+            <a href="#/history" class="section-link">View History -></a>
+          </div>
+          <div class="scroll-row new-ep-scroll">${cwCards}</div>
+        </div>`;
+    }
 
     const trendingAllRow = trending.results.slice(0, 16).map((item) =>
       buildCard(item, { showTypeBadge: true })
@@ -578,6 +628,7 @@ async function renderHome() {
 
     app.innerHTML = `
       ${heroHTML}
+      ${cwHTML}
       ${newEpsHTML}
       <div class="section">
         <div class="section-header">
@@ -1541,15 +1592,35 @@ document.getElementById('navSearchInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') doNavSearch();
 });
 
-// --- Hamburger ----------------------------------------------------------------
-document.getElementById('hamburger').addEventListener('click', () => {
-  document.getElementById('navLinks').classList.toggle('open');
+// --- Hamburger / mobile menu --------------------------------------------------
+const navbarEl = document.getElementById('navbar');
+const hamburgerEl = document.getElementById('hamburger');
+function setMenuOpen(open) {
+  navbarEl.classList.toggle('menu-open', open);
+  if (hamburgerEl) hamburgerEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function toggleMenu() { setMenuOpen(!navbarEl.classList.contains('menu-open')); }
+if (hamburgerEl) hamburgerEl.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(); });
+// close on outside tap, Escape, or a link click
+document.addEventListener('click', (e) => {
+  if (!navbarEl.classList.contains('menu-open')) return;
+  if (!navbarEl.contains(e.target)) setMenuOpen(false);
+  else if (e.target.closest('.nav-link')) setMenuOpen(false);
 });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenuOpen(false); });
+// close when resizing up to desktop (so the menu never sticks open)
+window.addEventListener('resize', () => { if (window.innerWidth > 920) setMenuOpen(false); });
 
-// --- Navbar scroll effect -----------------------------------------------------
+// --- Navbar scroll effect (dynamic: solidify + auto-hide on scroll down) ------
+let __lastScrollY = 0;
 window.addEventListener('scroll', () => {
-  document.getElementById('navbar').style.background =
-    window.scrollY > 50 ? 'rgba(11,12,15,0.97)' : 'rgba(11,12,15,0.85)';
+  const y = window.scrollY;
+  navbarEl.classList.toggle('scrolled', y > 40);
+  if (!navbarEl.classList.contains('menu-open')) {
+    if (y > 320 && y > __lastScrollY + 6) navbarEl.classList.add('nav-hidden');
+    else if (y < __lastScrollY - 6 || y < 320) navbarEl.classList.remove('nav-hidden');
+  }
+  __lastScrollY = y;
 }, { passive: true });
 
 // --- Error / Empty helpers ----------------------------------------------------
@@ -1606,6 +1677,12 @@ const wizard = {
   videoFormat: null,
   detail: null,
   historySaved: false,
+  // Live monitoring — last stream_health payload, plus the download-speed samples the
+  // sparkline draws. Deliberately not persisted with the rest of the wizard state: it's
+  // a live reading, and a stale one from before a reload would be a lie.
+  health: null,
+  healthSpeeds: [],
+  targets: [],
   // Step
   step: 1, // 1=episode(TV)/torrent(movie), 2=torrents, 3=subtitles, 4=streaming
 };
@@ -1628,7 +1705,16 @@ const castTvState = {
   castDeviceName: '',
   castVolume: 0.5,
   isMuted: false,
+  castProgressTimer: null, // reports the Chromecast playhead into watch history
+  // DLNA (push to smart TVs) — discovered renderers + the one we're casting to
+  dlnaDevices: [],
+  dlnaScanning: false,
+  dlnaCasting: false,
+  dlnaDeviceName: '',
+  dlnaDevice: null,
+  dlnaStatusText: '',
 };
+let dlnaStatusTimer = null;
 const externalScriptPromises = new Map();
 let googleCastSdkPromise = null;
 let googleCastContextReady = false;
@@ -1842,6 +1928,48 @@ async function resolveActivePlayerUrl(fallbackUrl) {
   return meta.playerUrl || null;
 }
 
+// One-click resume from the Continue Watching shelf. Stores the saved playhead as a
+// hint, then routes into the stream flow via the same auto deep link as "Next Episode"
+// — movies included — so resuming never asks for a source or a subtitle again: auto
+// mode picks the release itself and leaves subtitles to the player's manifest poll.
+// `lastSource` is the source this title last streamed from (remembered on the history
+// entry), so resume comes back to the same release. When the player opens for the SAME
+// title, the hint becomes a ?t= seek.
+function resumeFromHistory(type, tmdbId, season, episode, positionSec, titleText, lastSource) {
+  state.resumeHint = {
+    type,
+    tmdbId: Number(tmdbId),
+    season: season != null ? Number(season) : null,
+    episode: episode != null ? Number(episode) : null,
+    positionSec: Number(positionSec) || 0,
+  };
+  const title = encodeURIComponent(titleText || '');
+  const srcParam = lastSource ? `&src=${encodeURIComponent(lastSource)}` : '';
+  if (type === 'tv' && season != null && episode != null) {
+    navigate(`/stream?type=tv&id=${Number(tmdbId)}&title=${title}&s=${Number(season)}&e=${Number(episode)}&auto=1${srcParam}`);
+  } else {
+    navigate(`/stream?type=${type}&id=${Number(tmdbId)}&title=${title}&auto=1${srcParam}`);
+  }
+}
+window.resumeFromHistory = resumeFromHistory;
+
+// Append the saved playhead (?t=) when the player being opened matches the resume
+// hint; consume or discard the hint either way so a stale hint can never seek an
+// unrelated stream.
+function applyResumeParam(url) {
+  const hint = state.resumeHint;
+  if (!url || !hint) return url;
+  if (!wizard.tmdbId || Number(wizard.tmdbId) !== hint.tmdbId) return url; // different title — keep hint for now
+  if (hint.type === 'tv' && hint.season != null
+      && (Number(wizard.selectedSeason) !== hint.season || Number(wizard.selectedEpisode) !== hint.episode)) {
+    state.resumeHint = null; // same show, different episode — don't mis-seek
+    return url;
+  }
+  state.resumeHint = null;
+  if (!(hint.positionSec > 5)) return url;
+  return url + (url.includes('?') ? '&' : '?') + 't=' + Math.floor(hint.positionSec);
+}
+
 function openActivePlayer(event, fallbackUrl) {
   if (event) event.preventDefault();
 
@@ -1851,7 +1979,7 @@ function openActivePlayer(event, fallbackUrl) {
   if (nativeCastBridge() || nativePlayerBridge()) {
     resolveActivePlayerUrl(fallbackUrl).then((url) => {
       if (url) {
-        window.location.assign(url);
+        window.location.assign(applyResumeParam(url));
         return;
       }
       if (state.currentPage !== 'stream') navigate('/stream');
@@ -1874,8 +2002,9 @@ function openActivePlayer(event, fallbackUrl) {
 
   resolveActivePlayerUrl(fallbackUrl).then((url) => {
     if (url) {
-      if (popup && !popup.closed) popup.location.replace(url);
-      else window.open(url, '_blank', 'noopener');
+      const target = applyResumeParam(url);
+      if (popup && !popup.closed) popup.location.replace(target);
+      else window.open(target, '_blank', 'noopener');
       return;
     }
 
@@ -1890,11 +2019,56 @@ function openActivePlayer(event, fallbackUrl) {
   return false;
 }
 
+// True when this page is loaded on the same machine that runs the server. Remote
+// clients (a phone/tablet browsing to the host's LAN IP) are NOT localhost.
+function isLocalHostOrigin(locationLike = window.location) {
+  const h = String((locationLike && locationLike.hostname) || '').toLowerCase();
+  if (!h) return true; // origin unknown → keep the existing (host-side) behavior
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
+// Build a deep link that opens THIS device's video player for the stream. Any
+// localhost-only media URL is re-pointed at the host the client actually reached
+// us on (window.location.hostname), so it's reachable from the phone/tablet.
+function buildClientVlcDeepLink(rawUrl, locationLike = window.location, ua = (typeof navigator !== 'undefined' ? navigator.userAgent : '')) {
+  let u;
+  try { u = new URL(rawUrl); } catch (e) { return null; }
+  if (isLocalHostOrigin(u)) u.hostname = String((locationLike && locationLike.hostname) || u.hostname);
+  const httpUrl = u.toString();
+  if (/Android/i.test(ua || '')) {
+    // Chrome converts intent:// into an ACTION_VIEW intent → player chooser (VLC/MX/…),
+    // mirroring the in-app native bridge. No package pin, so any video player qualifies.
+    const scheme = u.protocol.replace(':', '');
+    return `intent://${httpUrl.replace(/^https?:\/\//i, '')}#Intent;scheme=${scheme};type=video/*;end`;
+  }
+  // iOS / other browsers: VLC's custom scheme (best effort).
+  return 'vlc://' + httpUrl;
+}
+
 function openActiveVlc(event, fallbackSessionId) {
   if (event) event.preventDefault();
   // Android app: open the stream in an external player via intent, not server-side VLC.
   if (nativePlayerBridge()) {
     return openInNativePlayer();
+  }
+  // Remote browser (e.g. phone on the LAN): "open-vlc" would spawn VLC on the HOST
+  // machine, not here. Instead deep-link into this device's own VLC with a
+  // LAN-reachable URL. Host machine's own browser (localhost) keeps the server spawn.
+  if (!isLocalHostOrigin()) {
+    const meta = castTvState.meta || normalizeActiveStreamMeta({
+      sessionId: wizard.sessionId,
+      playerUrl: wizard.playerUrl,
+      vlcUrl: wizard.vlcUrl,
+      castUrl: wizard.castUrl,
+    });
+    const media = meta.vlcUrl || meta.castUrl || meta.playerUrl;
+    if (!media) { toast('Stream is still starting', 'info'); return false; }
+    const deep = buildClientVlcDeepLink(media);
+    if (deep) {
+      toast('Opening in VLC on this device…', 'success');
+      window.location.href = deep;
+      return false;
+    }
   }
   const sessionId = fallbackSessionId || wizard.sessionId || null;
   fetchJson('/api/stream/open-vlc', {
@@ -2322,62 +2496,85 @@ function renderCastTvModalContent(meta, state = {}) {
         </div>
       </div>`;
 
-  const tvSection = sameNetworkUrl
-    ? `
-      <div class="cast-modal-card">
-        <div class="cast-modal-card-head">
-          <div>
-            <h3>Open on TV</h3>
-            <p>Use this same-network link on Samsung, LG, Chromecast with Google TV browsers, or any TV browser.</p>
-          </div>
-          <span class="cast-chip">TV browser</span>
-        </div>
-        <label class="cast-modal-label" for="castTvLinkInput">TV link</label>
-        <div class="cast-link-row">
-          <input id="castTvLinkInput" class="cast-link-input" type="text" readonly value="${escape(sameNetworkUrl)}">
-          <button type="button" class="btn btn-outline btn-sm" onclick="return copyCastTvLink(event)">
-            Copy Link
-          </button>
-        </div>
-        <div class="cast-qr-wrap">
-          <div class="cast-qr-box" id="castQrCode">
-            <div class="cast-qr-placeholder">Loading QR...</div>
-          </div>
-          <div class="cast-qr-copy">
-            <p>Scan this QR code from the TV or another device on the same network.</p>
-            <a class="btn btn-outline" href="${escape(sameNetworkUrl)}" target="_blank" rel="noopener">
-              Open TV Link
-            </a>
-          </div>
-        </div>
-        <div style="margin-top:1rem;display:flex;gap:0.5rem;flex-wrap:wrap">
-          <button type="button" class="btn btn-outline btn-sm" onclick="return testTvReadiness(event)">
-            Test TV Readiness
-          </button>
-          <span id="tvReadinessStatus" style="font-size:0.8rem;color:var(--text-muted);align-self:center"></span>
-        </div>
-      </div>`
-    : `
-      <div class="cast-modal-card">
-        <div class="cast-modal-card-head">
-          <div>
-            <h3>Open on TV</h3>
-            <p>The TV-ready link will appear when the stream player is live.</p>
-          </div>
-        </div>
+  // DLNA push-cast: discovered smart TVs, listed right next to Chromecast so the one
+  // popup shows every usable device. Sends TorrServer's :8090 stream = original quality.
+  const dlnaScanning = castTvState.dlnaScanning;
+  const dlnaDevices = castTvState.dlnaDevices || [];
+  const dlnaCasting = castTvState.dlnaCasting;
+  let dlnaBody;
+  if (dlnaCasting) {
+    dlnaBody = `
+      <p class="cast-modal-note">Casting to <strong>${escape(castTvState.dlnaDeviceName)}</strong> — original file, full quality, no transcoding.</p>
+      <p class="cast-modal-note" style="margin-top:.3rem">TV status: <strong id="dlnaStatusLine">${escape(castTvState.dlnaStatusText || 'starting…')}</strong></p>
+      <div class="cast-modal-actions" style="display:flex;gap:0.5rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-outline btn-sm" onclick="return pauseDlnaCast()">Pause</button>
+        <button type="button" class="btn btn-outline btn-sm" onclick="return resumeDlnaCast()">Resume</button>
+        <button type="button" class="btn btn-danger btn-sm" onclick="return stopDlnaCast()">Stop</button>
       </div>`;
+  } else if (dlnaDevices.length) {
+    // Devices discovered in the background are shown IMMEDIATELY — a refresh in progress
+    // never hides them (it just shows a small "Refreshing…" hint), so the popup is ready
+    // the moment it opens instead of flashing a "Scanning…" message.
+    dlnaBody = `
+      <div style="display:flex;flex-direction:column;gap:0.4rem;margin:0.6rem 0">
+        ${dlnaDevices.map((d) => `
+          <button type="button" class="btn btn-outline" style="justify-content:flex-start;text-align:left"
+            onclick="return castToDlnaDevice('${escape(d.id)}')">📺 ${escape(d.name)}${d.model ? ` <span style="opacity:.6">(${escape(d.model)})</span>` : ''}</button>`).join('')}
+      </div>
+      <div class="cast-modal-actions"><button type="button" class="btn btn-outline btn-sm" onclick="return discoverDlnaDevices(true)">Rescan</button>${dlnaScanning ? '<span class="cast-modal-note" style="margin-left:.5rem;opacity:.7">Refreshing…</span>' : ''}</div>`;
+  } else if (dlnaScanning) {
+    dlnaBody = `<p class="cast-modal-note">Scanning the network for DLNA TVs…</p>`;
+  } else {
+    dlnaBody = `
+      <p class="cast-modal-note">No DLNA TVs found yet. Make sure the TV is on and on the same Wi‑Fi/LAN, then rescan. If it still doesn't appear, allow <strong>Node.js</strong> through Windows Firewall (Private networks) — that blocks the TV's reply.</p>
+      <div class="cast-modal-actions"><button type="button" class="btn btn-outline btn-sm" onclick="return discoverDlnaDevices(true)">Rescan</button></div>`;
+  }
+  const dlnaSection = `
+    <div class="cast-modal-card">
+      <div class="cast-modal-card-head">
+        <div>
+          <h3>Cast to TV (DLNA)</h3>
+          <p>Push the stream to a smart TV at full original quality — no re-encoding.</p>
+        </div>
+        <span class="cast-chip ${dlnaCasting ? 'cast-chip-casting' : 'cast-chip-ready'}">${dlnaCasting ? 'Casting' : ((dlnaScanning && !dlnaDevices.length) ? 'Scanning' : 'DLNA')}</span>
+      </div>
+      ${dlnaBody}
+      <p class="cast-modal-note">Subtitles embedded in the file are selectable from the TV's own subtitle menu.</p>
+    </div>`;
+
+  // The third option the header promises, for TVs that are neither a Chromecast nor a DLNA
+  // renderer: read the address off the screen and type it into the TV's own browser.
+  // Deliberately `playerUrl` — `vlcUrl` is a localhost address the TV cannot reach, and
+  // `castUrl` is a raw media file its browser would download instead of play.
+  const tvBrowserSection = sameNetworkUrl
+    ? `
+    <div class="cast-modal-card">
+      <div class="cast-modal-card-head">
+        <div>
+          <h3>Open on a TV browser</h3>
+          <p>Type this address into any smart TV's browser on the same network.</p>
+        </div>
+        <span class="cast-chip cast-chip-ready">Any device</span>
+      </div>
+      <p class="cast-modal-note"><strong>${escape(sameNetworkUrl)}</strong></p>
+      <div class="cast-modal-actions">
+        <a class="btn btn-outline" href="${escape(sameNetworkUrl)}" target="_blank" rel="noopener">Open here</a>
+      </div>
+    </div>`
+    : '';
 
   return `
     <div class="cast-modal-shell">
       <div class="cast-modal-header">
         <div>
           <h2>Cast / TV</h2>
-          <p>Chromecast from this PC browser, or open the same stream directly on a TV browser.</p>
+          <p>Pick any device on your network — Chromecast, a DLNA smart TV, or open the link on a TV browser.</p>
         </div>
       </div>
       <div class="cast-modal-grid">
         ${chromecastSection}
-        ${tvSection}
+        ${dlnaSection}
+        ${tvBrowserSection}
       </div>
     </div>`;
 }
@@ -2749,6 +2946,9 @@ async function populateCastTvModal(meta) {
 
   renderState();
 
+  // Discover DLNA TVs on the LAN and drop them into the same popup (non-blocking).
+  if (!castTvState.dlnaCasting) discoverDlnaDevices();
+
   // Embedded subs fill in after player_ready; poll while manifest is empty or any track is still extracting.
   if (normalized.subtitleManifestUrl && (subtitleOptions.length === 0 || subtitleOptions.some((t) => t.ready === false))) {
     const manifestUrl = normalized.subtitleManifestUrl;
@@ -2821,6 +3021,155 @@ async function populateCastTvModal(meta) {
     castTvState.pendingAutoStartCast = false;
   }
 }
+
+// Re-render the cast popup from castTvState (used by the DLNA flow, which updates
+// state outside populateCastTvModal's local renderState closure).
+function rerenderCastTvModal() {
+  const content = document.getElementById('castModalContent');
+  const overlay = document.getElementById('castModalOverlay');
+  if (!content || !castTvState.meta) return;
+  if (overlay && !overlay.classList.contains('open')) return;
+  content.innerHTML = renderCastTvModalContent(castTvState.meta, {
+    senderAllowed: castTvState.senderAllowed,
+    senderHelperUrl: castTvState.senderHelperUrl,
+    subtitleOptions: castTvState.subtitleOptions,
+    selectedSubtitleTrackId: castTvState.selectedSubtitleTrackId,
+    castSdkReady: castTvState.castSdkReady,
+  });
+  renderCastQrCode(castTvState.meta.playerUrl);
+}
+
+async function discoverDlnaDevices(force) {
+  if (castTvState.dlnaScanning) return false;
+  // A background/silent refresh (already have devices and the user didn't hit Rescan)
+  // keeps the current list on screen — no "Scanning…" takeover, so the popup is always
+  // ready instantly. Only a first scan (nothing found yet) or a forced Rescan shows the
+  // scanning state.
+  const silent = !force && (castTvState.dlnaDevices || []).length > 0;
+  castTvState.dlnaScanning = true;
+  if (!silent) rerenderCastTvModal();
+  try {
+    const res = await fetch('/api/dlna/devices' + (force ? '?timeout=4000' : ''));
+    const data = await res.json();
+    const found = (data && Array.isArray(data.devices)) ? data.devices : [];
+    // Don't wipe a populated list on a transient empty background result (a TV can miss a
+    // single SSDP round). A forced rescan, or any non-empty result, replaces the list.
+    if (found.length || force) castTvState.dlnaDevices = found;
+  } catch (e) {
+    if (force) castTvState.dlnaDevices = [];
+  } finally {
+    castTvState.dlnaScanning = false;
+    rerenderCastTvModal();
+  }
+  return false;
+}
+
+async function castToDlnaDevice(deviceId) {
+  const dev = (castTvState.dlnaDevices || []).find((d) => d.id === deviceId);
+  if (!dev) return false;
+  toast('Sending to ' + dev.name + '…', 'info');
+  try {
+    const res = await fetch('/api/dlna/play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId,
+        sessionId: (castTvState.meta && castTvState.meta.sessionId) || wizard.sessionId || null,
+        title: wizard.titleText || 'Uplayer',
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    castTvState.dlnaCasting = true;
+    castTvState.dlnaDeviceName = dev.name;
+    castTvState.dlnaDevice = dev;
+    castTvState.dlnaStatusText = 'starting…';
+    toast('Casting to ' + dev.name, 'success');
+    startDlnaStatusPolling();
+  } catch (e) {
+    toast('DLNA cast failed: ' + (e.message || e), 'error');
+  } finally {
+    rerenderCastTvModal();
+  }
+  return false;
+}
+
+// Continue an active DLNA cast onto the current stream session (used after a binge
+// "Next Episode" starts the next episode). The native stream can lag a few seconds
+// behind the player URL, so retry while the server reports "not ready yet" (409).
+async function recastDlnaForCurrentSession() {
+  const dev = castTvState.dlnaDevice;
+  if (!castTvState.dlnaCasting || !dev || !wizard.sessionId) return;
+  const targetSession = wizard.sessionId;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (!castTvState.dlnaCasting || wizard.sessionId !== targetSession) return; // user stopped / moved on
+    try {
+      const res = await fetch('/api/dlna/play', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: dev.id, sessionId: targetSession, title: wizard.titleText || 'Uplayer' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && !data.error) {
+        castTvState.dlnaStatusText = 'starting…';
+        startDlnaStatusPolling();
+        rerenderCastTvModal();
+        toast('Continuing on ' + dev.name, 'success');
+        return;
+      }
+      if (res.status !== 409) throw new Error(data.error || ('HTTP ' + res.status)); // real failure
+    } catch (e) {
+      if (attempt === 7) { toast("Couldn't continue on " + dev.name + ' — re-cast manually', 'error'); return; }
+    }
+    await new Promise((r) => setTimeout(r, 2500)); // stream still buffering — wait and retry
+  }
+}
+
+// Poll the TV's transport state/position so the popup proves it's really playing
+// (LG webOS often plays a DLNA push without bringing the player to the foreground).
+function startDlnaStatusPolling() {
+  stopDlnaStatusPolling();
+  const tick = async () => {
+    if (!castTvState.dlnaCasting || !castTvState.dlnaDevice) { stopDlnaStatusPolling(); return; }
+    try {
+      const res = await fetch('/api/dlna/status?deviceId=' + encodeURIComponent(castTvState.dlnaDevice.id));
+      const d = await res.json();
+      if (d && (d.state || d.relTime)) {
+        const pos = (d.relTime && d.duration && !/NOT_IMPLEMENTED/i.test(d.relTime)) ? ` — ${d.relTime} / ${d.duration}` : '';
+        castTvState.dlnaStatusText = (d.state || '') + pos;
+        const line = document.getElementById('dlnaStatusLine');
+        if (line) line.textContent = castTvState.dlnaStatusText;
+      }
+    } catch (e) { /* ignore poll errors */ }
+  };
+  tick();
+  dlnaStatusTimer = setInterval(tick, 3000);
+}
+function stopDlnaStatusPolling() { if (dlnaStatusTimer) { clearInterval(dlnaStatusTimer); dlnaStatusTimer = null; } }
+
+function dlnaTransport(path) {
+  const dev = castTvState.dlnaDevice;
+  if (!dev) return Promise.resolve();
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: dev.id }),
+  }).catch(() => {});
+}
+
+async function stopDlnaCast() {
+  stopDlnaStatusPolling();
+  await dlnaTransport('/api/dlna/stop');
+  castTvState.dlnaCasting = false;
+  castTvState.dlnaDeviceName = '';
+  castTvState.dlnaDevice = null;
+  castTvState.dlnaStatusText = '';
+  toast('Stopped DLNA cast', 'info');
+  rerenderCastTvModal();
+  return false;
+}
+async function pauseDlnaCast() { await dlnaTransport('/api/dlna/pause'); toast('Paused', 'info'); return false; }
+async function resumeDlnaCast() { await dlnaTransport('/api/dlna/resume'); toast('Resumed', 'info'); return false; }
 
 function openCastFromNav(event) {
   if (event) event.preventDefault();
@@ -3026,6 +3375,7 @@ function startChromecastCast(event) {
     // Set up session state tracking
     castTvState.isCasting = true;
     castTvState.castSession = session;
+    startCastProgressUpdates(); // feed the TV's playhead into watch history
     castTvState.castDeviceName = session.getReceiverStatus?.()?.receiver?.friendlyName || 'Chromecast';
     // Remember what we cast so the status poller can top up subtitles as they extract.
     castTvState.castMeta = meta;
@@ -3074,6 +3424,96 @@ function startChromecastCast(event) {
   return false;
 }
 
+// --- Chromecast -> watch history ---------------------------------------------
+// The TV plays on its own, so nothing pings /api/progress the way the web player does.
+// The sender still knows the playhead, so poll it here and post it to history —
+// otherwise watching a whole film on the Chromecast leaves Continue Watching at 0.
+function castMediaSession() {
+  const s = castTvState.castSession;
+  if (!s) return null;
+  // CAF exposes getMediaSession(); the legacy v1 sender keeps a media[] array.
+  try {
+    if (typeof s.getMediaSession === 'function') return s.getMediaSession();
+    if (Array.isArray(s.media) && s.media.length) return s.media[0];
+  } catch (e) { /* SDK not ready */ }
+  return null;
+}
+
+// CAF playerState -> the vocabulary every target shares. IDLE is the interesting one:
+// it's the only truly unambiguous "finished" any target gives us, but only when the
+// SDK says the reason was FINISHED — IDLE/CANCELLED at 20% is someone giving up.
+function castPlaybackReport(m) {
+  const state = String(m.playerState || '').toUpperCase();
+  const idleReason = String(m.idleReason || '').toUpperCase();
+  let pos = null;
+  try {
+    pos = typeof m.getEstimatedTime === 'function' ? m.getEstimatedTime() : m.currentTime;
+  } catch (e) { return null; }
+  const dur = (m.media && m.media.duration) || 0;
+  const mapped = { PLAYING: 'playing', PAUSED: 'paused', BUFFERING: 'buffering', IDLE: 'idle' }[state];
+  if (!mapped) return null;
+  return {
+    kind: 'cast',
+    // Only this page can know which receiver it's talking to — the CAF SDK tells the
+    // sender, never the server — so the name rides along with the report.
+    device: castTvState.castDeviceName ? { name: castTvState.castDeviceName } : null,
+    state: mapped,
+    ended: mapped === 'idle' && idleReason === 'FINISHED',
+    positionSec: isFinite(pos) ? Math.floor(pos) : null,
+    durationSec: dur > 0 ? Math.floor(dur) : null,
+  };
+}
+
+// With a session, report through the bridge so the cast playhead gets the same `ended`
+// derivation and history write as every other target. Without one (a direct-magnet
+// play never creates a session), fall back to the standalone history endpoint.
+function reportCastProgress(report) {
+  if (!report) return;
+  if (wizard.sessionId) {
+    fetch(`/api/stream/${encodeURIComponent(wizard.sessionId)}/playback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report),
+    }).catch(() => { /* best-effort */ });
+    return;
+  }
+  // No session to hang a target off (a direct-magnet play never creates one), so this
+  // goes straight to history — the server applies the noise floor on that endpoint.
+  if (!(report.positionSec > 0) || !wizard.type || !wizard.tmdbId) return;
+  fetch('/api/history/progress', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: wizard.type,
+      tmdbId: Number(wizard.tmdbId),
+      season: wizard.type === 'tv' ? wizard.selectedSeason : undefined,
+      episode: wizard.type === 'tv' ? wizard.selectedEpisode : undefined,
+      positionSec: report.positionSec,
+      durationSec: report.durationSec,
+      item: buildWizardHistoryItem(),
+    }),
+  }).catch(() => { /* best-effort */ });
+}
+
+function startCastProgressUpdates() {
+  stopCastProgressUpdates();
+  castTvState.castProgressTimer = setInterval(() => {
+    const m = castMediaSession();
+    if (!m) return;
+    // Every state goes through, not just PLAYING. The target decides what a paused or
+    // idle TV means — dropping the non-playing states here is what used to throw away
+    // the finish signal.
+    reportCastProgress(castPlaybackReport(m));
+  }, 10000);
+}
+
+function stopCastProgressUpdates() {
+  if (castTvState.castProgressTimer) {
+    clearInterval(castTvState.castProgressTimer);
+    castTvState.castProgressTimer = null;
+  }
+}
+
 function handleCastSessionEnd() {
   castTvState.isCasting = false;
   castTvState.castSession = null;
@@ -3082,6 +3522,7 @@ function handleCastSessionEnd() {
   updateCastStatusIndicator();
   stopCastStatusUpdates();
   stopNativeCastStatusUpdates();
+  stopCastProgressUpdates();
 }
 
 function stopChromecastCast(event) {
@@ -3164,6 +3605,52 @@ function goBackFromWizard() {
 }
 
 // Entry point called by route()
+// Concurrent streams: a label from the file name in the TorrServer URL.
+function streamFileLabel(s) {
+  try {
+    const m = (s.vlcUrl || s.castUrl || '').match(/\/stream\/([^?]+)/);
+    if (m) return decodeURIComponent(m[1]).replace(/\.(mkv|mp4|avi|mov|m4v|webm|ts|m2ts)$/i, '');
+  } catch (e) {}
+  return 'Stream';
+}
+function renderActiveStreamsList(sessions) {
+  const running = (sessions || []).filter((s) => (s.running || !s.exited) && s.playerUrl);
+  if (running.length < 1) return '';
+  return `
+    <div class="active-streams">
+      <div class="active-streams-head">Active streams <span class="badge">${running.length}</span></div>
+      ${running.map((s) => `
+        <div class="active-stream-row">
+          <div class="as-dot"></div>
+          <div class="as-title" title="${escape(streamFileLabel(s))}">${escape(streamFileLabel(s))}</div>
+          <div class="as-actions">
+            <a class="btn btn-primary btn-sm" href="${escape(s.playerUrl)}" target="_blank" rel="noopener">Open</a>
+            <button class="btn btn-outline btn-sm" onclick="openCastForSession('${escape(s.id)}')">Cast</button>
+            <button class="btn btn-outline btn-sm" onclick="stopStreamSessionById('${escape(s.id)}', this)">Stop</button>
+          </div>
+        </div>`).join('')}
+    </div>`;
+}
+function injectActiveStreams(sessions) {
+  const html = renderActiveStreamsList(sessions);
+  const app = document.getElementById('app');
+  if (html && app) app.insertAdjacentHTML('afterbegin', html);
+}
+async function stopStreamSessionById(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+  try { await fetch('/api/stream/stop/' + encodeURIComponent(id), { method: 'DELETE' }); } catch (e) {}
+  refreshNavStreamIndicator();
+  route();
+}
+function openCastForSession(id) {
+  fetchJson('/api/stream/status').then((sessions) => {
+    const s = (sessions || []).find((x) => x.id === id);
+    if (s) { castTvState.meta = normalizeActiveStreamMeta(s); openCastTvModal(null, {}); }
+  }).catch(() => {});
+}
+window.stopStreamSessionById = stopStreamSessionById;
+window.openCastForSession = openCastForSession;
+
 async function renderStreamPage() {
   state.currentPage = 'stream';
   const params = getHashParams();
@@ -3172,6 +3659,8 @@ async function renderStreamPage() {
   const routeTitleText = params.get('title') || '';
   const routeSeason = params.get('s') ? Number(params.get('s')) : null;
   const routeEpisode = params.get('e') ? Number(params.get('e')) : null;
+  const routeAuto = params.get('auto') === '1'; // binge: auto-pick best torrent + stream
+  const routeSource = params.get('src') || null; // binge: prefer the source the user was already watching
   const restoredAny = loadAnyWizardState();
 
   let activeSessions = [];
@@ -3196,7 +3685,8 @@ async function renderStreamPage() {
     subtitleLangs: [], selectedLang: 'en',
     subtitles: [], selectedSubtitle: null, subtitleToken: null, subtitleTokenExpiresAt: null, skipSubtitles: false,
     sessionId: null, playerUrl: null, vlcUrl: null, castUrl: null, subtitleManifestUrl: null, videoFormat: null,
-    detail: null, historySaved: false,
+    detail: null, historySaved: false, autoStream: false, preferredSource: null,
+    pendingDlnaRecast: false,
     step: type === 'tv' ? 1 : 2,
   });
 
@@ -3249,6 +3739,16 @@ async function renderStreamPage() {
     wizard.step = 2;
   }
 
+  // auto=1 — binge ("Next Episode") and one-click Resume: skip the manual torrent and
+  // subtitle steps and start the best release straight away, preferring the source we
+  // were last watching. Movies get this too: they open at the torrent step (step 2),
+  // which is where autoStream is consumed, so resuming a film never shows the picker.
+  const autoTarget = type === 'movie' || (routeSeason && routeEpisode);
+  if (routeAuto && autoTarget && !runningSession) {
+    wizard.autoStream = true;
+    wizard.preferredSource = routeSource;
+  }
+
   if (runningSession) {
     wizard.sessionId = runningSession.id;
     wizard.playerUrl = runningSession.playerUrl || wizard.playerUrl || null;
@@ -3256,6 +3756,25 @@ async function renderStreamPage() {
     wizard.castUrl = runningSession.castUrl || wizard.castUrl || null;
     wizard.subtitleManifestUrl = runningSession.subtitleManifestUrl || wizard.subtitleManifestUrl || null;
     wizard.step = 4;
+    // Rebuild show context from the session itself when this device has no saved
+    // wizard state (e.g. a phone opening /#/stream fresh). Without this, type/season/
+    // episode stay unset and the "Next Episode" button never renders.
+    const media = runningSession.media;
+    if (media) {
+      if (media.type && (!wizard.type || wizard.type === 'movie')) wizard.type = media.type;
+      if (media.tmdbId && !wizard.tmdbId) wizard.tmdbId = Number(media.tmdbId);
+      if (media.season && !wizard.selectedSeason) wizard.selectedSeason = Number(media.season);
+      if (media.episode && !wizard.selectedEpisode) wizard.selectedEpisode = Number(media.episode);
+      if (media.title && (!wizard.titleText || wizard.titleText === 'Active Stream')) wizard.titleText = media.title;
+      // Pull season list so next-episode can roll over at a season finale.
+      if (wizard.type === 'tv' && wizard.tmdbId && !(wizard.seasons || []).length) {
+        try {
+          const detail = await api(`/api/detail/tv/${wizard.tmdbId}`);
+          wizard.detail = detail;
+          wizard.seasons = (detail.seasons || []).filter((s) => s.season_number > 0);
+        } catch (e) { /* non-fatal: next-episode still advances within the season */ }
+      }
+    }
     if (!wizard.titleText) {
       wizard.titleText = restored?.titleText || 'Active Stream';
     }
@@ -3263,12 +3782,14 @@ async function renderStreamPage() {
 
   if (!tmdbId && !restored && !runningSession) {
     renderEmptyStreamPage();
+    injectActiveStreams(activeSessions);
     clearWizardState();
     updateNavStreamIndicator(false);
     return;
   }
 
   renderWizardUI();
+  injectActiveStreams(activeSessions);
   persistWizardState();
 
   if (wizard.step === 4) {
@@ -3368,7 +3889,6 @@ function renderWizardUI() {
       : '';
     return `
       <div class="wizard-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}">
-        <div class="wizard-step-dot">${isDone ? 'OK' : s.n}</div>
         <span class="wizard-step-label">${s.label}</span>
       </div>${lineAfter}`;
   }).join('');
@@ -3384,6 +3904,7 @@ function renderWizardUI() {
         <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:.5rem">
           <button class="btn btn-outline btn-sm" onclick="goBackFromWizard()">Back</button>
           <span class="badge badge-episode" style="font-size:.8rem">${typeBadgeText}</span>
+          ${wizard.type === 'tv' && nextEpisodeTarget(wizard) ? `<button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="return goToNextEpisode(this)" title="Stop the current stream and play the next episode">Next Episode ⏭</button>` : ''}
         </div>
         <h1 class="wizard-title">${escape(wizard.titleText)}${epSuffix}</h1>
         <p class="wizard-subtitle">Follow the steps to search and stream</p>
@@ -3613,14 +4134,43 @@ async function wizardSearchTorrents() {
       throw new Error(msg);
     }
 
+    // Warm the front-runner while the search is still running and the user is still
+    // reading the list. Measured: ~10s of time-to-first-frame is metadata resolution +
+    // the first read, both swarm-bound — they can't be made faster, only started sooner.
+    // The top-ranked release is the one auto mode picks and the one users usually click,
+    // so it is nearly always the torrent we end up playing.
+    const prefetched = new Set();
+    const prefetchTopCandidate = () => {
+      const top = wizard.torrents[0];
+      if (!top) return;
+      const key = top.magnet || top.link || top.name;
+      // Ranking shifts as slower sources report in; cap the distinct warm-ups so a
+      // churning top spot can't fan out into a pile of adds.
+      if (!key || prefetched.has(key) || prefetched.size >= 3) return;
+      prefetched.add(key);
+      fetch('/api/torrents/prefetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ torrent: top, magnet: top.magnet || (String(top.link || '').startsWith('magnet:') ? top.link : null) }),
+      }).catch(() => { /* best-effort: a miss just means today's timing */ });
+    };
+
     const applyMessage = (msg) => {
       if (!msg) return;
       if (msg.error) throw new Error(msg.error);
       if (Array.isArray(msg.results)) {
         wizard.torrents = msg.results;
         renderTorrentSearchProgress(statusEl, listEl, msg.type === 'final');
+        prefetchTopCandidate();
       }
     };
+
+    // Binge mode: once the source we're continuing on has returned a match, we
+    // already have what we want — don't keep waiting on the slow sources (1337x
+    // mirrors, PirateBay/Nyaa timeouts) before starting the next episode.
+    const canAutoStartEarly = () =>
+      wizard.autoStream && wizard.preferredSource &&
+      wizard.torrents.some((t) => t && t.source === wizard.preferredSource);
 
     // The endpoint streams NDJSON (one ranked snapshot per line) so results show
     // up as each source returns instead of waiting for all of them.
@@ -3640,6 +4190,7 @@ async function wizardSearchTorrents() {
           if (!line) continue;
           try { applyMessage(JSON.parse(line)); } catch (_) { /* skip partial line */ }
         }
+        if (canAutoStartEarly()) { try { await reader.cancel(); } catch (_) {} break; }
       }
       const tail = buffer.trim();
       if (tail) {
@@ -3657,9 +4208,121 @@ async function wizardSearchTorrents() {
 
     renderTorrentSearchProgress(statusEl, listEl, true);
     persistWizardState();
+    // Binge mode (came here via "Next Episode"): don't make the user pick — auto-select
+    // the best-ranked torrent and start streaming straight away.
+    if (wizard.autoStream) { wizard.autoStream = false; autoStreamBest(); }
   } catch (e) {
     if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">Search failed: ${escape(e.message)}</span>`;
+    wizard.autoStream = false;
   }
+}
+
+// Auto-pick the best torrent (top-ranked) and stream it, skipping the manual torrent and
+// subtitle steps — used for one-click "Next Episode" binge-watching. Tries the top few in
+// case the first magnet won't resolve; if none work, drops the user on the manual picker.
+async function autoStreamBest() {
+  if (!wizard.torrents.length) return; // the "no torrents found" message is already shown
+  const statusEl = document.getElementById('torrentSearchStatus');
+  // If the previous episode was playing on a DLNA TV, remember to push the new
+  // episode there once it's ready — binge on the TV shouldn't need a manual re-cast.
+  if (castTvState.dlnaCasting && castTvState.dlnaDevice) wizard.pendingDlnaRecast = true;
+  // Binge continuity: if we were watching a specific source, try its releases first
+  // (best-ranked within that source), then fall back to the overall ranking if that
+  // source has nothing usable for this episode. Ranking within each group is preserved.
+  let ranked = wizard.torrents;
+  if (wizard.preferredSource) {
+    const same = wizard.torrents.filter((t) => t && t.source === wizard.preferredSource);
+    if (same.length) {
+      const rest = wizard.torrents.filter((t) => !t || t.source !== wizard.preferredSource);
+      ranked = [...same, ...rest];
+    }
+  }
+  const pool = ranked.slice(0, 3);
+  for (let i = 0; i < pool.length; i += 1) {
+    if (statusEl) statusEl.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Auto-starting best torrent…`;
+    wizard.selectedTorrent = { ...pool[i], _idx: i };
+    try {
+      const data = await fetch('/api/torrents/magnet', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ torrent: wizard.selectedTorrent }),
+      }).then((r) => r.json());
+      if (!data.magnet) throw new Error(data.error || 'no magnet');
+      wizard.resolvedMagnet = data.magnet;
+      wizard.subtitleToken = null;
+      wizard.skipSubtitles = true; // embedded subs still appear via the player's manifest poll
+      wizard.step = 4;
+      persistWizardState();
+      renderWizardUI();
+      await wizardStartStream();
+      return;
+    } catch (e) { /* try the next-ranked torrent */ }
+  }
+  if (statusEl) statusEl.innerHTML = '<span style="color:var(--yellow)">Couldn\'t auto-start — pick a torrent below.</span>';
+}
+
+// Next episode within the season, rolling over to the next season's E1 at the finale.
+// nextEpisodeTarget(wizard) now lives in public/js/next-episode.js (loaded before this file),
+// so it can be unit-tested by a plain require instead of source-slicing. It reads no globals —
+// pass wizard in.
+
+// One-click binge: stop the current stream and jump straight into the next episode.
+async function goToNextEpisode(btn) {
+  const t = nextEpisodeTarget(wizard);
+  if (!t) { toast("You're on the last available episode", 'info'); return false; }
+  const type = wizard.type;
+  const tmdbId = wizard.tmdbId;
+  const titleText = wizard.titleText;
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading next…'; }
+  // Carry the source of the release we're currently watching so the next episode
+  // auto-picks from the same one (e.g. stay on SubsPlease) instead of re-ranking blind.
+  const curSource = wizard.selectedTorrent && wizard.selectedTorrent.source ? wizard.selectedTorrent.source : '';
+  const srcParam = curSource ? `&src=${encodeURIComponent(curSource)}` : '';
+  await wizardStopStream();
+  navigate(`/stream?type=${type}&id=${tmdbId}&title=${encodeURIComponent(titleText)}&s=${t.s}&e=${t.e}&auto=1${srcParam}`);
+  return false;
+}
+window.goToNextEpisode = goToNextEpisode;
+
+// --- auto next-episode ---------------------------------------------------------
+// When the player reports playback ended (via its playhead pings → /api/stream/status),
+// offer a cancellable 10s countdown, then reuse the one-click binge path above.
+let autoNextTimer = null;
+let autoNextDismissedFor = null; // session id whose countdown the user cancelled
+
+function cancelAutoNext(sessionId) {
+  if (autoNextTimer) { clearInterval(autoNextTimer); autoNextTimer = null; }
+  const el = document.getElementById('autoNextOverlay');
+  if (el) el.remove();
+  if (sessionId) autoNextDismissedFor = sessionId;
+}
+window.cancelAutoNext = cancelAutoNext;
+
+function maybeAutoAdvance(ours) {
+  if (!ours || !ours.playback || !ours.playback.ended) return;
+  if (autoNextTimer || autoNextDismissedFor === ours.id) return;
+  if (wizard.type !== 'tv') return;
+  const t = nextEpisodeTarget(wizard);
+  if (!t) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'autoNextOverlay';
+  overlay.className = 'auto-next-overlay';
+  overlay.innerHTML = `
+    <div class="auto-next-text">Up next: <strong>S${t.s}E${t.e}</strong> — starting in <span id="autoNextSecs">10</span>s</div>
+    <div class="auto-next-actions">
+      <button class="btn btn-primary btn-sm" onclick="cancelAutoNext(null); goToNextEpisode(null); return false;">Play now</button>
+      <button class="btn btn-sm" onclick="cancelAutoNext('${escape(ours.id)}'); return false;">Cancel</button>
+    </div>`;
+  document.body.appendChild(overlay);
+  let remaining = 10;
+  autoNextTimer = setInterval(() => {
+    remaining -= 1;
+    const secsEl = document.getElementById('autoNextSecs');
+    if (secsEl) secsEl.textContent = String(remaining);
+    if (remaining <= 0) {
+      cancelAutoNext(null);
+      goToNextEpisode(null);
+    }
+  }, 1000);
 }
 
 function torrentKey(t) {
@@ -3669,11 +4332,14 @@ function torrentKey(t) {
 function renderTorrentItems() {
   const selectedKey = wizard.selectedTorrent ? torrentKey(wizard.selectedTorrent) : '';
   return wizard.torrents.map((t, i) => {
-    const src = (t.source || '').toLowerCase().replace(/[^a-z]/g, '');
+    // Keep digits: stripping them turned "1337x" into "x" and dropped it into
+    // the generic grey badge.
+    const src = (t.source || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     const srcClass = src.includes('1337') ? 'source-1337x'
       : src.includes('yts') ? 'source-yts'
       : src.includes('pirate') ? 'source-piratebay'
       : src.includes('nyaa') ? 'source-nyaa'
+      : src.includes('subsplease') ? 'source-subsplease'
       : 'source-other';
     const seeds = parseInt(t.seeders) || 0;
     const leech = parseInt(t.leechers) || 0;
@@ -3683,8 +4349,8 @@ function renderTorrentItems() {
     const isSelected = selectedKey !== '' && torrentKey(t) === selectedKey;
     return `
       <div class="torrent-item ${isSelected ? 'selected' : ''}" onclick="wizardSelectTorrent(${i})">
-        <div class="torrent-radio"></div>
         <span class="torrent-source ${srcClass}">${escape(t.source || '?')}</span>
+        ${t.quality ? `<span class="torrent-quality">${escape(t.quality)}</span>` : ''}
         <span class="torrent-name" title="${escape(t.name)}">${escape(t.name)}</span>
         <div class="torrent-meta">
           ${hasPeers ? `<span class="torrent-seeds">Seeds ${seeds}</span>
@@ -3888,6 +4554,18 @@ function renderWizardStep4(panel) {
         </div>
       </div>
 
+      <!-- Live byte-supply monitor (hidden until the first stream_health event) -->
+      <div id="streamHealthPanel" class="health-panel" style="display:none">
+        <div class="health-panel-head">
+          <span class="health-panel-title">Stream Health</span>
+          <span id="healthEngine" class="health-engine"></span>
+        </div>
+        <div class="health-grid" id="healthGrid"></div>
+        <svg id="healthSpark" class="health-spark" preserveAspectRatio="none" viewBox="0 0 240 34" aria-hidden="true"></svg>
+        <!-- Who is consuming those bytes (hidden until something reports) -->
+        <div id="targetsRow" class="targets-row" style="display:none"></div>
+      </div>
+
       <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.4rem">
         Torrent: <span style="color:var(--text)">${escape((torrentName || '').slice(0, 80))}</span>
         ${wizard.subtitleToken ? `<span style="color:var(--green);margin-left:.5rem">Subtitle loaded</span>` : ''}
@@ -3903,6 +4581,12 @@ function renderWizardStep4(panel) {
         </div>
       </div>
     </div>`;
+
+  // The markup above is fresh DOM, so the panel starts hidden. If a stream is already
+  // running we have its last tick in hand — paint it now rather than leaving a gap
+  // until the next one arrives a second later.
+  if (wizard.health) renderStreamHealth(wizard.health);
+  if (wizard.targets && wizard.targets.length) renderStreamTargets(wizard.targets);
 }
 
 function updateStreamReadyActions(url) {
@@ -3966,6 +4650,13 @@ async function wizardStartStream() {
         history: {
           type: wizard.type,
           item: buildWizardHistoryItem(),
+        },
+        // Remembered against the history entry so Continue Watching can resume from
+        // this same release source without re-asking.
+        playback: {
+          source: (wizard.selectedTorrent && wizard.selectedTorrent.source) || null,
+          season: wizard.selectedSeason,
+          episode: wizard.selectedEpisode,
         },
       }),
     });
@@ -4033,8 +4724,12 @@ function startStreamStatusPolling() {
         updateNavStreamIndicator(true, ours.playerUrl);
         saveWizardHistoryIfNeeded();
         persistWizardState();
+        // Binge on a DLNA TV: now that the next episode's stream is live, push it
+        // to the same TV automatically so it keeps playing there.
+        if (wizard.pendingDlnaRecast) { wizard.pendingDlnaRecast = false; recastDlnaForCurrentSession(); }
       } else if (ours) {
         applyActiveStreamMeta(ours);
+        maybeAutoAdvance(ours);
       }
     } catch (e) { /* ignore */ }
   }, 3000);
@@ -4065,8 +4760,256 @@ function clearWaitingTimer() {
   }
 }
 
+// -- Stream health monitor ----------------------------------------------------
+// Renders the `stream_health` SSE payload built by core/stream-health.js. Every number
+// here is one the server already computes; nothing is re-derived client-side, so the
+// panel and the server agree by construction.
+
+const HEALTH_SPARK_SAMPLES = 60; // ~1 minute at the server's 1s tick
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  const v = n / Math.pow(1024, i);
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function fmtBps(n) {
+  if (!Number.isFinite(n) || n <= 0) return '0 B/s';
+  return `${fmtBytes(n)}/s`;
+}
+
+function fmtSecs(s) {
+  if (!Number.isFinite(s) || s < 0) return '—';
+  if (s < 60) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s % 60);
+  return rem ? `${m}m ${rem}s` : `${m}m`;
+}
+
+// Turn a target key ('web' | 'vlc' | 'dlna:<deviceId>' | 'cast') into something a human
+// recognises, preferring the device's own name once the roster has told us one.
+function playheadLabel(key) {
+  if (!key) return 'unknown';
+  const match = (wizard.targets || []).find((t) => t.key === key);
+  if (match && match.device && match.device.name) return match.device.name;
+  const kind = String(key).split(':')[0];
+  return (TARGET_KINDS[kind] && TARGET_KINDS[kind].label) || kind;
+}
+
+function healthTile(label, value, sub, tone) {
+  return `
+    <div class="health-tile${tone ? ` ${tone}` : ''}">
+      <div class="health-tile-label">${escape(label)}</div>
+      <div class="health-tile-value">${value}</div>
+      <div class="health-tile-sub">${sub ? escape(sub) : '&nbsp;'}</div>
+    </div>`;
+}
+
+function renderStreamHealth(health) {
+  const panel = document.getElementById('streamHealthPanel');
+  const grid = document.getElementById('healthGrid');
+  if (!panel || !grid || !health) return;
+  panel.style.display = '';
+
+  const engine = document.getElementById('healthEngine');
+  if (engine) {
+    const label = health.engineStateText || 'Working';
+    engine.textContent = label;
+    // Green only for TorrServer's actual working state (3); anything else is neutral —
+    // guessing a colour for a state we don't recognise would be worse than no colour.
+    engine.style.color = health.engineState === 3 ? 'var(--green)' : 'var(--text-dim)';
+  }
+
+  const buf = health.buffer;
+  // Seeds are what actually feed you; 0 means the stream is about to stall regardless
+  // of how many peers are connected.
+  const seedTone = health.seeds > 0 ? (health.seeds >= 5 ? 'good' : 'warn') : 'bad';
+  const bufTone = !buf ? '' : (buf.aheadSec >= 30 ? 'good' : buf.aheadSec >= 10 ? 'warn' : 'bad');
+  const waste = health.wasteRatio;
+  const wasteTone = waste == null ? '' : (waste > 0.15 ? 'bad' : waste > 0.05 ? 'warn' : 'good');
+
+  grid.innerHTML = [
+    healthTile('Download', fmtBps(health.downloadSpeedBps),
+      `${fmtBytes(health.downloadedBytes)} cached`,
+      health.downloadSpeedBps > 0 ? '' : 'bad'),
+    healthTile('Upload', fmtBps(health.uploadSpeedBps), null, ''),
+    healthTile('Seeds', String(health.seeds ?? 0),
+      `${health.swarmPeers ?? 0} known`, seedTone),
+    healthTile('Peers', String(health.peers ?? 0),
+      `${health.pendingPeers ?? 0} pending`, ''),
+    // The buffer is an estimate and the server says so — the tile says so too rather
+    // than presenting a guess as a measurement.
+    // `playheadFrom` is last-writer-wins across targets (see core/stream-health.js), so
+    // naming the reporter isn't decoration — with two players running it's the only way
+    // to know which one this number is about.
+    healthTile('Buffer ahead',
+      buf ? `${escape(fmtSecs(buf.aheadSec))}<span class="health-est">est</span>` : '—',
+      buf ? `${fmtBytes(buf.aheadBytes)} · from ${playheadLabel(buf.playheadFrom)}` : 'waiting for playhead',
+      bufTone),
+    healthTile('Waste', waste == null ? '—' : `${(waste * 100).toFixed(1)}%`,
+      waste == null ? 'not reported' : 'of chunks read', wasteTone),
+    healthTile('Torrent', fmtBytes(health.torrentSizeBytes),
+      `${fmtBytes(health.loadedBytes)} loaded`, ''),
+  ].join('');
+
+  drawHealthSpark();
+}
+
+// Sampling is separate from drawing: re-entering step 4 repaints the panel from the
+// last payload, and a repaint must not push a duplicate sample onto the history.
+function pushHealthSample(speedBps) {
+  wizard.healthSpeeds.push(Number.isFinite(speedBps) ? Math.max(0, speedBps) : 0);
+  if (wizard.healthSpeeds.length > HEALTH_SPARK_SAMPLES) wizard.healthSpeeds.shift();
+}
+
+// Download speed over the last minute. A flat line at zero reads as "stalled" far
+// faster than a speed tile that just says 0 B/s.
+function drawHealthSpark() {
+  const svg = document.getElementById('healthSpark');
+  if (!svg) return;
+
+  const speeds = wizard.healthSpeeds;
+  if (speeds.length < 2) { svg.innerHTML = ''; return; }
+
+  const W = 240;
+  const H = 34;
+  // Scale to the window's own peak, not an absolute ceiling: this shows the shape of
+  // the last minute, which is the question ("is it holding up?"), not the magnitude —
+  // the Download tile already answers that.
+  const peak = Math.max(...speeds, 1);
+  const step = W / (HEALTH_SPARK_SAMPLES - 1);
+  const pts = speeds.map((s, i) => {
+    const x = i * step;
+    const y = H - (s / peak) * (H - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+
+  const area = `0,${H} ${pts.join(' ')} ${((speeds.length - 1) * step).toFixed(1)},${H}`;
+  svg.innerHTML = `
+    <defs>
+      <linearGradient id="healthSparkFill" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.35"/>
+        <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <polygon points="${area}" fill="url(#healthSparkFill)"/>
+    <polyline points="${pts.join(' ')}" fill="none" stroke="var(--accent-2)"
+      stroke-width="1.5" vector-effect="non-scaling-stroke"
+      stroke-linejoin="round" stroke-linecap="round"/>`;
+}
+
+function resetStreamHealth() {
+  wizard.health = null;
+  wizard.healthSpeeds = [];
+  wizard.targets = [];
+  const panel = document.getElementById('streamHealthPanel');
+  if (panel) panel.style.display = 'none';
+  const row = document.getElementById('targetsRow');
+  if (row) { row.style.display = 'none'; row.innerHTML = ''; }
+}
+
+// -- Playback targets ---------------------------------------------------------
+// The roster from the `targets` SSE event: every player this stream has fed, and what
+// each is doing. The health tiles above are the byte SUPPLY; this is the demand side —
+// the two are separate events for that reason and are only neighbours on screen.
+
+// Labels name the CONNECTION, not the box — 'DLNA' rather than 'TV', because the device
+// name already says which box and the question this row answers is how it's being fed.
+const TARGET_KINDS = {
+  web: { label: 'Web Player', icon: '🖥' },
+  vlc: { label: 'VLC', icon: '🎬' },
+  dlna: { label: 'DLNA', icon: '📺' },
+  cast: { label: 'Chromecast', icon: '📡' },
+};
+
+const TARGET_STATES = {
+  playing: { text: 'playing', tone: 'good' },
+  paused: { text: 'paused', tone: 'warn' },
+  buffering: { text: 'buffering', tone: 'warn' },
+  stopped: { text: 'stopped', tone: 'dim' },
+  idle: { text: 'idle', tone: 'dim' },
+};
+
+function fmtClock(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return null;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+// What to call this target. The device name is the useful thing when we have it — "the
+// TV" is useless with two TVs — with the kind kept as a qualifier so a name like
+// "Living Room" still says HOW it's playing.
+function targetTitle(t) {
+  const kind = TARGET_KINDS[t.kind] || { label: t.kind || 'Player', icon: '•' };
+  const name = t.device && t.device.name;
+  if (!name) return kind.label;
+  // "Bedroom Chromecast · Chromecast" — when the device is already named after the
+  // connection, the qualifier is noise.
+  if (name.toLowerCase().includes(kind.label.toLowerCase())) return name;
+  return `${name} · ${kind.label}`;
+}
+
+function targetDetail(t) {
+  const bits = [];
+  if (t.gone) {
+    // Terminal. Say so plainly and don't dress it up with a stale playhead.
+    bits.push('disconnected');
+  } else {
+    const st = TARGET_STATES[t.state] || { text: t.state || 'unknown' };
+    bits.push(st.text);
+    const pos = fmtClock(t.positionSec);
+    if (pos) bits.push(t.durationSec ? `${pos} / ${fmtClock(t.durationSec)}` : pos);
+    if (t.ended) bits.push('finished');
+  }
+  // The address is the tiebreaker when two identical TVs report the same friendly name.
+  if (t.device && t.device.address) bits.push(t.device.address);
+  return bits.join(' · ');
+}
+
+function renderStreamTargets(targets) {
+  const row = document.getElementById('targetsRow');
+  if (!row) return;
+  const list = Array.isArray(targets) ? targets : [];
+  if (!list.length) { row.style.display = 'none'; row.innerHTML = ''; return; }
+
+  // A stream can legitimately feed several players at once, so this is a list and not a
+  // single "now playing on X". Live ones first — a dead target shouldn't push the
+  // thing you're actually watching down the list.
+  const rank = (t) => (t.gone ? 2 : t.state === 'playing' ? 0 : 1);
+  const sorted = list.slice().sort((a, b) => rank(a) - rank(b));
+
+  // Targets can land before the first health tick, and a roster with nowhere to draw
+  // itself would just vanish — the panel's visibility belongs to whichever plane has
+  // something to say first.
+  const panel = document.getElementById('streamHealthPanel');
+  if (panel) panel.style.display = '';
+
+  row.style.display = '';
+  row.innerHTML = sorted.map((t) => {
+    const kind = TARGET_KINDS[t.kind] || { label: t.kind || 'Player', icon: '•' };
+    const st = TARGET_STATES[t.state] || { tone: 'dim' };
+    const tone = t.gone ? 'gone' : (st.tone || 'dim');
+    return `
+      <div class="target-chip ${tone}" title="${escape(t.key || '')}">
+        <span class="target-icon">${kind.icon}</span>
+        <span class="target-text">
+          <span class="target-title">${escape(targetTitle(t))}</span>
+          <span class="target-detail">${escape(targetDetail(t))}</span>
+        </span>
+      </div>`;
+  }).join('');
+}
+
 function connectStreamSSE(sessionId) {
   if (wizard.sseSource) { wizard.sseSource.close(); wizard.sseSource = null; }
+  // The server replays its event buffer on connect, so the health ticks arrive again
+  // from the top — start from empty or the sparkline would show each sample twice.
+  resetStreamHealth();
   wizard.sseSource = new EventSource(`/api/stream/output/${sessionId}`);
     wizard.sseSource.addEventListener('line', (e) => {
       const { text } = JSON.parse(e.data);
@@ -4082,6 +5025,35 @@ function connectStreamSSE(sessionId) {
       if (bar) bar.style.width = `${Math.min(percent, 100)}%`;
       if (label) label.textContent = `${percent.toFixed(1)}% downloaded`;
       if (speedEl) speedEl.textContent = speed;
+    });
+    // The rich byte-supply numbers. `progress` above stays the download bar; this is
+    // everything the bar can't say — seeds vs peers, buffer ahead, wasted chunks.
+    wizard.sseSource.addEventListener('stream_health', (e) => {
+      try {
+        wizard.health = JSON.parse(e.data);
+        pushHealthSample(wizard.health.downloadSpeedBps);
+        renderStreamHealth(wizard.health);
+      } catch (err) { /* a malformed tick shouldn't kill the stream view */ }
+    });
+    // The roster: who is playing this stream and what each is doing. Distinct from
+    // `playback` below, which is one report from one target and drives auto-next.
+    wizard.sseSource.addEventListener('targets', (e) => {
+      try {
+        wizard.targets = JSON.parse(e.data);
+        renderStreamTargets(wizard.targets);
+      } catch (err) { /* a malformed roster shouldn't kill the stream view */ }
+    });
+    // Playback events from whichever target is actually playing — the web player, VLC,
+    // a TV. Auto-next used to wait on the 3s status poll and only ever heard from the
+    // web player; now the finish arrives here whatever you watched on.
+    wizard.sseSource.addEventListener('playback', (e) => {
+      const playback = JSON.parse(e.data);
+      maybeAutoAdvance({ id: sessionId, playback });
+    });
+    wizard.sseSource.addEventListener('playback_error', (e) => {
+      const err = JSON.parse(e.data);
+      if (!err || err.fatal === false) return; // e.g. VLC playing fine, just untrackable
+      toast(err.message || 'Playback failed', 'error');
     });
     wizard.sseSource.addEventListener('player_ready', (e) => {
       const payload = JSON.parse(e.data);
@@ -4102,6 +5074,9 @@ function connectStreamSSE(sessionId) {
     wizard.sseSource.addEventListener('exit', (e) => {
       const { code } = JSON.parse(e.data);
       clearWaitingTimer();
+      // The panel is a live reading. Once the engine is gone the last tick is stale, and
+      // stale seed counts sitting on screen read as current ones.
+      resetStreamHealth();
       appendTerminalLine(`[Process exited with code ${code}]`, code === 0 ? 'success' : 'error');
       updateNavStreamIndicator(false);
       clearPlayerBanner();
@@ -4506,6 +5481,11 @@ window.closeCastTvModal = closeCastTvModal;
 window.testTvReadiness = testTvReadiness;
 window.setCastVolume = setCastVolume;
 window.toggleCastMute = toggleCastMute;
+window.discoverDlnaDevices = discoverDlnaDevices;
+window.castToDlnaDevice = castToDlnaDevice;
+window.stopDlnaCast = stopDlnaCast;
+window.pauseDlnaCast = pauseDlnaCast;
+window.resumeDlnaCast = resumeDlnaCast;
 window.execSearch = execSearch;
 window.setSearchType = setSearchType;
 window.applyFilters = applyFilters;
@@ -4533,8 +5513,82 @@ window.wizardGoStep = wizardGoStep;
 window.startWaitingTimer = startWaitingTimer;
 window.connectStreamSSE = connectStreamSSE;
 
+// --- Settings (API keys, entered in-app instead of a .env file) ---------------
+async function openSettingsModal() {
+  let data;
+  try { data = await (await fetch('/api/config')).json(); } catch (e) { data = { fields: [], status: {} }; }
+  const fields = data.fields || [];
+  const status = data.status || {};
+  const content = document.getElementById('settingsContent');
+  if (!content) return;
+  content.innerHTML = `
+    <h2 style="margin:0 0 .25rem">Settings</h2>
+    <p style="color:var(--text-muted);margin:0 0 1rem;font-size:.9rem">Enter the API keys Uplayer needs. They're saved on this device — no .env file required. Leave a field blank to keep its saved value.</p>
+    <div id="settingsFields" style="display:flex;flex-direction:column;gap:.9rem">
+      ${fields.map((f) => `
+        <label style="display:flex;flex-direction:column;gap:.3rem">
+          <span style="font-weight:600;font-size:.85rem">${escape(f.label)}${f.required ? ' <span style="color:var(--green)">*</span>' : ''}${status[f.key] ? ' <span style="color:var(--green);font-weight:400">— saved ✓</span>' : ''}</span>
+          <input type="${f.secret ? 'password' : 'text'}" data-key="${escape(f.key)}" autocomplete="off"
+            placeholder="${status[f.key] ? '•••••••• (leave blank to keep)' : (f.required ? 'Required' : 'Optional')}"
+            style="padding:.6rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
+          ${f.help ? `<span style="color:var(--text-muted);font-size:.78rem">${escape(f.help)}</span>` : ''}
+        </label>`).join('')}
+    </div>
+    <h3 style="margin:1.3rem 0 .25rem;font-size:1rem">Playback preferences</h3>
+    <label style="display:flex;flex-direction:column;gap:.3rem">
+      <span style="font-weight:600;font-size:.85rem">Preferred quality</span>
+      <select id="settingsQuality" style="padding:.6rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
+        ${['2160p', '1080p', '720p', 'SD'].map((q) => `<option value="${q}" ${(data.preferredQuality || '1080p') === q ? 'selected' : ''}>${q}</option>`).join('')}
+      </select>
+      <span style="color:var(--text-muted);font-size:.78rem">Shows only releases at this quality. If a title has none, all qualities are shown instead.</span>
+    </label>
+    <div style="display:flex;gap:.6rem;justify-content:flex-end;margin-top:1.2rem">
+      <button class="btn btn-outline" onclick="closeSettingsModal()">Close</button>
+      <button class="btn btn-primary" onclick="saveSettings(this)">Save</button>
+    </div>
+    <div id="settingsMsg" style="margin-top:.6rem;font-size:.85rem"></div>`;
+  const ov = document.getElementById('settingsOverlay');
+  if (ov) { ov.setAttribute('aria-hidden', 'false'); ov.classList.add('open'); }
+}
+
+function closeSettingsModal() {
+  const ov = document.getElementById('settingsOverlay');
+  if (ov) { ov.classList.remove('open'); ov.setAttribute('aria-hidden', 'true'); }
+}
+
+async function saveSettings(btn) {
+  const body = {};
+  document.querySelectorAll('#settingsFields input[data-key]').forEach((inp) => {
+    const v = inp.value.trim(); if (v) body[inp.getAttribute('data-key')] = v;
+  });
+  const quality = document.getElementById('settingsQuality');
+  if (quality) body.PREFERRED_QUALITY = quality.value;
+  const msg = document.getElementById('settingsMsg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Save failed');
+    if (msg) { msg.style.color = 'var(--green)'; msg.textContent = 'Saved. Reloading…'; }
+    setTimeout(() => location.reload(), 600);
+  } catch (e) {
+    if (msg) { msg.style.color = '#f66'; msg.textContent = 'Error: ' + (e.message || e); }
+    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+  }
+}
+window.openSettingsModal = openSettingsModal;
+window.closeSettingsModal = closeSettingsModal;
+window.saveSettings = saveSettings;
+document.getElementById('settingsOverlay')?.addEventListener('click', (e) => { if (e.target === e.currentTarget) closeSettingsModal(); });
+
 // --- Init ---------------------------------------------------------------------
 async function init() {
+  // If a required API key (TMDB) is missing, prompt for it up front — no .env needed.
+  try {
+    const cfg = await (await fetch('/api/config')).json();
+    if (cfg && cfg.needsSetup) openSettingsModal();
+  } catch (e) { /* ignore */ }
+
   try {
     // Load genres once
     const genres = await api('/api/genres');
@@ -4546,6 +5600,19 @@ async function init() {
   ensureWatchlistLoaded().catch((e) => {
     console.warn('Failed to warm watchlist cache', e);
   });
+
+  // Discover DLNA TVs in the BACKGROUND (and keep refreshing) so they're already listed
+  // the instant you open the Cast popup — no waiting for a scan on click. Scan on load,
+  // then a couple of quick early retries (so a TV that's on is found within a few seconds
+  // even if the first SSDP round races app startup), then settle to a periodic refresh.
+  discoverDlnaDevices();
+  let dlnaEarly = 0;
+  const dlnaEarlyTimer = setInterval(() => {
+    if (castTvState.dlnaCasting) return;
+    discoverDlnaDevices();
+    if (++dlnaEarly >= 3 || (castTvState.dlnaDevices || []).length) clearInterval(dlnaEarlyTimer);
+  }, 6000);
+  setInterval(() => { if (!castTvState.dlnaCasting) discoverDlnaDevices(); }, 45000);
 
   // Start routing
   window.addEventListener('hashchange', route);

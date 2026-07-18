@@ -1,9 +1,26 @@
 node_modules/
+
+# Run logs are never committed. Write them to a logs/ dir next to whatever produced them
+# (bench/logs/, scripts/data/logs/) rather than scattering them through the source tree —
+# both patterns below are already covered by *.log, this is the placement convention.
 *.log
+logs/
 .DS_Store
 .env
 *.torrent
 dist/
+
+# Engine benchmark (Phase 2 spike) — keep the harness + results, ignore the
+# large prebuilt binary, torrent caches, and logs (all regenerable).
+bench/*.exe
+bench/ts-data/
+bench/wt-cache/
+bench/ts.log
+
+# Root-level vendored prebuilt binaries (TorrServer, alass, whisper + models) — large,
+# regenerable via scripts/setup-torrserver.js and scripts/setup-subtitle-tools.js.
+# Leading slash so this does NOT match public/vendor/ (committed player libs: Video.js, JASSUB).
+/vendor/
 
 # Temporary streaming files
 .temp/

@@ -5,10 +5,30 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { loadEnvFileOnce } = require('./core/config');
+const { loadEnvFileOnce, setConfigValues, getConfigStatus, getRuntimeConfig, getEnv } = require('./core/config');
 const { createSharedServices } = require('./core/shared-services');
 const { StreamLifecycleState } = require('./core/stream-lifecycle');
-const { buildAccessibleUrls } = require('./core/network-address');
+const { PlaybackTarget, MIN_POSITION_SEC } = require('./core/playback-target');
+const { buildAccessibleUrls, getLocalIPv4Address } = require('./core/network-address');
+const { createSessionRegistry } = require('./core/session-registry');
+const dlna = require('./core/dlna-caster');
+
+// Resilient global error handling — a streaming server must survive client
+// disconnects and transient stream errors instead of crashing the whole app.
+// (Node crashes on an unhandled rejection unless a handler is present.)
+function isBenignStreamError(e) {
+  const c = e && e.code;
+  return c === 'EPIPE' || c === 'ECONNRESET' || c === 'ERR_STREAM_DESTROYED'
+    || c === 'ERR_STREAM_PREMATURE_CLOSE' || c === 'ECONNABORTED';
+}
+process.on('unhandledRejection', (reason) => {
+  if (isBenignStreamError(reason)) return;
+  console.error('[uplayer] unhandledRejection (kept alive):', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  if (isBenignStreamError(err)) return;
+  console.error('[uplayer] uncaughtException (kept alive):', err && err.stack ? err.stack : err);
+});
 
 loadEnvFileOnce();
 
@@ -36,7 +56,15 @@ function getServices() {
   return services;
 }
 
-const PORT = getServices().runtime.config.port || 3000;
+// Deliberately a function, not a const. As a const this ran getServices() at module load,
+// which does require('./uplayer.js') — so merely importing server.js dragged in the whole CLI
+// and resolved the server<->uplayer cycle at import time, defeating the point of getServices()
+// being lazy at all. Nothing else here needs the port before startServer() is called.
+// tests/module-graph.test.js pins this: it asserts uplayer.js is absent from require.cache
+// after requiring server.js.
+function getPort() {
+  return getServices().runtime.config.port || 3000;
+}
 const VLC_DOWNLOAD_URL = 'https://www.videolan.org/vlc/';
 
 app.use(express.json());
@@ -64,418 +92,28 @@ async function tmdb(endpoint, params = {}) {
 
 // --- API Routes ---------------------------------------------------------------
 
-// Trending ? type: all | movie | tv, window: day | week
-app.get('/api/trending', async (req, res) => {
-  try {
-    const type = ['all', 'movie', 'tv'].includes(req.query.type) ? req.query.type : 'all';
-    const win = req.query.window === 'day' ? 'day' : 'week';
-    const data = await tmdb(`/trending/${type}/${win}`);
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Search ? q, type: multi | movie | tv, page
-app.get('/api/search', async (req, res) => {
-  try {
-    const q = req.query.q || '';
-    const type = ['movie', 'tv'].includes(req.query.type) ? req.query.type : 'multi';
-    const page = parseInt(req.query.page) || 1;
-    if (!q.trim()) return res.json({ results: [], total_pages: 0, total_results: 0 });
-    const data = await tmdb(`/search/${type}`, { query: q, page });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Detail ? type: movie | tv, id
-app.get('/api/detail/:type/:id', async (req, res) => {
-  try {
-    const { type, id } = req.params;
-    if (!['movie', 'tv'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
-    const data = await tmdb(`/${type}/${id}`, {
-      append_to_response: 'credits,videos,external_ids',
-    });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Recommendations for a specific item
-app.get('/api/:type/:id/recommendations', async (req, res) => {
-  try {
-    const { type, id } = req.params;
-    if (!['movie', 'tv'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
-    const data = await tmdb(`/${type}/${id}/recommendations`, { page: req.query.page || 1 });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Similar items
-app.get('/api/:type/:id/similar', async (req, res) => {
-  try {
-    const { type, id } = req.params;
-    if (!['movie', 'tv'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
-    const data = await tmdb(`/${type}/${id}/similar`, { page: req.query.page || 1 });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Discover with filters
-app.get('/api/discover', async (req, res) => {
-  try {
-    const type = req.query.type === 'tv' ? 'tv' : 'movie';
-    const params = {
-      page: parseInt(req.query.page) || 1,
-      sort_by: req.query.sort || 'popularity.desc',
-    };
-    if (req.query.genre) params.with_genres = req.query.genre;
-    if (req.query.year) {
-      if (type === 'movie') params.primary_release_year = req.query.year;
-      else params.first_air_date_year = req.query.year;
-    }
-    if (req.query.minRating) params['vote_average.gte'] = req.query.minRating;
-    if (req.query.maxRating) params['vote_average.lte'] = req.query.maxRating;
-    if (req.query.yearFrom) {
-      if (type === 'movie') params['primary_release_date.gte'] = `${req.query.yearFrom}-01-01`;
-      else params['first_air_date.gte'] = `${req.query.yearFrom}-01-01`;
-    }
-    if (req.query.yearTo) {
-      if (type === 'movie') params['primary_release_date.lte'] = `${req.query.yearTo}-12-31`;
-      else params['first_air_date.lte'] = `${req.query.yearTo}-12-31`;
-    }
-    const data = await tmdb(`/discover/${type}`, params);
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Genres
-app.get('/api/genres', async (req, res) => {
-  try {
-    const [movies, tv] = await Promise.all([
-      tmdb('/genre/movie/list'),
-      tmdb('/genre/tv/list'),
-    ]);
-    res.json({ movie: movies.genres, tv: tv.genres });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// TV Season episodes
-app.get('/api/tv/:id/season/:n', async (req, res) => {
-  try {
-    const data = await tmdb(`/tv/${req.params.id}/season/${req.params.n}`);
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Popular people
-app.get('/api/popular', async (req, res) => {
-  try {
-    const type = req.query.type === 'tv' ? 'tv' : 'movie';
-    const data = await tmdb(`/${type}/popular`, { page: req.query.page || 1 });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Top Rated
-app.get('/api/top-rated', async (req, res) => {
-  try {
-    const type = req.query.type === 'tv' ? 'tv' : 'movie';
-    const data = await tmdb(`/${type}/top_rated`, { page: req.query.page || 1 });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Now Playing / On The Air
-app.get('/api/now-playing', async (req, res) => {
-  try {
-    const type = req.query.type === 'tv' ? 'tv' : 'movie';
-    const endpoint = type === 'tv' ? '/tv/on_the_air' : '/movie/now_playing';
-    const data = await tmdb(endpoint, { page: req.query.page || 1 });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+// TMDB catalog routes live in routes/catalog.js (no session state).
+require('./routes/catalog').register(app, { tmdb });
 
 // --- History Routes -----------------------------------------------------------
 
-app.get('/api/history', (req, res) => {
-  res.json(readHistory());
-});
-
-// Look up missing TMDB metadata (poster_path / backdrop_path) so history
-// items always have artwork. Multiple save paths (wizard auto-save, CLI
-// session persist, hero "mark watched") can race against the wizard's TMDB
-// detail fetch and otherwise persist an item with the artwork stripped.
-async function enrichHistoryItemFromTmdb(type, item) {
-  if (!item || (item.poster_path && item.backdrop_path)) return item;
-  const tmdbId = item.tmdbId || item.id;
-  if (!tmdbId) return item;
-  try {
-    const detail = await tmdb(`/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}`);
-    return {
-      ...item,
-      poster_path: item.poster_path || detail.poster_path || null,
-      backdrop_path: item.backdrop_path || detail.backdrop_path || null,
-      release_date: item.release_date || detail.release_date,
-      first_air_date: item.first_air_date || detail.first_air_date,
-      vote_average: item.vote_average != null ? item.vote_average : detail.vote_average,
-    };
-  } catch (e) {
-    // Non-fatal — just keep what we have.
-    return item;
-  }
-}
-
-app.post('/api/history', async (req, res) => {
-  try {
-    const { type, item } = req.body || {};
-    const tmdbId = item && (item.tmdbId || item.id);
-    if (!type || !item || !tmdbId) {
-      return res.status(400).json({ error: 'Missing type or item' });
-    }
-
-    const enriched = await enrichHistoryItemFromTmdb(type, item);
-    const normalizedItem = {
-      ...enriched,
-      tmdbId,
-      title: enriched.title || enriched.name || enriched.original_title || enriched.original_name || 'Unknown',
-    };
-
-    const db = getServices().historyStore.markWatched(type, normalizedItem);
-    try {
-      getRecommendationService().buildAndPersistProfile();
-    } catch (profileError) {
-      console.warn('Failed to refresh recommendation profile after history save:', profileError.message);
-    }
-    const savedItem = type === 'movie'
-      ? db.movies[String(tmdbId)]
-      : db.tvShows[String(tmdbId)];
-
-    res.json({ ok: true, item: savedItem });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.patch('/api/history/tv/:id/tracking', (req, res) => {
-  try {
-    const { id } = req.params;
-    const { tracking } = req.body || {};
-    if (typeof tracking !== 'boolean') {
-      return res.status(400).json({ error: 'tracking must be a boolean' });
-    }
-    const db = getServices().historyStore.setTracking(id, tracking);
-    res.json({ ok: true, item: db.tvShows[String(id)] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// One-shot artwork backfill — sweeps current history and patches in missing
-// poster_path / backdrop_path from TMDB. The frontend calls this once when
-// the history page loads so previously-broken records get fixed without
-// requiring the user to re-watch anything.
-app.post('/api/history/backfill', async (req, res) => {
-  try {
-    const store = getServices().historyStore;
-    const db = store.read();
-    const buckets = [
-      { type: 'movie', map: db.movies || {} },
-      { type: 'tv', map: db.tvShows || {} },
-    ];
-    let fixed = 0;
-    let attempted = 0;
-    for (const { type, map } of buckets) {
-      for (const id of Object.keys(map)) {
-        const item = map[id];
-        if (item && item.poster_path && item.backdrop_path) continue;
-        attempted += 1;
-        const enriched = await enrichHistoryItemFromTmdb(type, item);
-        if (enriched && (enriched.poster_path !== item.poster_path || enriched.backdrop_path !== item.backdrop_path)) {
-          map[id] = { ...item, ...enriched };
-          fixed += 1;
-        }
-      }
-    }
-    if (fixed > 0) store.write(db);
-    res.json({ ok: true, attempted, fixed });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete('/api/history/:type/:id', (req, res) => {
-  try {
-    const { type, id } = req.params;
-    getServices().historyStore.remove(type, id);
-    try {
-      getRecommendationService().buildAndPersistProfile();
-    } catch (profileError) {
-      console.warn('Failed to refresh recommendation profile after history delete:', profileError.message);
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/api/watchlist', (req, res) => {
-  try {
-    res.json(getRecommendationService().getWatchlist());
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/watchlist', async (req, res) => {
-  try {
-    const { type, tmdbId, item, metadata } = req.body || {};
-    const resolvedType = type === 'tv' ? 'tv' : type === 'movie' ? 'movie' : null;
-    const resolvedId = tmdbId || item?.tmdbId || item?.id || metadata?.tmdbId || metadata?.id;
-    if (!resolvedType || !resolvedId) {
-      return res.status(400).json({ error: 'type and tmdbId are required' });
-    }
-
-    const saved = await getRecommendationService().addWatchlist({
-      type: resolvedType,
-      tmdbId: resolvedId,
-      item,
-      metadata,
-    });
-    res.json({
-      ok: true,
-      item: saved.item,
-      profile: getRecommendationService().summarizeProfile(saved.profile),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete('/api/watchlist/:type/:id', (req, res) => {
-  try {
-    const { type, id } = req.params;
-    if (!['movie', 'tv'].includes(type)) {
-      return res.status(400).json({ error: 'Invalid type' });
-    }
-    const removed = getRecommendationService().removeWatchlist(type, id);
-    res.json({
-      ok: true,
-      removed: !!removed.removed,
-      item: removed.item || null,
-      profile: getRecommendationService().summarizeProfile(removed.profile || {}),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/recommendations/event', async (req, res) => {
-  try {
-    const { eventType, type, tmdbId, metadata } = req.body || {};
-    if (!eventType || !['movie', 'tv'].includes(type) || !tmdbId) {
-      return res.status(400).json({ error: 'eventType, type, and tmdbId are required' });
-    }
-    const recorded = await getRecommendationService().recordEvent({
-      eventType,
-      type,
-      tmdbId,
-      metadata,
-    });
-    res.json({
-      ok: true,
-      interaction: recorded.interaction,
-      profile: getRecommendationService().summarizeProfile(recorded.profile),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Check for new episodes on tracked TV shows
-app.get('/api/newEpisodes', async (req, res) => {
-  try {
-    const db = readHistory();
-    const shows = Object.values(db.tvShows).filter((s) => s.tracking !== false);
-    if (shows.length === 0) return res.json([]);
-
-    const updates = await Promise.all(
-      shows.map(async (show) => {
-        try {
-          const detail = await tmdb(`/tv/${show.tmdbId}`);
-          const latestSeason = detail.last_episode_to_air;
-          if (!latestSeason) return null;
-
-          const lastS = show.lastSeason || 0;
-          const lastE = show.lastEpisode || 0;
-          const newS = latestSeason.season_number;
-          const newE = latestSeason.episode_number;
-
-          const hasNew = newS > lastS || (newS === lastS && newE > lastE);
-          if (!hasNew) return null;
-
-          return {
-            tmdbId: show.tmdbId,
-            title: show.title || detail.name,
-            poster_path: show.poster_path || detail.poster_path,
-            lastWatchedSeason: lastS,
-            lastWatchedEpisode: lastE,
-            latestSeason: newS,
-            latestEpisode: newE,
-            latestEpisodeName: latestSeason.name,
-            latestAirDate: latestSeason.air_date,
-          };
-        } catch (e) {
-          return null;
-        }
-      })
-    );
-
-    res.json(updates.filter(Boolean));
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Personalised recommendations based on watch history
-app.get('/api/recommendations', async (req, res) => {
-  try {
-    const filters = {
-      type: ['movie', 'tv'].includes(req.query.type) ? req.query.type : '',
-      genre: req.query.genre ? String(req.query.genre) : '',
-      minRating: req.query.minRating ? String(req.query.minRating) : '',
-      yearFrom: req.query.yearFrom ? String(req.query.yearFrom) : '',
-      yearTo: req.query.yearTo ? String(req.query.yearTo) : '',
-    };
-    const data = await getRecommendationService().getRecommendations(filters);
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+require('./routes/library').register(app, { tmdb, readHistory, getRecommendationService, getServices });
 
 // --- Streaming Session Store --------------------------------------------------
 
 const streamSessions = new Map();
+// The registry wraps the SAME Map (identity preserved for the ~19 direct call sites and for
+// _internals.streamSessions, which tests/vlc-progress.test.js mutates directly). It exists to
+// give "the current stream" one definition instead of five hand-copied ones. onEvent surfaces
+// the case the single-stream invariant says can't happen — two active sessions at once.
+const sessionRegistry = createSessionRegistry({
+  sessions: streamSessions,
+  onEvent: (event, payload) => {
+    if (event === 'multiple-active-sessions') {
+      console.warn(`Multiple active stream sessions (${payload.count}): ${payload.ids.join(', ')}`);
+    }
+  },
+});
 let sessionCounter = 0;
 const STREAM_CLEANUP_DELAY_MS = 15000;
 const LEGACY_STREAM_FIELDS = ['subtitlePath', 'playerMode', 'noSubtitles'];
@@ -514,6 +152,13 @@ function createStreamSession() {
     castUrls: null,
     subtitleManifestUrls: null,
     videoFormat: null,
+    mediaFacts: null,
+    streamHealth: null,
+    targets: [],
+    // One entry per playback target, keyed 'web' | 'vlc' | 'dlna:<deviceId>' | 'cast'.
+    // Was a single timer slot, which meant casting to a TV silently stopped an
+    // unrelated session's VLC tracking — targets are independent and now tracked so.
+    playbackTargets: new Map(),
   };
   session.lifecycle = new StreamLifecycleState((event, data) => {
     broadcastToSession(sessionId, event, data);
@@ -521,146 +166,32 @@ function createStreamSession() {
   return session;
 }
 
-function applySessionPlayerReady(session, payload = {}) {
-  if (!session || !payload || typeof payload !== 'object') return false;
-
-  // Ensure playerUrl is the root URL (strip any path like /video.mp4?compat=1)
-  let rawPlayerUrl = payload.url ? String(payload.url) : null;
-  let playerUrl = rawPlayerUrl;
-  if (rawPlayerUrl) {
-    try {
-      const urlObj = new URL(rawPlayerUrl);
-      playerUrl = urlObj.protocol + '//' + urlObj.host + '/';
-    } catch (e) {
-      // Keep original URL if parsing fails
-    }
-  }
-
-  // VLC URL should be the full video URL, not the root URL
-  // Priority: payload.vlcUrl > payload.mediaUrl > payload.url + payload.videoPath > payload.url
-  let vlcUrl = null;
-  if (payload.vlcUrl) {
-    vlcUrl = String(payload.vlcUrl);
-  } else if (payload.mediaUrl) {
-    vlcUrl = String(payload.mediaUrl);
-  } else if (payload.videoPath && rawPlayerUrl) {
-    // Construct full video URL from root URL + video path
-    vlcUrl = `${rawPlayerUrl.replace(/\/$/, '')}${payload.videoPath}`;
-  } else if (rawPlayerUrl) {
-    // Use the original full URL, not the root URL
-    vlcUrl = rawPlayerUrl;
-  }
-
-  const castUrl = payload.castUrl
-    ? String(payload.castUrl)
-    : (payload.castUrls && payload.castUrls.preferred ? String(payload.castUrls.preferred) : null);
-  const subtitleManifestUrl = payload.subtitleManifestUrl
-    ? String(payload.subtitleManifestUrl)
-    : (payload.subtitleManifestUrls && payload.subtitleManifestUrls.preferred
-      ? String(payload.subtitleManifestUrls.preferred)
-      : null);
-  const videoFormat = payload.videoFormat || null;
-
-  if (playerUrl) {
-    session.playerUrl = playerUrl;
-    session.playerUrls = payload.urls || session.playerUrls || null;
-    if (videoFormat) {
-      session.videoFormat = videoFormat;
-    }
-    if (session.lifecycle) {
-      session.lifecycle.playerReady({
-        url: playerUrl,
-        playerUrl,
-        vlcUrl,
-        castUrl,
-        subtitleManifestUrl,
-        videoFormat,
-      });
-    }
-  }
-
-  if (vlcUrl) {
-    session.vlcUrl = vlcUrl;
-    session.mediaUrls = payload.mediaUrls || session.mediaUrls || null;
-  }
-
-  if (castUrl) {
-    session.castUrl = castUrl;
-    session.castUrls = payload.castUrls || session.castUrls || null;
-  }
-
-  if (subtitleManifestUrl) {
-    session.subtitleManifestUrl = subtitleManifestUrl;
-    session.subtitleManifestUrls = payload.subtitleManifestUrls || session.subtitleManifestUrls || null;
-  }
-
-  return !!playerUrl;
-}
-
-function getSessionPlayerState(session) {
-  const lifecycleStatus = session && session.lifecycle
-    ? session.lifecycle.status()
-    : { playerUrl: null, exited: false };
-  const playerReadyData = lifecycleStatus.playerReadyData || {};
-  const playerUrl = session && session.playerUrl
-    ? session.playerUrl
-    : (playerReadyData.url || lifecycleStatus.playerUrl);
-  const castUrl = session && session.castUrl
-    ? session.castUrl
-    : (playerReadyData.castUrl || null);
-  const subtitleManifestUrl = session && session.subtitleManifestUrl
-    ? session.subtitleManifestUrl
-    : (playerReadyData.subtitleManifestUrl || null);
-  const videoFormat = session && session.videoFormat
-    ? session.videoFormat
-    : (playerReadyData.videoFormat || null);
-  
-  // Get VLC URL with proper fallback priority
-  // Priority: session.vlcUrl > playerReadyData.vlcUrl > playerReadyData.mediaUrl > playerUrl (full URL)
-  let vlcUrl = session && session.vlcUrl ? session.vlcUrl : null;
-  if (!vlcUrl && playerReadyData) {
-    vlcUrl = playerReadyData.vlcUrl || playerReadyData.mediaUrl || playerReadyData.url || playerUrl;
-  }
-  
-  return {
-    playerUrl,
-    vlcUrl: vlcUrl || playerUrl,
-    castUrl,
-    subtitleManifestUrl,
-    videoFormat,
-    exited: !!lifecycleStatus.exited,
-  };
-}
+// Session player-URL resolution moved to core/session-player-state.js so it can be
+// require()d and unit-tested directly. resolveOpenableSession takes the registry Map as its
+// first argument now (it used to reach the streamSessions module global); server.js binds it
+// below so existing call sites keep the single-argument shape.
+const {
+  applySessionPlayerReady,
+  getSessionPlayerState,
+  resolveOpenableSession: resolveOpenableSessionIn,
+} = require('./core/session-player-state.js');
 
 function resolveOpenableSession(sessionId) {
-  if (sessionId) {
-    const session = streamSessions.get(sessionId);
-    if (!session) return { error: 'Session not found' };
-    const status = getSessionPlayerState(session);
-    if (!status.playerUrl) return { error: 'Player is still starting' };
-    return { session, url: status.playerUrl, vlcUrl: status.vlcUrl || status.playerUrl };
-  }
-
-  for (const session of streamSessions.values()) {
-    const status = getSessionPlayerState(session);
-    if (status.playerUrl && session.streamManager && !status.exited) {
-      return { session, url: status.playerUrl, vlcUrl: status.vlcUrl || status.playerUrl };
-    }
-  }
-
-  for (const session of streamSessions.values()) {
-    const status = getSessionPlayerState(session);
-    if (status.playerUrl) {
-      return { session, url: status.playerUrl, vlcUrl: status.vlcUrl || status.playerUrl };
-    }
-  }
-
-  return { error: 'Player is still starting' };
+  return resolveOpenableSessionIn(streamSessions, sessionId);
 }
 
-function buildVlcLaunchAttempts(url) {
+// `http` (optional) enables VLC's built-in web interface on a loopback port so we can
+// read the playhead back out of it — VLC is a separate process and reports nothing on
+// its own. Purely additive: if VLC ignores the flags (or is already running, so the URL
+// is handed to the existing instance instead) the poller just never connects and VLC
+// plays exactly as before.
+function buildVlcLaunchAttempts(url, http = null) {
   const target = String(url || '');
   const attempts = [];
+  const httpArgs = http
+    ? ['--extraintf=http', '--http-host=127.0.0.1', `--http-port=${http.port}`, `--http-password=${http.password}`]
+    : [];
+  const withHttp = (t) => [t, ...httpArgs];
 
   // VLC on Windows sometimes fails with localhost - try network IP first
   let networkTarget = target;
@@ -680,12 +211,12 @@ function buildVlcLaunchAttempts(url) {
   if (process.platform === 'win32') {
     // Try network IP first (more reliable for VLC on Windows)
     if (networkTarget !== target) {
-      attempts.push({ command: 'vlc.exe', args: [networkTarget] });
+      attempts.push({ command: 'vlc.exe', args: withHttp(networkTarget) });
     }
     // Then try localhost
     attempts.push(
-      { command: 'vlc.exe', args: [target] },
-      { command: 'vlc', args: [target] }
+      { command: 'vlc.exe', args: withHttp(target) },
+      { command: 'vlc', args: withHttp(target) }
     );
 
     const envPaths = [
@@ -697,21 +228,22 @@ function buildVlcLaunchAttempts(url) {
     for (const root of envPaths) {
       attempts.push({
         command: path.join(root, 'VideoLAN', 'VLC', 'vlc.exe'),
-        args: [target],
+        args: withHttp(target),
       });
     }
   } else if (process.platform === 'darwin') {
     attempts.push(
-      { command: 'open', args: ['-a', 'VLC', target] },
-      { command: '/Applications/VLC.app/Contents/MacOS/VLC', args: [target] },
-      { command: 'vlc', args: [target] }
+      // `open` forwards app flags only after --args.
+      { command: 'open', args: ['-a', 'VLC', target, ...(httpArgs.length ? ['--args', ...httpArgs] : [])] },
+      { command: '/Applications/VLC.app/Contents/MacOS/VLC', args: withHttp(target) },
+      { command: 'vlc', args: withHttp(target) }
     );
   } else {
     attempts.push(
-      { command: 'vlc', args: [target] },
-      { command: '/usr/bin/vlc', args: [target] },
-      { command: '/usr/local/bin/vlc', args: [target] },
-      { command: '/snap/bin/vlc', args: [target] }
+      { command: 'vlc', args: withHttp(target) },
+      { command: '/usr/bin/vlc', args: withHttp(target) },
+      { command: '/usr/local/bin/vlc', args: withHttp(target) },
+      { command: '/snap/bin/vlc', args: withHttp(target) }
     );
   }
 
@@ -770,9 +302,9 @@ function spawnDetached(command, args) {
   });
 }
 
-async function openStreamInVlc(url) {
+async function openStreamInVlc(url, http = null) {
   let lastError = null;
-  for (const attempt of buildVlcLaunchAttempts(url)) {
+  for (const attempt of buildVlcLaunchAttempts(url, http)) {
     try {
       await spawnDetached(attempt.command, attempt.args);
       return;
@@ -853,17 +385,270 @@ function validateStreamStartBody(body) {
     };
   }
 
+  // Optional: how this release was chosen, remembered against the history entry so
+  // "Resume" can restart from the same source without a second trip through the
+  // picker. Purely advisory — a malformed/absent playback block is not an error.
+  let playback = null;
+  if (body.playback && typeof body.playback === 'object') {
+    const source = body.playback.source;
+    if (source && String(source).trim()) {
+      playback = { source: String(source).trim() };
+      const season = Number(body.playback.season);
+      const episode = Number(body.playback.episode);
+      if (Number.isFinite(season)) playback.season = season;
+      if (Number.isFinite(episode)) playback.episode = episode;
+    }
+  }
+
   return {
     magnet: String(body.magnet),
     subtitleToken: body.subtitleToken ? String(body.subtitleToken) : null,
+    burnSubtitle: body.burnSubtitle === true,
     history,
+    playback,
   };
+}
+
+// Each player has its own vocabulary for "what am I doing"; PlaybackTarget has one.
+// Anything not mapped here is a state we have no opinion about and is dropped.
+const VLC_STATES = { playing: 'playing', paused: 'paused', stopped: 'stopped' };
+const DLNA_STATES = {
+  PLAYING: 'playing',
+  PAUSED_PLAYBACK: 'paused',
+  PAUSED_RECORDING: 'paused',
+  TRANSITIONING: 'buffering',
+  STOPPED: 'stopped',
+  NO_MEDIA_PRESENT: 'idle',
+};
+
+// "H:MM:SS" / "MM:SS" (UPnP RelTime, VLC) -> seconds. Returns null when unparseable
+// (renderers report "NOT_IMPLEMENTED" or empty before playback settles).
+function hhmmssToSeconds(text) {
+  const m = /^(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.\d+)?$/.exec(String(text || '').trim());
+  if (!m) return null;
+  const secs = (Number(m[1] || 0) * 3600) + (Number(m[2]) * 60) + Number(m[3]);
+  return Number.isFinite(secs) ? secs : null;
+}
+
+// Fold a playhead reported by ANY player into watch history — same session history
+// context, same updateProgress path, so "Continue Watching" works regardless of where
+// the user actually watched. Reached only via a PlaybackTarget's 'playback' event
+// (see getPlaybackTarget), so position is already past the noise floor and `ended` is
+// already derived by the time it lands here. Best-effort throughout.
+function recordSessionProgress(session, { positionSec, durationSec, ended = false } = {}) {
+  if (!session) return;
+  const position = Number(positionSec);
+  const duration = Number(durationSec);
+  if (!Number.isFinite(position)) return;
+
+  // `ended` is assigned, not OR-ed with what came before. The target already decided —
+  // including clearing it when the user seeks back after the credits, which the old
+  // OR made impossible (once ended, ended forever).
+  session.playback = {
+    ...(session.playback || {}),
+    positionSec: Math.floor(position),
+    durationSec: Number.isFinite(duration) && duration > 0 ? Math.floor(duration) : null,
+    ended: ended === true,
+    updatedAt: Date.now(),
+  };
+
+  const h = session.history;
+  if (!h || !h.item || !h.item.tmdbId) return;
+  try {
+    getServices().historyStore.updateProgress(h.type, h.item.tmdbId, {
+      season: h.type === 'tv' ? h.item.lastSeason : undefined,
+      episode: h.type === 'tv' ? h.item.lastEpisode : undefined,
+      positionSec: Math.floor(position),
+      durationSec: Number.isFinite(duration) && duration > 0 ? Math.floor(duration) : null,
+      item: h.item,
+    });
+  } catch (e) { /* progress persistence is best-effort */ }
+}
+
+// The bridge's junction point. Every target — the web player, VLC, a DLNA TV, a
+// Chromecast — reports through a PlaybackTarget, and its events fan out here to BOTH
+// destinations at once: watch history (so "Continue Watching" works wherever you
+// watched) and the session's SSE channel (so the UI learns about a finish or a failure
+// without polling for it). Targets are created lazily on first report.
+// The roster the UI reads: every target this session has ever fed, and what each is
+// doing now. Built from the map rather than from the last event, because the map is the
+// only thing that knows about a target that has stopped reporting — and a TV that went
+// quiet is precisely what you'd be looking at this for.
+function sessionTargetsSnapshot(session) {
+  if (!session || !session.playbackTargets) return [];
+  const out = [];
+  for (const [key, entry] of session.playbackTargets.entries()) {
+    const t = entry.target;
+    out.push({
+      key,
+      ...t.status(),
+      // `gone` is terminal — VLC closed, the TV stopped answering. Distinct from a
+      // target that is merely paused or idle, which is still there.
+      gone: t.finished === true,
+      // A live poller vs. one we've stopped. Without this a dead DLNA target and a
+      // paused one look identical from outside.
+      polling: !!entry.timer,
+    });
+  }
+  return out;
+}
+
+function broadcastTargets(session) {
+  if (!session || !session.lifecycle) return;
+  session.targets = sessionTargetsSnapshot(session);
+  session.lifecycle.targets(session.targets);
+}
+
+function getPlaybackTarget(session, key, kind, device = null) {
+  if (!session) return null;
+  if (!session.playbackTargets) session.playbackTargets = new Map();
+
+  const existing = session.playbackTargets.get(key);
+  if (existing) {
+    // A name can arrive after the target does (the cast sender learns the friendly name
+    // from its own SDK, on its first report). Take it whenever it shows up.
+    if (device) existing.target.describe(device);
+    return existing.target;
+  }
+
+  const target = new PlaybackTarget(kind, (event, payload) => {
+    if (event === 'playback') {
+      recordSessionProgress(session, payload);
+      // The one place a TARGET fact crosses into the stream-health plane: "how much
+      // buffer is ahead of me" needs the playhead (target) and the average bitrate
+      // (source), and neither plane can answer it alone. Every target lands here, so
+      // this is the only wiring needed — but with two players running, last one wins,
+      // which is why the payload stamps who reported it.
+      if (session.streamManager && session.streamManager.streamHealth) {
+        session.streamManager.streamHealth.observePlayhead(payload.positionSec, key);
+      }
+      if (session.lifecycle) session.lifecycle.playback(payload);
+      broadcastTargets(session);
+      return;
+    }
+    if (event === 'playback_error' && session.lifecycle) {
+      session.lifecycle.playbackError(payload);
+      broadcastTargets(session); // `gone` flips here — the roster has to say so
+    }
+  });
+
+  session.playbackTargets.set(key, { target, timer: null, device: device || null });
+  broadcastTargets(session); // a new target appearing IS the news
+  return target;
+}
+
+// Hand a poller's interval to the registry so it can be cleared per-target.
+function setPlaybackTimer(session, key, timer) {
+  if (!session || !session.playbackTargets) return;
+  const entry = session.playbackTargets.get(key);
+  if (!entry) return;
+  if (entry.timer) clearInterval(entry.timer);
+  entry.timer = timer;
+  if (timer && timer.unref) timer.unref();
+  broadcastTargets(session);
+}
+
+// Stop polling one target, leaving every other target on the session running.
+function stopPlaybackTarget(session, key) {
+  if (!session || !session.playbackTargets) return;
+  const entry = session.playbackTargets.get(key);
+  if (!entry) return;
+  if (entry.timer) clearInterval(entry.timer);
+  entry.timer = null;
+  broadcastTargets(session);
+}
+
+// Stop every poller on a session. Session teardown still wants the blunt version.
+function stopExternalProgress(session) {
+  if (!session || !session.playbackTargets) return;
+  for (const key of session.playbackTargets.keys()) stopPlaybackTarget(session, key);
+}
+
+// A loopback port for VLC's web interface. Bind :0 and let the OS pick, so two
+// concurrent VLC launches can't collide on a hardcoded port.
+function findFreePort() {
+  return new Promise((resolve) => {
+    const srv = require('net').createServer();
+    srv.once('error', () => resolve(null));
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+// Read VLC's playhead out of its web interface. VLC is a separate process that pings
+// nothing, so without this a full film watched in VLC leaves Continue Watching at 0.
+// Entirely best-effort: if the interface never comes up (VLC too old, flags ignored
+// because an instance was already running, user's own VLC config), we simply stop.
+function startVlcProgress(session, { port, password }) {
+  stopPlaybackTarget(session, 'vlc');
+  const auth = 'Basic ' + Buffer.from(':' + password).toString('base64');
+  const target = getPlaybackTarget(session, 'vlc', 'vlc');
+  let misses = 0;
+  let everAnswered = false;
+
+  // Whether we ever reached the interface is the only signal we have to tell "the user
+  // closed VLC" apart from "this VLC never had an interface to begin with" (flags went
+  // to an already-running instance, or it's too old). The process itself is spawned
+  // detached with stdio ignored, so its exit is invisible to us.
+  const giveUpNow = () => {
+    target.gone(everAnswered ? 'closed' : 'unavailable');
+    stopPlaybackTarget(session, 'vlc');
+  };
+
+  const poll = () => {
+    if (!streamSessions.has(session.id)) return stopPlaybackTarget(session, 'vlc');
+    const req = require('http').request(
+      { host: '127.0.0.1', port, path: '/requests/status.xml', headers: { Authorization: auth }, timeout: 4000 },
+      (res) => {
+        let xml = '';
+        res.on('data', (d) => { xml += d; if (xml.length > 200000) req.destroy(); });
+        res.on('end', () => {
+          if (res.statusCode !== 200) { if (++misses >= 4) giveUpNow(); return; }
+          misses = 0;
+          everAnswered = true;
+          // Report every state, not just 'playing'. A 'stopped' is exactly the event
+          // that means the film finished — dropping it here is why auto-next-episode
+          // never fired in VLC. VLC zeroes <time>/<length> on stop, so the numbers in
+          // that last report are junk; the target ignores them and consults the
+          // playhead it retained while the film was actually running.
+          const raw = String((/<state>([^<]*)<\/state>/i.exec(xml) || [])[1] || '').toLowerCase();
+          const state = VLC_STATES[raw];
+          if (!state) return;
+          target.report({
+            state,
+            positionSec: Number((/<time>(\d+)<\/time>/i.exec(xml) || [])[1]),
+            durationSec: Number((/<length>(\d+)<\/length>/i.exec(xml) || [])[1]),
+          });
+          if (state === 'stopped') stopPlaybackTarget(session, 'vlc');
+        });
+      }
+    );
+    // VLC closed, or the interface never started — stop after a few failures.
+    const giveUp = () => { try { req.destroy(); } catch (e) {} if (++misses >= 4) giveUpNow(); };
+    req.on('error', giveUp);
+    req.on('timeout', giveUp);
+    req.end();
+  };
+
+  setPlaybackTimer(session, 'vlc', setInterval(poll, 15000));
+  return poll; // returned so tests can drive a scrape without waiting out the interval
 }
 
 function persistSessionHistory(session) {
   if (!session || session.historySaved || !session.history) return null;
   const { type, item } = session.history;
   const db = getServices().historyStore.markWatched(type, item);
+  // Record the release source alongside the entry markWatched just created, so the
+  // Continue Watching shelf can resume straight back into the same one.
+  if (session.playback) {
+    try {
+      getServices().historyStore.setLastPlayback(type, item.tmdbId, session.playback);
+    } catch (playbackError) {
+      console.warn('Failed to record last playback source:', playbackError.message);
+    }
+  }
   try {
     getRecommendationService().buildAndPersistProfile();
   } catch (profileError) {
@@ -884,6 +669,7 @@ async function destroySession(sessionId, code = 0) {
   }
 
   session.destroyPromise = (async () => {
+    stopExternalProgress(session); // no session left to attribute VLC/DLNA progress to
     if (session.cleanupTimer) {
       clearTimeout(session.cleanupTimer);
       session.cleanupTimer = null;
@@ -946,12 +732,32 @@ app.post('/api/torrents/search', async (req, res) => {
           // original_name already romanized (Latin script) — include that too, but
           // skip the CJK/kanji original_name since these trackers never match it.
           const altResults = (detail.alternative_titles && detail.alternative_titles.results) || [];
-          const romaji = altResults
-            .filter((a) => a && a.iso_3166_1 === 'JP' && /romaji|hepburn/i.test(a.type || ''))
-            .map((a) => a.title);
+          // Anime trackers use double-vowel romaji (Yuusha), but TMDB often stores
+          // the Hepburn macron form (Yūsha). Normalize macrons so the API's literal
+          // token match lands. ō→ou matches the おう the trackers spell out.
+          const deMacron = (s) => String(s || '')
+            .replace(/ā/g, 'aa').replace(/ī/g, 'ii').replace(/ū/g, 'uu')
+            .replace(/ē/g, 'ee').replace(/ō/g, 'ou')
+            .replace(/Ā/g, 'Aa').replace(/Ī/g, 'Ii').replace(/Ū/g, 'Uu')
+            .replace(/Ē/g, 'Ee').replace(/Ō/g, 'Ou');
+          // SubsPlease/Nyaa file a show under a SHORT title; TMDB frequently appends
+          // a long subtitle after a colon (e.g. "Yuusha-kei ni Shosu: Choubatsu
+          // Yuusha 9004-tai Keimu Kiroku"). Searching the full string returns nothing,
+          // so also emit the pre-colon form.
+          const stripSubtitle = (s) => String(s).split(/[:：]/)[0].trim();
           const hasCjk = (s) => /[　-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ]/.test(String(s || ''));
-          const origRomaji = detail.original_name && !hasCjk(detail.original_name) ? [detail.original_name] : [];
-          altTitles = [...new Set([...romaji, ...origRomaji].filter(Boolean))];
+          // Seed from JP alt titles that are romaji-typed OR simply non-CJK (many
+          // romaji entries carry no type), plus a romanized original_name.
+          const romajiSeeds = altResults
+            .filter((a) => a && a.iso_3166_1 === 'JP' && (/romaji|hepburn/i.test(a.type || '') || !hasCjk(a.title)))
+            .map((a) => a.title);
+          if (detail.original_name && !hasCjk(detail.original_name)) romajiSeeds.push(detail.original_name);
+          const expanded = [];
+          for (const seed of romajiSeeds) {
+            const n = deMacron(seed);
+            expanded.push(n, stripSubtitle(n));
+          }
+          altTitles = [...new Set(expanded.map((s) => s.trim()).filter(Boolean))];
         }
 
         if (isAnime) {
@@ -1012,6 +818,64 @@ app.post('/api/torrents/search', async (req, res) => {
 });
 
 // Resolve magnet link from a torrent result
+// Warm a candidate before the user commits to it. Measured: engine start is 14ms and
+// `add` is 16ms — the real 10s+ of time-to-first-frame is metadata resolution and the
+// first read, both swarm-bound and unavoidable ONCE STARTED. So start them earlier:
+// while the search is still running and the user is still reading the list. `add` uses
+// save_to_db:false and downloads no data until a reader opens, so this costs metadata
+// and peer discovery only, and leaves nothing behind if the user picks something else.
+// Deliberately never fails the caller — a prefetch miss just means today's timing.
+// Process-wide singleton — the same engine instance the app starts at boot and that
+// every stream shares (see core/torrserver-client.js getSharedClient).
+function getSharedTorrServer() {
+  return require('./core/torrserver-client').getSharedClient();
+}
+
+// Open a brief reader so TorrServer resolves metadata AND initialises its reader now,
+// while the user is still choosing. Measured against a warm, actively-seeded torrent:
+// the FIRST read costs ~7.8s, every read after it ~200ms — that cost is paid on the
+// click today. Reading ~1MB here moves it off the critical path. Bounded and
+// best-effort: worst case it warms a torrent the user doesn't pick.
+async function warmTorrentReader(hash) {
+  const ts = getSharedTorrServer();
+  const file = await ts.resolveLargestFile(hash, { timeout: 45000 });
+  const url = ts.streamUrl(hash, file.id, file.path);
+  await new Promise((resolve) => {
+    const req = require('http').get(url, { headers: { Range: 'bytes=0-1048575' } }, (res) => {
+      res.on('data', () => {}); // drain and discard; we only want the reader warm
+      res.on('end', resolve);
+      res.on('error', resolve);
+    });
+    req.on('error', resolve);
+    req.setTimeout(60000, () => { try { req.destroy(); } catch (e) {} resolve(); });
+  });
+}
+
+const prefetchedTorrents = new Map(); // magnet -> hash, so a repeat pick skips the scrape
+app.post('/api/torrents/prefetch', async (req, res) => {
+  try {
+    const { torrent, magnet } = req.body || {};
+    let link = magnet && String(magnet).startsWith('magnet:') ? String(magnet) : null;
+    if (!link) {
+      if (!torrent) return res.json({ ok: false, reason: 'torrent or magnet required' });
+      const scraper = getServices().createTorrentScraper();
+      link = await scraper.getMagnetLink(torrent); // scraping overlaps with the search too
+    }
+    if (!link) return res.json({ ok: false, reason: 'could not resolve magnet' });
+    if (prefetchedTorrents.has(link)) return res.json({ ok: true, hash: prefetchedTorrents.get(link), cached: true });
+
+    const hash = await getSharedTorrServer().add(link, (torrent && torrent.name) || '');
+    prefetchedTorrents.set(link, hash);
+    // Bound the map; it only exists to skip a repeat scrape.
+    if (prefetchedTorrents.size > 50) prefetchedTorrents.delete(prefetchedTorrents.keys().next().value);
+    res.json({ ok: true, hash, magnet: link });
+    // Reply first, then keep warming in the background — the caller never waits on this.
+    warmTorrentReader(hash).catch(() => {});
+  } catch (e) {
+    res.json({ ok: false, reason: e.message });
+  }
+});
+
 app.post('/api/torrents/magnet', async (req, res) => {
   try {
     const { torrent } = req.body;
@@ -1105,6 +969,35 @@ app.post('/api/subtitles/download', async (req, res) => {
 
 // --- Stream Management --------------------------------------------------------
 
+// Auto-sync an external subtitle (by token) to the active stream's audio via alass.
+app.post('/api/subtitles/sync', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const token = typeof body.subtitleToken === 'string' ? body.subtitleToken.trim() : '';
+    if (!token) return res.status(400).json({ error: 'subtitleToken required' });
+    const subPath = getServices().subtitleTokenStore.resolve(token);
+    if (!subPath || !fs.existsSync(subPath)) return res.status(400).json({ error: 'Invalid or expired subtitle token' });
+    const session = sessionRegistry.currentStreamSession();
+    if (!session) return res.status(409).json({ error: 'No active stream to sync against' });
+    const r = await session.streamManager.syncSubtitle(subPath, { maxSeconds: body.maxSeconds });
+    if (!r.ok) return res.status(500).json({ error: r.reason || 'sync failed' });
+    const issued = getServices().subtitleTokenStore.issueWithMetadata(r.output, 2 * 60 * 60 * 1000);
+    res.json({ subtitleToken: issued.token, expiresAt: issued.expiresAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Generate subtitles for the active stream via whisper.cpp (speech-to-text).
+app.post('/api/subtitles/generate', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const session = sessionRegistry.currentStreamSession();
+    if (!session) return res.status(409).json({ error: 'No active stream' });
+    const r = await session.streamManager.generateSubtitles({ language: body.language, maxSeconds: body.maxSeconds });
+    if (!r.ok) return res.status(500).json({ error: r.reason || 'generation failed' });
+    res.json({ ok: true, index: r.index });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Start a new stream session ? runs StreamManager in-process (no child process spawn)
 app.post('/api/stream/start', async (req, res) => {
   try {
@@ -1120,11 +1013,19 @@ app.post('/api/stream/start', async (req, res) => {
       resolvedSubtitlePath = byToken;
     }
 
-    // Single active stream policy: start request replaces any running session.
-    await destroyAllSessions(0);
+    // Concurrent streams: each start adds a new session (its own player server + torrent;
+    // TorrServer serves them all). A small cap avoids runaway resource use; the oldest
+    // is retired when exceeded.
+    const MAX_CONCURRENT_STREAMS = Math.max(1, Number(process.env.UPLAYER_MAX_STREAMS) || 4);
+    const live = sessionRegistry.activeStreamSessions();
+    if (live.length >= MAX_CONCURRENT_STREAMS) {
+      const oldest = live.sort((a, b) => (a.started || 0) - (b.started || 0))[0];
+      if (oldest) { try { await destroySession(oldest.id, 0); } catch (e) {} }
+    }
 
     const session = createStreamSession();
     session.history = parsed.history;
+    session.playback = parsed.playback;
     if (parsed.history && parsed.history.type && parsed.history.item && parsed.history.item.tmdbId) {
       try {
         await getRecommendationService().recordEvent({
@@ -1152,6 +1053,34 @@ app.post('/api/stream/start', async (req, res) => {
       session.lifecycle.progress(data);
     });
 
+    // The byte supply, in real numbers. `progress` above stays exactly as it was.
+    sm.on('stream_health', (data) => {
+      session.streamHealth = data;
+      session.lifecycle.streamHealth(data);
+    });
+
+    // Playhead pings from the player page (via the stream hub). The web player is the
+    // one target that reports a real `ended` event rather than having it inferred from
+    // an ambiguous stop, so it's passed straight through and believed.
+    sm.on('playback_position', (data) => {
+      getPlaybackTarget(session, 'web', 'web').report({
+        positionSec: data.positionSec,
+        durationSec: data.durationSec,
+        state: data.ended === true ? 'stopped' : 'playing',
+        ended: data.ended === true,
+      });
+    });
+
+    // The player page failed to play at all (bad codec, dead source). Nothing used to
+    // arrive here — the page swallowed its own errors — so a failed stream just sat
+    // there looking like it was still loading.
+    sm.on('playback_error', (data) => {
+      getPlaybackTarget(session, 'web', 'web').error({
+        code: data && data.code,
+        message: (data && data.message) || 'The player could not play this file',
+      });
+    });
+
     sm.on('player_ready', (data) => {
       const url = data && data.url ? data.url : null;
       if (url) {
@@ -1171,6 +1100,7 @@ app.post('/api/stream/start', async (req, res) => {
     sm.stream(parsed.magnet, {
       openPlayer: false,
       subtitlePath: resolvedSubtitlePath,
+      burnSubtitle: parsed.burnSubtitle,
     }).then((result) => {
       if (result && result.url) {
         persistSessionHistory(session);
@@ -1206,7 +1136,14 @@ app.post('/api/stream/open-vlc', async (req, res) => {
     }
 
     const vlcUrl = resolved.vlcUrl || resolved.url;
-    await openStreamInVlc(vlcUrl);
+    // Enable VLC's web interface on a loopback port so we can poll the playhead back
+    // into watch history. Never fatal: no port -> launch VLC exactly as before.
+    const port = await findFreePort();
+    const vlcHttp = port
+      ? { port, password: require('crypto').randomBytes(12).toString('hex') }
+      : null;
+    await openStreamInVlc(vlcUrl, vlcHttp);
+    if (vlcHttp && resolved.session) startVlcProgress(resolved.session, vlcHttp);
     res.json({
       ok: true,
       url: resolved.url,
@@ -1250,6 +1187,13 @@ app.get('/api/stream/output/:sessionId', (req, res) => {
     })}\n\n`);
   }
 
+  // The roster is state, not a stream of news: replay the CURRENT one rather than
+  // relying on the event buffer, which may have aged the earlier ones out.
+  const targets = sessionTargetsSnapshot(session);
+  if (targets.length) {
+    res.write(`event: targets\ndata: ${JSON.stringify(targets)}\n\n`);
+  }
+
   session.clients.push(res);
 
   req.on('close', () => {
@@ -1271,6 +1215,28 @@ app.delete('/api/stream/kill-all', async (req, res) => {
 });
 
 // Status of all sessions
+// Chromecast reports through the browser rather than the server: only the sender page
+// can talk to the CAF SDK, so unlike VLC and DLNA there is nothing here to poll. This
+// endpoint is how it joins the bridge anyway — the sender posts what the SDK told it,
+// and from here on it's an ordinary target like any other.
+app.post('/api/stream/:id/playback', (req, res) => {
+  const session = streamSessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Unknown session' });
+  const { positionSec, durationSec, state, ended, kind, device } = req.body || {};
+
+  const key = kind === 'cast' ? 'cast' : 'web';
+  // The sender is the only thing that can know the receiver's friendly name — the CAF
+  // SDK hands it to the page, never to us — so it rides along with the report.
+  const target = getPlaybackTarget(session, key, key, device);
+  const out = target.report({
+    positionSec,
+    durationSec,
+    state: state || 'playing',
+    ended: ended === true,
+  });
+  res.json({ ok: true, playback: out || session.playback || null });
+});
+
 app.get('/api/stream/status', (req, res) => {
   const active = [];
   for (const [id, session] of streamSessions.entries()) {
@@ -1283,10 +1249,27 @@ app.get('/api/stream/status', (req, res) => {
       castUrl: lifecycleStatus.castUrl,
       subtitleManifestUrl: lifecycleStatus.subtitleManifestUrl,
       videoFormat: lifecycleStatus.videoFormat,
+      mediaFacts: lifecycleStatus.mediaFacts,
+      streamHealth: session.streamHealth || null,
+      // `playback` above is the last report from whichever target spoke most recently;
+      // this is every target and what each is doing. A client that didn't start the
+      // session (a phone opening /#/stream fresh) gets the roster from here.
+      targets: sessionTargetsSnapshot(session),
       started: session.started,
       mode: session.mode || PLAYER_MODE,
       exited: !!lifecycleStatus.exited,
       exitedAt: session.exitedAt,
+      playback: session.playback || null,
+      // Surface what this session is playing so a client that didn't start it
+      // (e.g. a phone opening /#/stream fresh) can rebuild the wizard — this is
+      // what lets "Next Episode" work without relying on that device's localStorage.
+      media: session.history ? {
+        type: session.history.type || null,
+        tmdbId: (session.history.item && (session.history.item.tmdbId || session.history.item.id)) || null,
+        title: (session.history.item && session.history.item.title) || null,
+        season: (session.history.item && session.history.item.lastSeason) || null,
+        episode: (session.history.item && session.history.item.lastEpisode) || null,
+      } : null,
     });
   }
   res.json(active);
@@ -1294,9 +1277,11 @@ app.get('/api/stream/status', (req, res) => {
 
 // TV Cast readiness test endpoint
 app.get('/api/cast/test', (req, res) => {
-  const sessions = Array.from(streamSessions.values());
-  const activeSession = sessions.find(s => s.streamManager && !s.lifecycle?.status()?.exited);
-  
+  // { live: true } == the old `s.streamManager && !exited` predicate this route used on its own.
+  // It is the ONE finder site that excluded exited sessions; kept explicit rather than silently
+  // unified with the others (see core/session-registry.js).
+  const activeSession = sessionRegistry.currentStreamSession({ live: true });
+
   if (!activeSession) {
     return res.status(404).json({
       ready: false,
@@ -1341,6 +1326,165 @@ app.get('/api/cast/test', (req, res) => {
   res.json(testResults);
 });
 
+// --- DLNA push-cast (smart TVs) -----------------------------------------------
+// Discover UPnP MediaRenderers on the LAN and push the active stream to one. Unlike
+// Chromecast (which needs H.264/AAC via the :8000 HLS), DLNA TVs play TorrServer's
+// native :8090 stream — the ORIGINAL file at full quality, no transcoding.
+
+// Rewrite a localhost/loopback media URL to the server's LAN IP so the TV can reach it.
+function lanReachable(urlStr) {
+  if (!urlStr) return urlStr;
+  try {
+    const u = new URL(urlStr);
+    if (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '0.0.0.0') {
+      u.hostname = getLocalIPv4Address();
+    }
+    return u.toString();
+  } catch (e) { return urlStr; }
+}
+
+app.get('/api/dlna/devices', async (req, res) => {
+  try {
+    const debug = req.query.debug === '1';
+    const devices = await dlna.discover({
+      timeout: Math.min(8000, Math.max(1500, Number(req.query.timeout) || 4000)),
+      debug,
+    });
+    const payload = { devices };
+    if (debug) payload.raw = dlna.getLastRaw(); // every SSDP responder, to diagnose "TV not found"
+    res.json(payload);
+  } catch (e) { res.status(500).json({ error: e.message, devices: [] }); }
+});
+
+app.post('/api/dlna/play', async (req, res) => {
+  try {
+    const { deviceId, sessionId, title, subtitleUrl } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    let session = sessionId ? streamSessions.get(sessionId) : null;
+    if (!session) session = sessionRegistry.currentStreamSession();
+    if (!session) return res.status(404).json({ error: 'No active stream to cast' });
+    const st = getSessionPlayerState(session);
+    const mediaUrl = lanReachable(st.vlcUrl); // TorrServer :8090 native stream = original quality
+    if (!mediaUrl) return res.status(409).json({ error: 'Stream not ready yet' });
+    const r = await dlna.play(deviceId, mediaUrl, {
+      title: title || 'Uplayer',
+      subtitleUrl: subtitleUrl ? lanReachable(subtitleUrl) : '',
+    });
+    startDlnaProgress(session, deviceId);
+    res.json(Object.assign({ mediaUrl }, r));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// A TV plays on its own — nothing pings /api/progress the way the web player does — so
+// poll the renderer for its playhead and fold it into history. Without this, watching a
+// whole episode on the TV leaves "Continue Watching" stuck at 0.
+function startDlnaProgress(session, deviceId) {
+  const key = `dlna:${deviceId}`;
+  stopPlaybackTarget(session, key);
+  // Discovery already learned the TV's friendly name, model and address — carry them
+  // onto the target so the UI can say "Samsung Q80 (192.168.1.42)" rather than echoing
+  // a UUID nobody can match to a box in their living room.
+  const known = typeof dlna.getDevice === 'function' ? dlna.getDevice(deviceId) : null;
+  const target = getPlaybackTarget(session, key, 'dlna', known ? {
+    name: known.name, model: known.model, address: known.address,
+  } : null);
+  let misses = 0;
+
+  setPlaybackTimer(session, key, setInterval(async () => {
+    // The session went away (stream stopped) — nothing left to attribute progress to.
+    if (!streamSessions.has(session.id)) return stopPlaybackTarget(session, key);
+    let st;
+    try {
+      st = await dlna.status(deviceId);
+    } catch (e) {
+      st = null;
+    }
+
+    // A device that won't answer at all is a miss: TV switched off, or off the network.
+    // Give up rather than poll a dead renderer forever.
+    if (!st || !st.ok) {
+      misses += 1;
+      if (misses >= 3) {
+        target.gone('unreachable');
+        stopPlaybackTarget(session, key);
+      }
+      return;
+    }
+    misses = 0;
+
+    // A device that answers STOPPED is NOT a miss — it's an answer, and the most
+    // important one we get. Lumping it in with unreachable (as this used to) threw away
+    // the only signal that the episode finished, which is why casting never triggered
+    // auto-next. Whether it means "finished" or "user bailed" is for the target to
+    // decide from the playhead it retained.
+    const state = DLNA_STATES[String(st.state || '').toUpperCase()];
+    if (!state) return;
+    target.report({
+      state,
+      positionSec: hhmmssToSeconds(st.relTime), // null when the renderer says NOT_IMPLEMENTED
+      durationSec: hhmmssToSeconds(st.duration),
+    });
+    if (state === 'stopped' || state === 'idle') stopPlaybackTarget(session, key);
+  }, 15000));
+}
+
+app.post('/api/dlna/stop', async (req, res) => {
+  try {
+    const deviceId = (req.body || {}).deviceId;
+    // Casting stopped — stop polling this TV (the last position is already recorded).
+    // Only this device's target: a blanket sweep here used to also kill an unrelated
+    // session's VLC poller, back when every session had a single shared timer slot.
+    for (const s of streamSessions.values()) stopPlaybackTarget(s, `dlna:${deviceId}`);
+    res.json(await dlna.stop(deviceId));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.post('/api/dlna/pause', async (req, res) => { try { res.json(await dlna.pause((req.body || {}).deviceId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.post('/api/dlna/resume', async (req, res) => { try { res.json(await dlna.resume((req.body || {}).deviceId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get('/api/dlna/status', async (req, res) => { try { res.json(await dlna.status(req.query.deviceId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+
+// --- App configuration (API keys) --------------------------------------------
+// Keys are entered in the Settings popup instead of a .env file, so a fresh PC
+// needs no setup — it just asks for what it needs. Status returns booleans only;
+// the secret values are never sent back to the browser.
+
+app.get('/api/config', (req, res) => {
+  const status = getConfigStatus();
+  res.json({
+    status,
+    needsSetup: !status.TMDB_API_KEY, // TMDB is required for browsing/search
+    fields: [
+      { key: 'TMDB_API_KEY', label: 'TMDB API Key', required: true, help: 'Free at themoviedb.org → Settings → API. Powers all movie/TV browsing & search.' },
+      { key: 'OPENSUBTITLES_API_KEY', label: 'OpenSubtitles API Key', required: false, help: 'Free at opensubtitles.com. Needed only for subtitle search/download.' },
+      { key: 'OPENSUBTITLES_USERNAME', label: 'OpenSubtitles Username', required: false },
+      { key: 'OPENSUBTITLES_PASSWORD', label: 'OpenSubtitles Password', required: false, secret: true },
+    ],
+    // Rendered by dedicated Settings sections (not the generic field loop).
+    preferredQuality: getEnv('PREFERRED_QUALITY', '1080p'),
+  });
+});
+
+app.post('/api/config', (req, res) => {
+  try {
+    const allowed = ['TMDB_API_KEY', 'OPENSUBTITLES_API_KEY', 'OPENSUBTITLES_USERNAME', 'OPENSUBTITLES_PASSWORD', 'PREFERRED_QUALITY'];
+    const values = {};
+    for (const k of allowed) {
+      if (req.body && Object.prototype.hasOwnProperty.call(req.body, k)) values[k] = req.body[k];
+    }
+    setConfigValues(values);
+
+    // Apply to the already-running services without a restart.
+    const svc = getServices();
+    const cfg = getRuntimeConfig();
+    svc.runtime.config.tmdbApiKey = cfg.tmdbApiKey;
+    svc.runtime.config.openSubtitles = cfg.openSubtitles;
+    if (svc.tmdbClient) svc.tmdbClient.apiKey = cfg.tmdbApiKey;
+
+    res.json({ ok: true, status: getConfigStatus() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // --- SPA Catch-all ------------------------------------------------------------
 
 app.get('*', (req, res) => {
@@ -1354,11 +1498,11 @@ let activeServer = null;
 function getServerUrl(server = activeServer) {
   if (!server || !server.listening) return null;
   const addr = server.address();
-  const resolvedPort = addr && typeof addr === 'object' ? addr.port : PORT;
+  const resolvedPort = addr && typeof addr === 'object' ? addr.port : getPort();
   return buildAccessibleUrls(resolvedPort).localhost;
 }
 
-function startServer(port = PORT) {
+function startServer(port = getPort()) {
   if (activeServer && activeServer.listening) {
     const addr = activeServer.address();
     const activePort = addr && typeof addr === 'object' ? addr.port : port;
@@ -1407,7 +1551,26 @@ async function stopServer() {
 }
 
 if (require.main === module) {
-  startServer(PORT);
+  startServer(getPort());
+
+  // Start the torrent engine ONCE, up front, so it's ready before the first stream and
+  // stays up for the whole life of the app — no per-stream start/stop churn. Streams just
+  // add/remove torrents against it. It's stopped only when the app itself exits.
+  const { getSharedClient } = require('./core/torrserver-client');
+  const torrServer = getSharedClient({ log: (m) => console.log(String(m)) });
+  torrServer.start().catch((e) => console.error('TorrServer failed to start:', e && e.message));
+
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try { torrServer.stop(); } catch (e) { /* ignore */ }
+    // Give the kill a beat to fire, then exit.
+    setTimeout(() => process.exit(0), 300);
+    if (signal) console.log(`\nShutting down (${signal})…`);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 module.exports = app;
@@ -1415,4 +1578,14 @@ module.exports.app = app;
 module.exports.startServer = startServer;
 module.exports.stopServer = stopServer;
 module.exports.getServerUrl = getServerUrl;
+
+// Exposed for tests/vlc-progress.test.js, which drives the real poller against a fake
+// VLC web interface — the only way to cover the scrape without launching VLC.
+module.exports._internals = {
+  streamSessions,
+  createStreamSession,
+  startVlcProgress,
+  getPlaybackTarget,
+  stopExternalProgress,
+};
 

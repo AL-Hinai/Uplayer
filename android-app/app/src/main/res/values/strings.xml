@@ -4,4 +4,5 @@
     <string name="node_channel_name">Uplayer streaming</string>
     <string name="node_notification_title">Uplayer is running</string>
     <string name="node_notification_text">Streaming engine active</string>
+    <string name="node_notification_stop">Stop</string>
 </resources>
