@@ -64,7 +64,8 @@ frozen (`core/stream-health.js:165-172`). Do not write comments that restate the
   hand-maintained `&&` chain silently orphaned a test file for months; that is why it is gone.)
   A `test:<slug>` script is optional convenience for running one file directly.
 - The one exclusion list is `tests/run-all.js:29`. Adding to it needs a stated reason in the
-  file — today it holds `cast-tv-modal.test.js`, quarantined over a render regression.
+  file. It is currently **empty**, which is the goal — `cast-tv-modal.test.js` was the last
+  entry and now runs with everything else.
 - **`_internals` is the sanctioned test escape hatch.** Export it with the comment
   `// exposed for unit tests`. See `core/dlna-caster.js:333`, `server.js:1584`.
 - Prefer testing a pure function over mocking IO. `core/stream-health.js` is pure precisely so
@@ -98,3 +99,32 @@ playhead (target plane) and the bitrate (supply plane), and neither plane can an
 If you find yourself adding target state to `stream-health.js`, or byte counters to
 `playback-target.js`, stop. Add a new event instead — that is why `stream_health` and `targets`
 are separate SSE events rather than one payload.
+
+## Two kinds of subtitle — the auto-fix belongs to exactly one
+
+- **Embedded** (`source: 'embedded'`) — extracted from the container by ffmpeg.
+- **Downloaded** (`source: 'external'`) — fetched from a provider, chosen in the wizard.
+
+They **coexist**. Downloading does not disable extraction, extraction does not skip the
+download, and every playback target offers both so the viewer picks whichever they want.
+
+**The timing auto-fix (alass) applies to the DOWNLOADED track only.** An embedded track was
+muxed with this exact video, so its clock *is* the video's clock — "correcting" it can only
+make it wrong, after spending minutes of audio extraction to do so. All three entry points
+enforce this separately and must keep agreeing: `_autoSyncExternalSubtitle` (`uplayer.js`) only
+ever `find`s `source === 'external'`; `POST /api/subtitles/sync` rejects an embedded index;
+`native-player.js`'s CC⇄ button won't offer one as a candidate.
+
+Two consequences that are easy to break:
+
+- **A track's index never moves.** Every player addresses subtitles as `/subtitle_<index>.vtt`,
+  so the fix is swapped in **in place** and the uncorrected copy is **appended**. Insert or
+  reorder and players are silently handed the wrong subtitle — no error anywhere.
+- **A no-op fix must change nothing.** A subtitle that was already correctly timed comes back
+  from alass unchanged; relabelling it, adding a duplicate track, or (on DLNA) offering to
+  restart the film for a difference of zero are all wrong. See `_syncChangedTiming`.
+
+`tests/subtitle-coexistence.test.js` pins all of this; `tests/auto-sync-subtitle.test.js` covers
+the fix's own behaviour. Note also that `streamManager.subtitlePath` is **not** a reliable
+handle on the downloaded track — the extractor races it for that slot, which is why
+`resolveVlcSubtitle` (`server.js:648`) searches `subtitlePaths` instead.

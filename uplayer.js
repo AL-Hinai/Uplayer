@@ -113,6 +113,8 @@ class StreamManager extends EventEmitter {
     // Live byte-supply state for this stream. Fed by the TorrServer stats tick; the
     // playhead crosses in from whichever target is playing (see the registry fan-out).
     this.streamHealth = new StreamHealth();
+    this._healthTicker = null; // playback-phase stats poll; outlives the startup bar's tick
+    this._destroyed = false;   // stops background retry loops (subtitle auto-sync) at teardown
   }
 
   // Emit a log line to EventEmitter listeners AND write to stdout (CLI behaviour preserved)
@@ -254,6 +256,49 @@ class StreamManager extends EventEmitter {
     }
 
     return this._legacySrtToVtt(srtContent);
+  }
+
+  // The inverse, and it exists for exactly one consumer: the DLNA sidecar. A smart TV
+  // fetches the subtitle URL we name in the DIDL and parses it ITSELF — and Samsung's
+  // sec:CaptionInfoEx path (plus most LG firmwares) understands SRT, not WebVTT. So
+  // the same track has to be offerable in both dialects; everything internal to
+  // Uplayer stays VTT, since that is what <track> and Chromecast want.
+  convertVTTtoSRT(vttContent) {
+    if (!vttContent || vttContent.trim() === '') return '';
+    if (!vttContent.trim().startsWith('WEBVTT')) return vttContent; // already SRT
+
+    try {
+      const { parseSync, stringifySync } = require('subtitle');
+      const converted = stringifySync(parseSync(vttContent), { format: 'SRT' });
+      if (converted && converted.trim()) return converted;
+    } catch (err) {
+      // Same reason as above: a track still being extracted can be truncated mid-cue.
+    }
+
+    return this._legacyVttToSrt(vttContent);
+  }
+
+  // Tolerant inline VTT->SRT fallback. Drops WEBVTT/NOTE/STYLE blocks, renumbers the
+  // cues (SRT requires an index line, WebVTT does not) and strips WebVTT cue settings,
+  // which a TV's SRT parser reads as part of the timestamp and then rejects the cue.
+  _legacyVttToSrt(vttContent) {
+    const body = String(vttContent).replace(/^WEBVTT[^\n]*\r?\n/, '');
+    const out = [];
+    let n = 0;
+    for (const raw of body.split(/\r?\n\r?\n/)) {
+      const lines = raw.split(/\r?\n/).filter((l) => l.trim() !== '');
+      if (!lines.length || /^(NOTE|STYLE|REGION)\b/.test(lines[0])) continue;
+      const t = lines.findIndex((l) => l.includes('-->'));
+      if (t === -1) continue;
+      const text = lines.slice(t + 1).join('\n');
+      if (!text.trim()) continue;
+      n += 1;
+      const timing = lines[t]
+        .replace(/(\d{2}:\d{2}:\d{2})\.(\d{3})/g, '$1,$2')
+        .replace(/-->\s*([\d:,]+).*$/, '--> $1');
+      out.push(`${n}\n${timing}\n${text}`);
+    }
+    return out.length ? out.join('\n\n') + '\n' : '';
   }
 
   // Tolerant inline SRT->VTT fallback (kept permissive for truncated streaming files).
@@ -431,6 +476,18 @@ class StreamManager extends EventEmitter {
           log(`Video file: ${videoFile.name}`);
           log(`Size: ${(videoFile.length / 1024 / 1024 / 1024).toFixed(2)} GB`);
 
+          // ALWAYS kick TorrServer's native preload — the request its own player makes
+          // before playing. The engine downloads only while a reader is attached and
+          // drops the torrent after 30s without one, so a stream that sat unplayed
+          // froze at a fixed percent until the user opened it in TorrServer's player.
+          // This attaches an engine-side reader up front for every movie instead.
+          // Fire-and-forget: the call blocks until the preload target is reached, and
+          // the streaming path must never wait on it. UPLAYER_TS_PRELOAD=0 disables.
+          if (process.env.UPLAYER_TS_PRELOAD !== '0') {
+            this.tsClient.preload(hash, fileInfo.id, fileInfo.path)
+              .then((ok) => { if (ok) this._log('TorrServer preload target reached'); });
+          }
+
           // Stats shim so existing code that reads torrent.downloaded/downloadSpeed keeps working.
           const torrentLike = {
             downloaded: 0, downloadSpeed: 0, progress: 0,
@@ -528,6 +585,10 @@ class StreamManager extends EventEmitter {
               castUrl: fullVideoUrl, subtitleManifestUrl,
             });
 
+            // Downloaded subtitle timing gets checked against the audio in the
+            // background (embedded tracks never need this — see the method).
+            this._autoSyncExternalSubtitle();
+
             // Background cache warm-up (NON-blocking): drive TorrServer's download from the
             // start so a cushion is buffered ahead of when the user opens the player. This
             // does NOT gate the buttons — it just runs ahead, then stops once the target is
@@ -553,6 +614,28 @@ class StreamManager extends EventEmitter {
         }
       })();
     });
+  }
+
+  // Playback-phase stream_health poll. The startup stats tick in stream() dies at
+  // finish() with the download bar; this one takes over for the life of playback so
+  // the health panel keeps ticking — and so an engine death mid-movie shows up as
+  // health.engineDown instead of a percent frozen at its last value. (This method
+  // was once called but not defined: the TypeError left the STARTUP interval leaked
+  // as an accidental forever-poller, which is exactly the frozen-at-38% session.)
+  _startHealthTicker(hash) {
+    this._stopHealthTicker();
+    this._healthTicker = setInterval(async () => {
+      if (this.currentHash !== hash) { this._stopHealthTicker(); return; }
+      try {
+        const s = await this.tsClient.stats(hash);
+        this.emit('stream_health', this.streamHealth.report(s));
+      } catch (e) { /* a bad tick must not kill playback */ }
+    }, 1000);
+    if (typeof this._healthTicker.unref === 'function') this._healthTicker.unref();
+  }
+
+  _stopHealthTicker() {
+    if (this._healthTicker) { clearInterval(this._healthTicker); this._healthTicker = null; }
   }
 
   // TorrServer-backed file object exposing the same surface (createReadStream/length/name)
@@ -668,10 +751,280 @@ class StreamManager extends EventEmitter {
     const wav = path.join(this.tempDir, `alass_${Date.now()}.wav`);
     this._log('Extracting audio for subtitle sync…');
     if (!(await this._extractStreamAudio(wav, { maxSeconds: opts.maxSeconds }))) return { ok: false, reason: 'audio extraction failed' };
-    const out = path.join(this.tempDir, `synced_${Date.now()}.srt`);
-    const r = await tools.syncSubtitle(wav, subPath, out);
+
+    // TorrServer's /stream returns a clean EOF at the first uncached piece (the
+    // reason createTorrServerFile's reader reconnects), so on a cold cache ffmpeg
+    // can hand back a FRAGMENT of the requested window without erroring. Feeding
+    // alass a fragment is how a correctly-timed subtitle got "corrected" by almost
+    // four minutes — aligning 20 minutes of cues against 30 seconds of audio.
+    // A truncated extraction is a failed extraction, full stop.
+    const expected = Math.min(
+      opts.maxSeconds || Infinity,
+      (this.streamHealth && this.streamHealth.durationSec) || Infinity
+    );
+    if (Number.isFinite(expected)) {
+      let wavDur = null;
+      try { wavDur = await this._probeDurationSeconds(wav); } catch (e) { /* probe unavailable → trust ffmpeg */ }
+      if (wavDur != null && wavDur < expected * 0.9) {
+        try { fs.unlinkSync(wav); } catch (e) {}
+        return { ok: false, reason: `audio incomplete (${Math.round(wavDur)}s of ${Math.round(expected)}s cached) — retry once more is buffered` };
+      }
+    }
+
+    // This name is for humans reading a temp dir, and nothing else. It was chosen when
+    // VLC was believed to name an external track after its filename; VLC 3.0.23 does not
+    // — it calls every external track "Track N" regardless, which is why the label now
+    // reaches VLC through a Matroska track name instead (core/vlc-subtitle-label.js).
+    // The timestamp still guarantees uniqueness across repeated runs.
+    const out = path.join(this.tempDir, `Auto-synced timing ${Date.now()}.srt`);
+    // alass's VAD over a 20-minute WAV takes minutes on its own — the library
+    // default of 3 killed real runs mid-analysis ("error":"timeout" with a warm
+    // cache). 10 minutes is generous without letting a hang live forever.
+    const r = await tools.syncSubtitle(wav, subPath, out, { timeoutMs: 10 * 60 * 1000 });
     try { fs.unlinkSync(wav); } catch (e) {}
     return r;
+  }
+
+  // Cue START times of a subtitle file, in ms — null when unreadable.
+  _subtitleCueStarts(subPath) {
+    try {
+      const text = fs.readFileSync(subPath, 'utf8');
+      const re = /(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->/g;
+      const out = [];
+      let m;
+      while ((m = re.exec(text))) out.push(((+m[1]) * 3600 + (+m[2]) * 60 + (+m[3])) * 1000 + (+m[4]));
+      return out;
+    } catch (e) { return null; }
+  }
+
+  // Did alass actually MOVE anything? A subtitle that was already correctly timed comes
+  // back effectively identical, and treating that as a correction is not harmless: it
+  // relabels the track "(auto-synced)", adds a duplicate "Original timing" entry nobody
+  // needs, and — on a TV — offers to RESTART the film to apply a change of zero. Nothing
+  // changed, so nothing should change.
+  //
+  // 50ms is under one frame at 24fps, i.e. below what anyone can perceive. When the two
+  // files can't be compared (unreadable, different cue counts) the answer is "yes it
+  // changed": the fallback has to be the behaviour that keeps a real correction.
+  _syncChangedTiming(originalPath, syncedPath) {
+    const a = this._subtitleCueStarts(originalPath);
+    const b = this._subtitleCueStarts(syncedPath);
+    if (!a || !b || a.length === 0 || a.length !== b.length) return true;
+    for (let i = 0; i < a.length; i += 1) {
+      if (Math.abs(a[i] - b[i]) > 50) return true;
+    }
+    return false;
+  }
+
+  // The constant offset between two subtitle files in ms, or null when the correction is
+  // not a pure shift (frame-rate drift, per-scene retiming).
+  //
+  // This exists for VLC. VLC cannot swap a subtitle file it has already loaded, so a
+  // corrected one arrives as a SECOND track that the viewer has to go and select by hand
+  // — which is not a fix, it is homework. But when the whole correction is "every cue is
+  // 7 seconds late", which is what a subtitle cut for a different release usually is, the
+  // identical result comes from telling VLC to delay the track it ALREADY has. One track,
+  // its original name, correct timing, nothing to select.
+  //
+  // Deliberately tolerant, because the first version was not and it cost the whole point.
+  // Requiring every cue to move by an identical amount (max-min <= 100ms) only holds when
+  // alass aligns a subtitle against ANOTHER SUBTITLE. The auto-fix aligns against AUDIO,
+  // where alass matches speech segments and individual cues land a few tens or hundreds
+  // of ms apart even when the correction is, to a viewer, one constant offset. Those runs
+  // all failed the test, fell through to addsubtitle, and produced the second VLC track
+  // this is supposed to avoid.
+  //
+  // So: take the MEDIAN offset (immune to a handful of outliers) and accept it if the
+  // large majority of cues sit near it. A few stragglers are alass nudging one line; a
+  // broad spread is real drift, and then only the file will do.
+  _subtitleUniformShiftMs(originalPath, syncedPath, toleranceMs = 250, minAgreement = 0.9) {
+    const a = this._subtitleCueStarts(originalPath);
+    const b = this._subtitleCueStarts(syncedPath);
+    if (!a || !b || a.length === 0 || b.length === 0) return null;
+
+    // alass can drop or merge a cue, so the two lists are not always the same length.
+    // Pair each corrected cue with the closest original one rather than giving up — a
+    // length mismatch was another reason this returned null on real output.
+    const offsets = [];
+    if (a.length === b.length) {
+      for (let i = 0; i < a.length; i += 1) offsets.push(b[i] - a[i]);
+    } else {
+      for (let i = 0; i < b.length; i += 1) {
+        let best = null;
+        let bestAbs = Infinity;
+        for (let j = 0; j < a.length; j += 1) {
+          const d = b[i] - a[j];
+          const abs = Math.abs(d);
+          if (abs < bestAbs) { bestAbs = abs; best = d; }
+        }
+        if (best != null) offsets.push(best);
+      }
+    }
+    if (!offsets.length) return null;
+
+    const sorted = offsets.slice().sort((x, y) => x - y);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const agree = offsets.filter((d) => Math.abs(d - median) <= toleranceMs).length;
+    if (agree / offsets.length < minAgreement) return null; // genuine drift — send the file
+    return Math.round(median);
+  }
+
+  // Last cue timestamp of a subtitle file, in seconds — null when unparseable.
+  _subtitleSpanSeconds(subPath) {
+    try {
+      const text = fs.readFileSync(subPath, 'utf8');
+      let last = null, m;
+      const re = /(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/g;
+      while ((m = re.exec(text))) last = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+      return last;
+    } catch (e) { return null; }
+  }
+
+  // Wait until the byte supply covers the first `maxSeconds` of the file (the span
+  // syncSubtitle will extract), so alass always sees the full window. Returns early
+  // once covered; false on timeout or teardown — callers proceed and let the
+  // duration validation in syncSubtitle be the backstop.
+  async _waitForSyncWindow(maxSeconds, capMs = 10 * 60 * 1000) {
+    const started = Date.now();
+    while (Date.now() - started < capMs) {
+      if (this._destroyed) return false;
+      const h = this.streamHealth;
+      const size = h && h.sizeBytes;
+      // No health data YET is not the same as no health data ever. This runs the instant
+      // the stream server comes up, a beat before the health ticker's first poll — and
+      // returning false there meant the very first sync attempt skipped its wait entirely
+      // and extracted audio from the coldest possible cache, guaranteeing a fragment.
+      // Keep waiting; the caller's cap bounds this.
+      if (!size) { await new Promise((r) => setTimeout(r, 5000)); continue; }
+      const frac = h.durationSec ? Math.min(1, maxSeconds / h.durationSec) : null;
+      // 10% margin over the average-bitrate estimate; unknown duration falls back
+      // to "a generous slab from the front".
+      const needed = Math.min(size, frac != null ? size * frac * 1.1 : Math.min(size, 200 * 1024 * 1024));
+      if ((h.downloadedBytes || 0) >= needed) return true;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    return false;
+  }
+
+  // Alass availability, in a method so tests can stub it without touching require().
+  _isAlassAvailable() {
+    try { return require('./core/subtitle-tools').isAlassAvailable(); } catch (e) { return false; }
+  }
+
+  // AUTO-fix timing — for the DOWNLOADED subtitle only. An embedded/extracted
+  // track was muxed with this exact video, so its clock IS the video's clock;
+  // running alass on it would spend minutes of audio extraction fixing nothing.
+  // A downloaded subtitle was cut for whatever encode its uploader had, so it
+  // arrives suspect by definition.
+  //
+  // On success the external entry is swapped IN PLACE: the manifest (web + cast),
+  // VLC's --sub-file, and the cast burn-in path all read these fields, so every
+  // playback target gets the corrected timing without anyone selecting anything.
+  // The uncorrected file stays available as its own "Original timing" track in
+  // case alass guessed wrong. Runs as the shared background job, so the player's
+  // CC⇄ spinner reflects it. UPLAYER_AUTO_SYNC_SUBS=0 disables.
+  _autoSyncExternalSubtitle() {
+    if (process.env.UPLAYER_AUTO_SYNC_SUBS === '0') return;
+    if (!this._isAlassAvailable()) return;
+    const entry = this.subtitlePaths.find((s) => s && s.source === 'external' && s.path);
+    if (!entry) return;
+    if (this._subtitleJob && this._subtitleJob.running) return;
+    this._subtitleJob = { kind: 'sync', running: true, error: null, startedAt: Date.now() };
+    (async () => {
+      const original = entry.path;
+      const maxSeconds = 1200;
+      // This fires at stream START, the coldest possible moment for the cache —
+      // so wait for the byte supply to cover the sync window first, and treat an
+      // incomplete extraction as "not yet", not as a result. Syncing against a
+      // fragment is worse than not syncing: it once shifted a correct subtitle
+      // by four minutes and every player dutifully showed the damage.
+      // Junk guard: a "subtitle" spanning a small fraction of the runtime is a
+      // trailer/sample upload (they chart high on download counts), and aligning
+      // one against the movie's audio produces meaningless shifts. Leave it be —
+      // the user can see it's junk; a sync would only disguise that.
+      const mediaDur = this.streamHealth && this.streamHealth.durationSec;
+      const span = this._subtitleSpanSeconds(entry.path);
+      if (mediaDur && span != null && span < mediaDur * 0.4) {
+        this._log(`Subtitle covers only ${Math.round(span / 60)}min of a ${Math.round(mediaDur / 60)}min film (trailer/sample upload?) — auto-sync skipped.`);
+        this._subtitleJob = { kind: 'sync', running: false, error: 'subtitle looks like a trailer/sample — sync skipped', startedAt: this._subtitleJob.startedAt };
+        return;
+      }
+
+      // "audio incomplete" is not a failure — it means the bytes for the sync window
+      // haven't arrived yet. This fires at stream START, the coldest the cache ever is,
+      // on a file whose first 20 minutes can be a few hundred MB. Three attempts all
+      // burned inside the opening minutes and the fix then gave up FOREVER, leaving the
+      // player's CC⇄ button as the only way to get it — which is the whole thing this is
+      // supposed to do without being asked.
+      //
+      // So: keep retrying for as long as the stream is alive. The viewer is watching,
+      // which is precisely what pulls those bytes down, so waiting is what makes it
+      // succeed. Each pass already blocks on _waitForSyncWindow and a full audio
+      // extraction, so the loop is paced by real work and cannot spin. The cap only
+      // exists so a permanently stalled swarm doesn't retry until the process dies.
+      const MAX_ATTEMPTS = 12;
+      let r = { ok: false, reason: 'stream ended before sync could run' };
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS && !this._destroyed; attempt++) {
+        await this._waitForSyncWindow(maxSeconds);
+        if (this._destroyed) break;
+        r = await this.syncSubtitle(original, { maxSeconds });
+        if (r.ok || !/audio incomplete/.test(r.reason || '')) break;
+        this._log(`Subtitle auto-sync deferred (${r.reason}) — attempt ${attempt}/${MAX_ATTEMPTS}`);
+      }
+      // Already correctly timed. Keep the original as THE track, untouched and unlabelled,
+      // and throw the identical copy away — see _syncChangedTiming.
+      if (r.ok && !this._syncChangedTiming(original, r.output)) {
+        try { fs.unlinkSync(r.output); } catch (e) {}
+        this._log('Downloaded subtitle was already in sync with the audio — left as it is.');
+        this._subtitleJob = {
+          kind: 'sync', running: false, error: null, unchanged: true,
+          startedAt: this._subtitleJob.startedAt,
+          finishedAt: Date.now(),
+          durationMs: Date.now() - this._subtitleJob.startedAt,
+          shiftMs: 0,
+        };
+        return;
+      }
+      let shiftMs = null;
+      if (r.ok) {
+        shiftMs = this._subtitleUniformShiftMs(original, r.output);
+        entry.path = r.output;
+        // The size of the correction goes in the LABEL, because the label is what every
+        // player shows in its captions menu — so "which of these two is the fixed one,
+        // and by how much" is answerable without leaving the video.
+        const by = shiftMs == null ? '' : ` ${shiftMs > 0 ? '+' : '−'}${(Math.abs(shiftMs) / 1000).toFixed(1)}s`;
+        entry.label = (entry.label || 'External Subtitle') + ` (auto-synced${by})`;
+        if (this.subtitlePath === original) this.subtitlePath = r.output;
+        if (this._burnSubtitlePath === original) this._burnSubtitlePath = r.output;
+        this.subtitlePaths.push({
+          path: original, source: 'external', language: entry.language || 'en',
+          label: 'Original timing', codec: entry.codec || 'srt', complete: true,
+        });
+        // Already-running players: the web player refreshes through its manifest
+        // poll; VLC needs a push (the owning server relays this to its web
+        // interface). DLNA/Chromecast only pick the new file up on re-cast.
+        // shiftMs lets VLC fix the track it already has instead of gaining a second one
+        // — see _subtitleUniformShiftMs. null means "not a pure offset, send the file".
+        this.emit('subtitle_updated', { path: entry.path, label: entry.label, shiftMs });
+        const secs = ((Date.now() - this._subtitleJob.startedAt) / 1000).toFixed(0);
+        this._log(`Downloaded subtitle auto-synced against the audio (alass)`
+          + `${shiftMs == null ? '' : ` — moved ${(shiftMs / 1000).toFixed(1)}s`} in ${secs}s.`);
+      }
+      this._subtitleJob = {
+        kind: 'sync',
+        running: false,
+        error: r.ok ? null : (r.reason || 'sync failed'),
+        startedAt: this._subtitleJob.startedAt,
+        finishedAt: Date.now(),
+        // How long the whole thing took and how far it moved the subtitle. Both are
+        // reported to the UI beside "Subtitle loaded": a fix that silently happens is
+        // indistinguishable from one that never ran.
+        durationMs: Date.now() - this._subtitleJob.startedAt,
+        shiftMs,
+      };
+    })().catch((e) => {
+      this._subtitleJob = { kind: 'sync', running: false, error: e.message, startedAt: Date.now() };
+    });
   }
 
   // Probe video codec from the stream (HEVC/H.265 not supported in browsers - needs transcoding)
@@ -1279,6 +1632,9 @@ class StreamManager extends EventEmitter {
           return {
             index,
             url: `${this.streamBasePath || ''}/subtitle_${index}.vtt`,
+            // Same track, SRT dialect — for DLNA TVs, which parse the sidecar
+            // themselves and mostly don't accept WebVTT.
+            srtUrl: `${this.streamBasePath || ''}/subtitle_${index}.srt`,
             language: sub.language || 'en',
             label: sub.label || `Subtitle ${index + 1}`,
             source: sub.source || 'unknown',
@@ -1378,19 +1734,30 @@ class StreamManager extends EventEmitter {
             res.end(JSON.stringify({ ok: false, reason: 'no subtitle track at that index' }));
             return;
           }
+          // Embedded tracks were muxed with this exact video — their clock IS the
+          // video's clock. Refusing here keeps a misclick from burning minutes of
+          // audio extraction to "fix" timing that cannot be wrong.
+          if (src.source === 'embedded') {
+            res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify({ ok: false, reason: 'embedded subtitles are already in sync with the video — timing fix is for downloaded subtitles' }));
+            return;
+          }
           startSubtitleJob('sync', async () => {
             const r = await this.syncSubtitle(src.path, { maxSeconds: 1200 });
             if (r.ok) {
               // syncSubtitle returns a file but doesn't self-register — add it as a NEW
               // track so the player can offer both the original and the synced version.
+              const label = `${src.label || 'Subtitle'} (synced)`;
               this.subtitlePaths.push({
                 path: r.output,
                 source: 'alass',
                 language: src.language || 'en',
-                label: `${src.label || 'Subtitle'} (synced)`,
+                label,
                 codec: 'srt',
                 complete: true,
               });
+              // A running VLC gets the corrected track pushed too (see the owning server).
+              this.emit('subtitle_updated', { path: r.output, label });
             }
             return r;
           });
@@ -1398,10 +1765,14 @@ class StreamManager extends EventEmitter {
         return;
       }
 
-      // Serve subtitle files as WebVTT
-      const subtitleMatch = req.url.match(/^\/subtitle_(\d+)\.vtt(\?.*)?$/);
+      // Serve subtitle files. WebVTT is the house format (browsers + Chromecast); the
+      // .srt twin exists for DLNA TVs, which parse the sidecar themselves and largely
+      // don't speak WebVTT. Same index, same file on disk — so an auto-synced swap
+      // (which replaces the path at the SAME index) reaches both without re-indexing.
+      const subtitleMatch = req.url.match(/^\/subtitle_(\d+)\.(vtt|srt)(\?.*)?$/);
       if (subtitleMatch) {
         const subtitleIndex = parseInt(subtitleMatch[1]);
+        const wantSrt = subtitleMatch[2] === 'srt';
         if (subtitleIndex >= 0 && subtitleIndex < this.subtitlePaths.length) {
           const subPath = this.subtitlePaths[subtitleIndex].path;
           const emptyVtt = 'WEBVTT\n\n';
@@ -1432,10 +1803,16 @@ class StreamManager extends EventEmitter {
           if (isSRT) {
             subtitleContent = this.convertSRTtoVTT(subtitleContent);
           }
+          if (wantSrt) {
+            subtitleContent = this.convertVTTtoSRT(subtitleContent);
+          }
 
           const vttBuffer = Buffer.from(subtitleContent, 'utf8');
           res.writeHead(200, {
-            'Content-Type': 'text/vtt; charset=utf-8',
+            // text/srt is what the DLNA DIDL declares for this file (core/dlna-caster
+            // subInfo). Serving a different type than we advertised is a reason some
+            // renderers drop the sidecar, so the two are kept identical on purpose.
+            'Content-Type': wantSrt ? 'text/srt; charset=utf-8' : 'text/vtt; charset=utf-8',
             'Content-Length': vttBuffer.length,
             'Accept-Ranges': 'none',
             'Access-Control-Allow-Origin': '*',
@@ -1820,6 +2197,7 @@ class StreamManager extends EventEmitter {
   }
 
   stop() {
+    this._stopHealthTicker();
     // Unregister from the shared hub (this closes the shared server only if no other
     // concurrent stream is still registered) instead of closing a per-stream server.
     if (this._hubStreamId) {
@@ -1860,6 +2238,8 @@ class StreamManager extends EventEmitter {
   }
 
   async destroy() {
+    this._destroyed = true;
+    this._stopHealthTicker();
     // Stop periodic cleanup
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
@@ -2498,7 +2878,8 @@ async function main() {
                   selectedSubtitle.fileId || selectedSubtitle.id,
                   subtitlePath,
                   selectedSubtitle.source,
-                  selectedSubtitle.downloadUrl || selectedSubtitle.attributes?.addic7ed_url || selectedSubtitle.attributes?.subsplease_url
+                  selectedSubtitle.downloadUrl || selectedSubtitle.attributes?.addic7ed_url || selectedSubtitle.attributes?.subsplease_url,
+                  selectedSubtitle.language || selectedSubtitle.attributes?.language || null
                 );
                 
                 if (downloaded) {

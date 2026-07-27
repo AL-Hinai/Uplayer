@@ -1895,82 +1895,363 @@ img { display: block; max-width: 100%; }
   gap: 0.5rem;
 }
 
-/* Episode selector grid */
-.episode-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
-  gap: 0.5rem;
-  margin-top: 0.75rem;
-  max-height: 280px;
-  overflow-y: auto;
-}
-
-.ep-btn {
-  aspect-ratio: 1;
-  border-radius: 8px;
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 0.8rem;
-  font-weight: 600;
+/* Panel head: title on the left, the "what do I do here" hint on the right.
+   The hint used to sit in a .wizard-nav strip *below* the episode list, which
+   put the instruction after the thing it described — and off-screen whenever
+   the list scrolled. */
+.wizard-panel-head {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 2px;
-  transition: all var(--transition);
-  cursor: pointer;
-  padding: 4px;
-}
-
-.ep-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(108,99,255,0.08); }
-.ep-btn.selected { background: var(--accent); border-color: var(--accent); color: #fff; }
-.ep-btn .ep-btn-num { font-size: 0.9rem; font-weight: 700; }
-.ep-btn .ep-btn-label { font-size: 0.6rem; opacity: 0.7; text-align: center; overflow: hidden; max-width: 100%; white-space: nowrap; text-overflow: ellipsis; }
-
-.season-tabs {
-  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   flex-wrap: wrap;
-  gap: 0.4rem;
+  gap: 0.5rem;
   margin-bottom: 1rem;
 }
+.wizard-panel-head .wizard-panel-title { margin-bottom: 0; }
+.wizard-panel-hint { font-size: 0.78rem; color: var(--text-muted); }
 
-.season-tab {
-  padding: 0.35rem 0.85rem;
-  border-radius: 6px;
-  font-size: 0.8rem;
-  font-weight: 600;
-  background: var(--bg-3);
+/* Season control + episode filter on one row. Which season control shows is a
+   media query away: the pill strip on a pointer-and-width desktop, a native
+   <select> on a phone. Both are always in the DOM. */
+.season-picker {
+  display: flex;
+  /* Top-aligned, not centred: the strip's box also contains its scrollbar
+     gutter, so centring against it floats the toggle a few pixels below the
+     pills. Both items start at the same top and share a height instead. */
+  align-items: flex-start;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.season-select-wrap { display: none; }
+
+/* "Hide watched" filter — a toggle, not an action, so it reads as pressed
+   rather than firing and reverting. */
+.ep-filter-toggle {
+  flex: 0 0 auto;
+  min-height: 34px; /* == a .season-tab, so the two line up — see .season-picker */
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
   border: 1px solid var(--border);
+  background: var(--bg-3);
   color: var(--text-muted);
-  cursor: pointer;
-  transition: all var(--transition);
+  font-size: 0.75rem;
+  font-weight: 600;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
 }
-
-.season-tab:hover { border-color: var(--accent); color: var(--accent); }
-.season-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-
-/* Already-watched states for the season/episode pickers — earlier seasons
-   and episodes are implicitly watched once the user marks any later one. */
-.season-tab-watched { opacity: 0.55; }
-.season-tab-watched.active { opacity: 1; }
-.season-tab-partial { border-color: var(--accent); }
-
-.ep-btn-watched {
-  background: rgba(58, 170, 58, 0.08);
-  border-color: rgba(58, 170, 58, 0.4);
-  color: var(--text-muted);
+.ep-filter-toggle:hover { border-color: var(--accent); color: var(--text); }
+.ep-filter-label-short { display: none; }
+.ep-filter-box {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid var(--text-dim);
+  font-size: 0.6rem;
+  line-height: 1;
+  color: transparent;
 }
-.ep-btn-watched:hover {
-  background: rgba(58, 170, 58, 0.18);
-  border-color: rgba(58, 170, 58, 0.7);
+.ep-filter-toggle.active {
+  background: rgba(108,99,255,0.16);
+  border-color: var(--accent);
+  color: var(--accent-2);
 }
-.ep-btn-watched.selected {
+.ep-filter-toggle.active .ep-filter-box {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
 }
-.ep-btn-check { font-size: 0.7em; }
+
+/* ─── Season strip ──────────────────────────────────────────────────────────
+   One scrollable row, never a wrapping block: a 12-season show would otherwise
+   push the episode list a screen and a half down. Tabs are fixed-basis so the
+   row scrolls instead of squeezing them into unreadable slivers. */
+.season-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.5rem;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scroll-snap-type: x proximity;
+  /* Room for the scrollbar. The toggle beside it carries the same bottom
+     margin so both boxes centre on the same line. */
+  padding-bottom: 0.5rem;
+  scrollbar-width: thin;
+}
+
+.season-tab {
+  flex: 0 0 auto;
+  scroll-snap-align: start;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.2;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+
+.season-tab:hover { border-color: var(--accent); color: var(--text); }
+.season-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: 0 2px 12px rgba(108,99,255,0.3);
+}
+.season-tab-name { font-weight: 700; }
+.season-tab-count { font-weight: 500; opacity: 0.65; font-size: 0.75rem; }
+
+.season-tab-flag {
+  font-size: 0.65rem;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0.18rem 0.35rem;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.08);
+}
+.season-tab-flag.is-watched { color: var(--green); }
+.season-tab-flag.is-partial { color: var(--accent-2); }
+.season-tab-flag.is-upcoming { color: var(--gold); }
+.season-tab.active .season-tab-flag { background: rgba(255,255,255,0.2); color: #fff; }
+
+/* Already-watched states for the season/episode pickers — earlier seasons
+   and episodes are implicitly watched once the user marks any later one. */
+.season-tab-watched { opacity: 0.6; }
+.season-tab-watched.active { opacity: 1; }
+.season-tab-partial { border-color: rgba(108,99,255,0.5); }
+.season-tab-upcoming { border-style: dashed; }
+.season-tab-upcoming.active { border-style: solid; }
+
+/* Phone season control (hidden until the media query turns it on). A real
+   <select>, so the OS renders its own full-height picker — that is the whole
+   point: it beats any custom sheet on a 375px screen, and it reaches season 38
+   in one gesture. */
+.season-select {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 2.1rem 0 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-3);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.88rem;
+  font-weight: 700;
+  /* Renders the native option list dark instead of system-default white. */
+  color-scheme: dark;
+  text-overflow: ellipsis;
+}
+.season-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Chevron on the wrapper, not the select — `appearance: none` removes the
+   native arrow and a background-image would scroll with the text on some
+   engines. */
+.season-select-wrap::after {
+  content: '';
+  position: absolute;
+  right: 0.95rem;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin-top: -6px;
+  border-right: 2px solid var(--text-muted);
+  border-bottom: 2px solid var(--text-muted);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+/* Season summary strip — release counts and the next air date, so the user
+   knows what exists before scanning the cards. */
+.season-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding: 0.6rem 0.85rem;
+  margin-bottom: 0.85rem;
+  border-radius: var(--radius);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.season-summary[hidden] { display: none; }
+.season-summary-main { font-weight: 600; color: var(--text); }
+.season-summary-sep { margin: 0 0.4rem; opacity: 0.4; }
+.season-summary-chips { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.season-summary-chip {
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 0.72rem;
+}
+.season-summary-chip.is-released { background: rgba(60,186,122,0.14); color: var(--green); }
+.season-summary-chip.is-upcoming { background: rgba(245,200,66,0.14); color: var(--gold); }
+.season-summary-chip.is-watched { background: rgba(255,255,255,0.07); color: var(--text-muted); }
+.season-summary-chip.is-hidden-count { background: rgba(108,99,255,0.16); color: var(--accent-2); }
+.season-summary-next { margin-left: auto; }
+.season-summary-next strong { color: var(--text); }
+
+/* ─── Episode cards ─────────────────────────────────────────────────────────
+   Was a grid of 56px squares showing a number and 12 clipped characters of
+   title. TMDB gives an air date, runtime and rating per episode, and none of
+   that fits in a square — so the card is a row that grows to two columns when
+   there is width for it, and the grid auto-fills instead of fixing a count. */
+.episode-grid {
+  display: grid;
+  /* `min(280px, 100%)` not a bare 280px: auto-fill's track floor is not
+     clamped to the container, so on anything narrower than 280px the row
+     overflowed the panel and the whole grid gained a horizontal scrollbar.
+     The min() makes the single-column fallback width-driven, so it holds at
+     any container size without waiting for a viewport breakpoint. */
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+  gap: 0.6rem;
+  max-height: min(440px, 55vh);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 0.25rem;
+}
+
+.ep-card {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  /* Grid items default to min-width:auto, which lets the longest episode
+     title set the card's floor and punch it out of the track. */
+  min-width: 0;
+  min-height: 60px;
+  padding: 0.6rem 0.75rem;
+  text-align: left;
+  border-radius: var(--radius);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), transform var(--transition);
+}
+
+.ep-card:hover {
+  border-color: var(--accent);
+  background: rgba(108,99,255,0.08);
+  transform: translateY(-1px);
+}
+.ep-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.ep-card-num {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  min-width: 34px;
+  height: 34px;
+  padding: 0 0.35rem;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.06);
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.ep-card-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 0.2rem; }
+.ep-card-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.ep-card-meta {
+  display: flex;
+  align-items: center;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.ep-card-sep { margin: 0 0.4rem; opacity: 0.4; }
+.ep-card-rating { color: var(--gold); }
+
+.ep-card-flag {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 0.22rem 0.5rem;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.06);
+  white-space: nowrap;
+}
+.ep-card-flag.is-watched { color: var(--green); background: rgba(60,186,122,0.14); }
+.ep-card-flag.is-upcoming { color: var(--gold); background: rgba(245,200,66,0.14); }
+.ep-card-flag.is-today { color: var(--cyan); background: rgba(34,211,238,0.14); }
+.ep-card-flag.is-next { color: #fff; background: var(--accent); }
+
+.ep-card.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.ep-card.selected .ep-card-name,
+.ep-card.selected .ep-card-meta,
+.ep-card.selected .ep-card-rating { color: #fff; }
+.ep-card.selected .ep-card-num { background: rgba(255,255,255,0.22); color: #fff; }
+.ep-card.selected .ep-card-flag { background: rgba(255,255,255,0.2); color: #fff; }
+
+/* Where the viewer left off. An accent ring rather than a fill — .selected
+   already owns the filled look, and both can be true at once. */
+.ep-card.is-next {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.ep-card.is-next .ep-card-num { background: rgba(108,99,255,0.28); }
+
+.ep-card.is-watched { border-color: rgba(60,186,122,0.3); }
+.ep-card.is-watched .ep-card-name { color: var(--text-muted); }
+.ep-card.is-watched:hover { border-color: rgba(60,186,122,0.6); background: rgba(60,186,122,0.08); }
+.ep-card.is-watched.selected { border-color: var(--accent); }
+.ep-card.is-today { border-color: rgba(34,211,238,0.35); }
+
+/* Scheduled but not out yet — no torrent can exist, so the card is inert
+   rather than a click that leads to an empty search. */
+.ep-card.is-upcoming {
+  cursor: not-allowed;
+  opacity: 0.55;
+  border-style: dashed;
+}
+.ep-card.is-upcoming:hover {
+  transform: none;
+  background: var(--bg-3);
+  border-color: var(--border);
+}
+
+/* Nothing left to show once "Hide watched" filters the season away. Spans the
+   whole grid so it centres against the panel, not against one track. */
+.episode-grid-empty {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1.75rem 1rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
 
 /* Torrent results table */
 .torrent-list {
@@ -2103,6 +2384,56 @@ img { display: block; max-width: 100%; }
 
   /* Bigger tap targets for the wizard's primary actions. */
   .wizard-nav .btn { min-height: 40px; }
+
+  /* ── Season & episode picker, phone layout ────────────────────────────────
+     The header block used to eat 235px before a single episode was visible:
+     a title row, a hint-and-toggle row, and a 48px season strip that was
+     5,400px wide for a 38-season show. Now it is one 44px row — a native
+     season picker and the filter beside it — and the episode list starts
+     roughly a hundred pixels higher. */
+  .wizard-panel { padding: 1.1rem 0.9rem; }
+  .wizard-panel-head { margin-bottom: 0.8rem; }
+
+  /* The pill strip is a desktop control: on a phone it is a horizontal scroll
+     through dozens of seasons to find one. The <select> replaces it outright. */
+  .season-tabs { display: none; }
+  .season-select-wrap { display: block; position: relative; flex: 1 1 auto; min-width: 0; }
+  .season-picker { align-items: stretch; gap: 0.5rem; margin-bottom: 0.7rem; }
+
+  /* No strip to align against now, so the toggle just matches the select. */
+  .ep-filter-toggle {
+    min-height: 44px;
+    border-radius: 999px;
+    padding: 0 0.75rem;
+  }
+  /* "Hide watched" costs ~124px of a ~312px row. The checkbox already carries
+     the on/off state and the title/aria-label carry the meaning, so the label
+     shortens rather than squeezing the season name into nothing. */
+  .ep-filter-label { display: none; }
+  .ep-filter-label-short { display: inline; }
+
+  .season-summary { font-size: 0.74rem; padding: 0.55rem 0.7rem; }
+  /* The picker directly above already reads "Season 4 · 22 ep"; repeating it
+     here is what pushed the summary onto a second line. Keep the counts. */
+  .season-summary-main { display: none; }
+  .season-summary-next { margin-left: 0; flex: 1 0 100%; }
+
+  .episode-grid { max-height: 52vh; }
+  .ep-card { min-height: 56px; padding: 0.55rem 0.65rem; gap: 0.6rem; }
+  .ep-card:hover { transform: none; }
+
+  /* One ellipsised line cuts an episode title right where it starts telling
+     two episodes apart. Clamp at two lines instead — same trade the torrent
+     rows above make, and for the same reason. */
+  .ep-card-name {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow-wrap: anywhere;
+  }
+  .ep-card-num { min-width: 30px; height: 30px; font-size: 0.82rem; }
+  .ep-card-flag { font-size: 0.62rem; padding: 0.2rem 0.42rem; }
 }
 
 /* Subtitle list */
@@ -2792,7 +3123,7 @@ img { display: block; max-width: 100%; }
 
 /* ─── Active streams list (concurrent streams) ─────────────────────────────── */
 .active-streams {
-  margin: 1rem auto 0;
+  margin: 1.5rem auto 2rem;
   max-width: 900px;
   padding: 0.85rem 1rem;
   background: var(--bg-2);
@@ -2836,10 +3167,23 @@ img { display: block; max-width: 100%; }
   color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.as-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
+.as-actions { display: flex; gap: 0.4rem; flex-shrink: 0; align-items: center; }
+.active-streams-spacer { flex: 1; }
+.as-main { flex: 1; min-width: 0; }
+.as-main[role="button"] { cursor: pointer; }
+.as-main[role="button"]:hover .as-title,
+.as-main[role="button"]:focus-visible .as-title { color: var(--accent); }
+.as-sub {
+  font-size: 0.74rem;
+  color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.as-dot.ended { background: var(--text-dim); animation: none; }
 @media (max-width: 560px) {
   .active-stream-row { flex-wrap: wrap; }
-  .as-title { flex-basis: 100%; }
+  .active-streams-head { flex-wrap: wrap; }
+  .as-main { flex-basis: 100%; }
+  .as-actions { margin-left: 1.1rem; }
 }
 
 /* --- Continue Watching shelf ---------------------------------------------- */

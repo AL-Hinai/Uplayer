@@ -113,7 +113,7 @@
   // first one on by default. Subtitles are extracted in two passes (a quick "first
   // minutes" file, then the full one), so when a track flips to complete we reload it
   // once to pick up the rest of the cues — without duplicating it on screen.
-  var subTracks = {}; // url -> { el, complete }
+  var subTracks = {}; // url -> { el, sig }
   function showingTrack() {
     var t = player.textTracks();
     for (var i = 0; i < t.length; i++) {
@@ -121,12 +121,26 @@
     }
     return null;
   }
+  // A track is identified by its URL, but its CONTENT can change underneath that URL:
+  // the timing auto-fix swaps the corrected file in at the SAME index, so
+  // /subtitle_0.vtt silently becomes a different file. Keying the "already loaded"
+  // check on the URL alone meant the player bailed out and kept showing the
+  // uncorrected cues forever, while the "Original timing" track the fix appends showed
+  // up as a NEW entry — so it looked like the fix had created a second track instead of
+  // updating the first. The signature is what actually moves: the label gains
+  // "(auto-synced)", and `complete` flips when extraction finishes.
+  function subSig(s) { return (s.label || s.name || "") + "|" + (s.complete ? 1 : 0); }
   function syncSub(s) {
     if (!s || !s.url) return;
     var cur = subTracks[s.url];
-    if (cur && cur.complete) return;       // already loaded the final version
-    if (cur && !s.complete) return;        // early version already loaded; wait for complete
-    var wasShowing = true;
+    if (cur && cur.sig === subSig(s)) return;  // same track, same version — nothing to do
+    // Defaulting this to TRUE turned on every newly discovered track, not just the
+    // first: a file with three embedded tracks showed three at once, and the "Original
+    // timing" copy the auto-fix appends lit up alongside the corrected one — so the
+    // viewer got the fixed and unfixed subtitle stacked on screen together. A track
+    // being RELOADED keeps whatever state it had; a genuinely NEW one only comes on if
+    // nothing is on yet, which is the "turn the first one on by default" rule.
+    var wasShowing = false;
     if (cur && cur.el) {
       try { if (cur.el.track) wasShowing = (cur.el.track.mode === "showing"); } catch (e) {}
       try { player.removeRemoteTextTrack(cur.el); } catch (e) {}
@@ -135,7 +149,7 @@
     try {
       var el = player.addRemoteTextTrack({ kind: "subtitles", src: src, srclang: s.language || "en", label: s.label || s.name || "Subtitle" }, false);
       if (el && el.track && (wasShowing || !showingTrack())) el.track.mode = "showing";
-      subTracks[s.url] = { el: el, complete: !!s.complete };
+      subTracks[s.url] = { el: el, sig: subSig(s) };
     } catch (e) {}
   }
   function pollSubs() {
@@ -158,7 +172,6 @@
   var toolButtons = {}; // kind -> videojs button component
   var manifestBase = String(cfg.subtitleManifestUrl || "").replace(/\/api\/subtitles$/, "");
   var lastSubCount = 0;
-  var latestSubs = []; // most recent manifest track list, for the sync button's click handler
 
   function postTool(kind, payload) {
     return fetch(manifestBase + "/api/subtitles/" + kind, {
@@ -166,15 +179,6 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload || {}),
     }).then(function (r) { return r.json(); }).catch(function () { return { ok: false }; });
-  }
-
-  function showingTrackIndex(subs) {
-    var tr = showingTrack();
-    if (!tr) return -1;
-    for (var i = 0; i < subs.length; i++) {
-      if (subs[i].label && tr.label === subs[i].label) return subs[i].index;
-    }
-    return subs.length ? subs[0].index : -1;
   }
 
   function makeToolButton(kind, text, title, onClick) {
@@ -198,18 +202,15 @@
         setButtonBusy("generate", true);
       });
     }
-    if (tools && tools.alass && !toolButtons.sync) {
-      toolButtons.sync = makeToolButton("sync", "CC⇄", "Fix subtitle timing against the audio (alass)", function () {
-        var idx = showingTrackIndex(latestSubs);
-        if (idx < 0) return;
-        postTool("sync", { index: idx });
-        setButtonBusy("sync", true);
-      });
-    }
-    latestSubs = subs;
+    // There is deliberately NO timing-fix button. The fix runs by itself on every
+    // downloaded subtitle from the moment the stream starts
+    // (StreamManager._autoSyncExternalSubtitle), and the corrected file replaces the
+    // original at the SAME track index — so syncSub swaps it in and keeps it selected
+    // if it was the track being watched. A button here only ever meant "do the thing
+    // that was already happening", and its presence implied the fix was a step the
+    // viewer was supposed to take.
     var running = job && job.running;
     setButtonBusy("generate", running && job.kind === "generate");
-    setButtonBusy("sync", running && job.kind === "sync");
     // A finished job that produced a new track: auto-show it once.
     if (subs.length > lastSubCount) {
       var newest = subs[subs.length - 1];

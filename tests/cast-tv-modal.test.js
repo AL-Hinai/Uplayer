@@ -201,18 +201,35 @@ function testBuildCastMediaDraftDirectPlayUsesMp4ContentType() {
   assert.strictEqual(draft.streamType, 'BUFFERED');
 }
 
-function testBuildCastMediaDraftOmitsTracksWhenNoSubtitlesSelected() {
+// CONTRACT CHANGE (was: testBuildCastMediaDraftOmitsTracksWhenNoSubtitlesSelected).
+//
+// Selecting no subtitle used to withhold the tracks from the receiver entirely. That made
+// the choice unrecoverable: the Chromecast's own subtitle menu came up empty, so the only
+// way to turn subtitles on was to stop and re-cast. Chromecast takes a real track LIST, so
+// there is no reason to withhold them — every ready track is sent and the selection only
+// decides which one starts ACTIVE. "Off" now means off, not absent.
+//
+// This is the one target that can do it: DLNA is measured to fetch only the first of
+// several sidecars, which is why it still has to choose up front (tests/dlna-subtitle).
+function testBuildCastMediaDraftSendsEveryTrackAndStartsThemOffWhenNoneSelected() {
   const { buildCastMediaDraft } = loadCastHelpers();
-  const draft = buildCastMediaDraft(
-    { castUrl: 'http://192.168.1.50:8000/video.mp4' },
-    [
-      { trackId: 1, trackContentId: 'http://192.168.1.50:8000/subtitle_0.vtt', name: 'English', ready: true },
-    ],
-    '',
-    'Demo'
-  );
-  assert.strictEqual(draft.tracks.length, 0);
-  assert.deepStrictEqual(Array.from(draft.activeTrackIds), []);
+  const options = [
+    { trackId: 1, trackContentId: 'http://192.168.1.50:8000/subtitle_0.vtt', name: 'English', ready: true },
+    { trackId: 2, trackContentId: 'http://192.168.1.50:8000/subtitle_1.vtt', name: 'Arabic', ready: true },
+    { trackId: 3, trackContentId: 'http://192.168.1.50:8000/subtitle_2.vtt', name: 'French', ready: false },
+  ];
+
+  const off = buildCastMediaDraft({ castUrl: 'http://192.168.1.50:8000/video.mp4' }, options, '', 'Demo');
+  assert.strictEqual(off.tracks.length, 2, 'both READY tracks are still sent, so the TV menu is populated');
+  assert.deepStrictEqual(Array.from(off.activeTrackIds), [], 'but none starts showing');
+
+  const picked = buildCastMediaDraft({ castUrl: 'http://192.168.1.50:8000/video.mp4' }, options, '2', 'Demo');
+  assert.strictEqual(picked.tracks.length, 2, 'same track list either way');
+  assert.deepStrictEqual(Array.from(picked.activeTrackIds), [2], 'the selection only chooses what starts on');
+
+  // A track with no content yet must never be advertised — the receiver would fetch an
+  // empty VTT and cache it.
+  assert.ok(!picked.tracks.some((t) => t.name === 'French'), 'not-ready tracks stay out until they have cues');
 }
 
 function testRenderCastTvModalUsesPlayerUrlForTvLinkOnly() {
@@ -435,7 +452,7 @@ async function main() {
   testBuildCastMediaDraftUsesHlsContentTypeWhenStrategyIsRemux();
   testBuildCastMediaDraftKeepsBufferedForFullTranscode();
   testBuildCastMediaDraftDirectPlayUsesMp4ContentType();
-  testBuildCastMediaDraftOmitsTracksWhenNoSubtitlesSelected();
+  testBuildCastMediaDraftSendsEveryTrackAndStartsThemOffWhenNoneSelected();
   testRenderCastTvModalUsesPlayerUrlForTvLinkOnly();
   testRenderCastTvModalShowsSubtitleChooserAndNoSubtitleWarning();
   await testStartChromecastRequestsSessionBeforeSubtitleRefresh();

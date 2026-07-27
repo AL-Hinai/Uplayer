@@ -30,7 +30,40 @@ function nextEpisodeTarget(wizard) {
   return null; // already at the last available episode
 }
 
+// Where a returning viewer should be dropped: the episode they have NOT seen,
+// not the one they last watched. The season/episode picker used to open on
+// season 1 every time, so anyone twenty seasons deep had to scroll the season
+// strip back to where they were on every single visit.
+//
+// It is deliberately the same walk as nextEpisodeTarget — "resume" and "next
+// episode" are the same question asked from different places, and if they ever
+// disagreed the picker would open on a season the Next Episode button refuses
+// to go to. Two extra rules that only matter here:
+//   - No history at all → the first season's E1. A show nobody has started
+//     opens where it starts.
+//   - Finished the whole show → stay on the last watched episode rather than
+//     returning null. The picker must always land somewhere.
+//
+// PURE. Returns { s, e }, or null only when there are no seasons to pick from.
+function resumeTarget(seasons, lastSeason, lastEpisode) {
+  const list = (seasons || []).slice().sort((a, b) => a.season_number - b.season_number);
+  if (!list.length) return null;
+
+  const lastS = Number(lastSeason) || 0;
+  const lastE = Number(lastEpisode) || 0;
+  if (!lastS || !lastE) return { s: list[0].season_number, e: 1 };
+
+  // History can name a season that is no longer in the list (a TMDB re-split,
+  // or a specials-only entry we filter out). Fall back to the start.
+  if (!list.some((s) => s.season_number === lastS)) return { s: list[0].season_number, e: 1 };
+
+  const next = nextEpisodeTarget({
+    type: 'tv', selectedSeason: lastS, selectedEpisode: lastE, seasons: list,
+  });
+  return next || { s: lastS, e: lastE };
+}
+
 // Node require() for the test; harmless no-op in the browser (no `module`).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { nextEpisodeTarget };
+  module.exports = { nextEpisodeTarget, resumeTarget };
 }

@@ -185,13 +185,18 @@ function resolveOpenableSession(sessionId) {
 // its own. Purely additive: if VLC ignores the flags (or is already running, so the URL
 // is handed to the existing instance instead) the poller just never connects and VLC
 // plays exactly as before.
-function buildVlcLaunchAttempts(url, http = null) {
+function buildVlcLaunchAttempts(url, http = null, subtitlePath = null) {
   const target = String(url || '');
   const attempts = [];
   const httpArgs = http
     ? ['--extraintf=http', '--http-host=127.0.0.1', `--http-port=${http.port}`, `--http-password=${http.password}`]
     : [];
-  const withHttp = (t) => [t, ...httpArgs];
+  // The downloaded external subtitle. VLC picks up EMBEDDED tracks on its own
+  // (it plays the original MKV from :8090), but a downloaded .srt lives in a temp
+  // dir VLC has never heard of — without this flag the web/cast players showed
+  // the chosen subtitle and VLC silently didn't.
+  const subArgs = subtitlePath ? [`--sub-file=${subtitlePath}`] : [];
+  const withHttp = (t) => [t, ...httpArgs, ...subArgs];
 
   // VLC on Windows sometimes fails with localhost - try network IP first
   let networkTarget = target;
@@ -234,7 +239,7 @@ function buildVlcLaunchAttempts(url, http = null) {
   } else if (process.platform === 'darwin') {
     attempts.push(
       // `open` forwards app flags only after --args.
-      { command: 'open', args: ['-a', 'VLC', target, ...(httpArgs.length ? ['--args', ...httpArgs] : [])] },
+      { command: 'open', args: ['-a', 'VLC', target, ...((httpArgs.length || subArgs.length) ? ['--args', ...httpArgs, ...subArgs] : [])] },
       { command: '/Applications/VLC.app/Contents/MacOS/VLC', args: withHttp(target) },
       { command: 'vlc', args: withHttp(target) }
     );
@@ -302,9 +307,9 @@ function spawnDetached(command, args) {
   });
 }
 
-async function openStreamInVlc(url, http = null) {
+async function openStreamInVlc(url, http = null, subtitlePath = null) {
   let lastError = null;
-  for (const attempt of buildVlcLaunchAttempts(url, http)) {
+  for (const attempt of buildVlcLaunchAttempts(url, http, subtitlePath)) {
     try {
       await spawnDetached(attempt.command, attempt.args);
       return;
@@ -397,6 +402,21 @@ function validateStreamStartBody(body) {
       const episode = Number(body.playback.episode);
       if (Number.isFinite(season)) playback.season = season;
       if (Number.isFinite(episode)) playback.episode = episode;
+      // Which SUBTITLE was chosen, so Resume can fetch the same one again. Resume goes
+      // through the auto path, which skips the subtitle step entirely — without this a
+      // resumed film comes back with no subtitle at all, and on a release with no
+      // embedded tracks (a YIFY rip, say) that means none whatsoever. Enough to re-run
+      // the download and nothing more: the FILE is temporary, the choice is not.
+      const sub = body.playback.subtitle;
+      if (sub && typeof sub === 'object' && (sub.id || sub.fileId || sub.downloadUrl)) {
+        playback.subtitle = {
+          source: sub.source ? String(sub.source) : null,
+          id: sub.id != null ? String(sub.id) : null,
+          fileId: sub.fileId != null ? String(sub.fileId) : null,
+          downloadUrl: sub.downloadUrl ? String(sub.downloadUrl) : null,
+          language: sub.language ? String(sub.language) : null,
+        };
+      }
     }
   }
 
@@ -587,12 +607,16 @@ function startVlcProgress(session, { port, password }) {
   const target = getPlaybackTarget(session, 'vlc', 'vlc');
   let misses = 0;
   let everAnswered = false;
+  // Kept on the session so a finished subtitle auto-sync can PUSH the corrected
+  // file into this running VLC (addsubtitle) instead of waiting for a relaunch.
+  session.vlcHttp = { port, password };
 
   // Whether we ever reached the interface is the only signal we have to tell "the user
   // closed VLC" apart from "this VLC never had an interface to begin with" (flags went
   // to an already-running instance, or it's too old). The process itself is spawned
   // detached with stdio ignored, so its exit is invisible to us.
   const giveUpNow = () => {
+    session.vlcHttp = null;
     target.gone(everAnswered ? 'closed' : 'unavailable');
     stopPlaybackTarget(session, 'vlc');
   };
@@ -634,6 +658,153 @@ function startVlcProgress(session, { port, password }) {
 
   setPlaybackTimer(session, 'vlc', setInterval(poll, 15000));
   return poll; // returned so tests can drive a scrape without waiting out the interval
+}
+
+// The one subtitle file worth handing VLC at launch: a DOWNLOADED (external)
+// track, and nothing else. `streamManager.subtitlePath` is NOT that — the
+// embedded-subtitle extractor claims it when no download exists, pointing it at
+// a partial, progressively-rewritten VTT. Passing that to VLC named it "Track",
+// outranked the properly-named embedded tracks inside the MKV, and broke anime
+// subtitles entirely. Embedded tracks live in the container; VLC finds them
+// itself. First external entry wins — after an auto-sync that IS the corrected
+// file ("Original timing" sits later in the list).
+function pickVlcSubtitle(session) {
+  const sm = session && session.streamManager;
+  if (!sm || !Array.isArray(sm.subtitlePaths)) return null;
+  const ext = sm.subtitlePaths.find((s) => s && s.source === 'external' && s.path && fs.existsSync(s.path));
+  return ext ? ext.path : null;
+}
+
+// pickVlcSubtitle answers WHICH subtitle; this answers WHAT FILE to hand VLC. Same cues,
+// wrapped so the menu shows the label instead of "Track 1" — see core/vlc-subtitle-label.js
+// for why the file NAME cannot do that job. Kept separate from pickVlcSubtitle so the
+// choice stays synchronous and testable without ffmpeg.
+//
+// `subPath` overrides the pick, for the auto-sync push (the corrected file is already in
+// hand, and its label came along on the event).
+async function vlcSubtitleFile(session, subPath, label) {
+  const sm = session && session.streamManager;
+  const picked = subPath || pickVlcSubtitle(session);
+  if (!picked || !sm) return picked || null;
+  const entry = Array.isArray(sm.subtitlePaths)
+    ? sm.subtitlePaths.find((s) => s && s.path === picked)
+    : null;
+  try {
+    return await require('./core/vlc-subtitle-label').labelSubtitleForVlc({
+      ffmpegPath: sm.ffmpegPath,
+      subPath: picked,
+      label: label || (entry && entry.label),
+      language: entry && entry.language,
+      outDir: sm.tempDir,
+    });
+  } catch (e) {
+    return picked; // a nicer menu entry is never worth losing the subtitle over
+  }
+}
+
+// One request to VLC's web interface, resolving with the body (or null). Best-effort:
+// only possible when VLC was launched by Uplayer, so the interface is up at all.
+function vlcRequest(creds, query) {
+  return new Promise((resolve) => {
+    const auth = 'Basic ' + Buffer.from(':' + creds.password).toString('base64');
+    const req = require('http').request({
+      host: '127.0.0.1',
+      port: creds.port,
+      path: '/requests/status.xml?' + query,
+      headers: { Authorization: auth },
+      timeout: 4000,
+    }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { try { req.destroy(); } catch (e) {} resolve(null); });
+    req.end();
+  });
+}
+
+// Subtitle ES ids parsed out of a status.xml body: every <category name='Stream N'>
+// whose Type is Subtitle. N is the ES id, i.e. the value `spu-es` — and therefore the
+// `subtitle_track` command — takes.
+//
+// That identity is measured, not assumed. On an MKV with two embedded subtitle tracks
+// plus an external one, status.xml listed [3,5,4,2] (note: out of document order) and
+// VLC's own rc `strack` reported ES ids [2,3,4,5] — the same set, and selecting the id
+// derived from here moved the active track. Order in the XML means nothing; the numbers
+// do.
+//
+// Pure: a regex over a string. No IO.
+function vlcSubtitleTrackIds(xml) {
+  const ids = [];
+  if (!xml) return ids;
+  const re = /<category name=['"]Stream (\d+)['"]>([\s\S]*?)<\/category>/g;
+  let m;
+  while ((m = re.exec(xml))) {
+    if (/>Subtitle</.test(m[2])) ids.push(Number(m[1]));
+  }
+  return ids;
+}
+
+// Get a corrected subtitle into an already-running VLC.
+//
+// VLC has no "replace this subtitle file" command, so `addsubtitle` necessarily produces
+// a SECOND track, and it does NOT select it — measured on 3.0.23, where the original
+// stayed starred in `strack` and the corrected file sat there inert. A track the viewer
+// has to go and find is not a fix.
+//
+// The best path is still not to send a file at all. When the correction is a pure offset
+// — "everything is 7 seconds late", the usual case for a subtitle cut for another
+// release — `subdelay` applies it to the track VLC ALREADY has. One track, its original
+// name, correct timing, nothing added. Confirmed round-tripping through <subtitledelay>.
+//
+// Only a non-uniform correction (frame-rate drift) needs the file, because a single delay
+// cannot express it. That case DOES gain a second track — but it can be selected, which
+// is what makes it a fix rather than homework. An earlier note here claimed otherwise
+// ("status.xml lists only Video and Audio ... nothing to address a subtitle_track command
+// at"); that was wrong on the very version it cited. Subtitle streams are listed, their
+// Stream number is the ES id, and `command=subtitle_track&val=<id>` moves the selection.
+//
+// The id is found by DIFFING the track list around the add rather than by trusting a
+// numbering rule: whichever subtitle ES is present afterwards and was not present before
+// is the file we just loaded. Anything other than exactly one new id — zero (the add
+// failed) or several (something else touched the input) — selects nothing. Guessing wrong
+// here puts the UNCORRECTED subtitle on screen, which is worse than leaving the viewer to
+// pick.
+//
+// Best-effort throughout: on failure the corrected file is still what --sub-file picks up
+// next launch (see pickVlcSubtitle).
+async function pushSubtitleToVlc(session, subPath, shiftMs, label) {
+  const creds = session && session.vlcHttp;
+  if (!creds || !subPath) return;
+
+  if (Number.isFinite(shiftMs)) {
+    // VLC takes seconds, positive = show later. shiftMs is corrected-minus-original, so
+    // a subtitle running 7s late is -7 here, which is exactly the delay that fixes it.
+    await vlcRequest(creds, 'command=subdelay&val=' + (shiftMs / 1000));
+    return;
+  }
+
+  // Only the file path needs the naming wrapper, and only on this branch — the subdelay
+  // above sends no file at all, so wrapping there would be work for a menu entry nobody
+  // gains.
+  const file = await vlcSubtitleFile(session, subPath, label);
+  const before = new Set(vlcSubtitleTrackIds(await vlcRequest(creds, '')));
+  await vlcRequest(creds, 'command=addsubtitle&val=' + encodeURIComponent(file));
+
+  // The slave is attached by the input thread, so the new ES is not in status.xml the
+  // instant addsubtitle returns — it took a couple of seconds to appear in testing. Poll
+  // instead of sleeping a fixed amount, which is either a guess that is too short or a
+  // stall that is too long.
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await new Promise((r) => setTimeout(r, 500));
+    const added = vlcSubtitleTrackIds(await vlcRequest(creds, '')).filter((id) => !before.has(id));
+    if (added.length === 1) {
+      await vlcRequest(creds, 'command=subtitle_track&val=' + added[0]);
+      return;
+    }
+    if (added.length > 1) return; // ambiguous — see the header
+  }
 }
 
 function persistSessionHistory(session) {
@@ -914,6 +1085,17 @@ app.post('/api/subtitles/search', async (req, res) => {
     const { title, type, season, episode, year, tmdbId, language } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
 
+    // The YIFY provider is addressed by IMDb id (its movie pages are
+    // /movie-imdb/<id>, server-rendered and unambiguous). TMDB knows the mapping;
+    // best-effort — a failed lookup just means one fewer source in the fan-out.
+    let imdbId = null;
+    if ((type || 'movie') !== 'tv' && tmdbId) {
+      try {
+        const ext = await getServices().tmdbClient.get(`/movie/${tmdbId}/external_ids`);
+        imdbId = ext && ext.imdb_id ? String(ext.imdb_id) : null;
+      } catch (e) { /* keyless sources still run */ }
+    }
+
     const manager = getServices().createSubtitleManager();
     const results = await manager.searchSubtitles(
       title,
@@ -922,7 +1104,8 @@ app.post('/api/subtitles/search', async (req, res) => {
       episode != null ? Number(episode) : null,
       year || null,
       tmdbId || null,
-      type || null
+      type || null,
+      imdbId
     );
     res.json(results);
   } catch (e) {
@@ -948,7 +1131,10 @@ app.post('/api/subtitles/download', async (req, res) => {
       subtitleId,
       outputPath,
       subtitle.source,
-      subtitle.downloadUrl || subtitle.attributes?.subsplease_url || subtitle.attributes?.addic7ed_url || null
+      subtitle.downloadUrl || subtitle.attributes?.subsplease_url || subtitle.attributes?.addic7ed_url || null,
+      // Decoding hint only. Providers label rows either way — 'ar' from the API,
+      // 'Arabic' from the scrapers — and subtitle-encoding accepts both.
+      subtitle.language || subtitle.attributes?.language || null
     );
 
     if (!ok || !fs.existsSync(outputPath)) {
@@ -1059,6 +1245,15 @@ app.post('/api/stream/start', async (req, res) => {
       session.lifecycle.streamHealth(data);
     });
 
+    // A subtitle finished syncing AFTER playback began. The web player refreshes on
+    // its own (manifest poll); a running VLC only updates if we push the corrected
+    // file into it via its web interface.
+    sm.on('subtitle_updated', (data) => {
+      // data.label is what the manifest calls this track ("… (auto-synced −7.0s)"); it
+      // becomes the name VLC's own menu shows, so the two agree.
+      if (data && data.path) pushSubtitleToVlc(session, data.path, data.shiftMs, data.label);
+    });
+
     // Playhead pings from the player page (via the stream hub). The web player is the
     // one target that reports a real `ended` event rather than having it inferred from
     // an ambiguous stop, so it's passed straight through and believed.
@@ -1142,7 +1337,7 @@ app.post('/api/stream/open-vlc', async (req, res) => {
     const vlcHttp = port
       ? { port, password: require('crypto').randomBytes(12).toString('hex') }
       : null;
-    await openStreamInVlc(vlcUrl, vlcHttp);
+    await openStreamInVlc(vlcUrl, vlcHttp, await vlcSubtitleFile(resolved.session));
     if (vlcHttp && resolved.session) startVlcProgress(resolved.session, vlcHttp);
     res.json({
       ok: true,
@@ -1441,6 +1636,24 @@ app.post('/api/dlna/stop', async (req, res) => {
 app.post('/api/dlna/pause', async (req, res) => { try { res.json(await dlna.pause((req.body || {}).deviceId)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.post('/api/dlna/resume', async (req, res) => { try { res.json(await dlna.resume((req.body || {}).deviceId)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get('/api/dlna/status', async (req, res) => { try { res.json(await dlna.status(req.query.deviceId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+// Whether this renderer supports Seek, asked before offering a restart-and-seek so the
+// offer can be honest about what it will cost. "unknown" is a real answer here — see
+// core/dlna-caster transportActions.
+app.get('/api/dlna/capabilities', async (req, res) => {
+  try { res.json(await dlna.transportActions(req.query.deviceId)); }
+  catch (e) { res.status(502).json({ error: e.message, ok: false, actions: [], canSeek: false }); }
+});
+// UPnP has no way to hot-swap a subtitle sidecar: a corrected file only reaches the TV
+// by re-sending the URI, which restarts the title at 00:00. Seek is what puts the viewer
+// back where they were. `target` is REL_TIME, "HH:MM:SS".
+app.post('/api/dlna/seek', async (req, res) => {
+  try {
+    const { deviceId, target } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    if (!/^\d{1,2}:\d{2}:\d{2}$/.test(String(target || ''))) return res.status(400).json({ error: 'target must be HH:MM:SS' });
+    res.json(await dlna.seek(deviceId, String(target)));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
 
 // --- App configuration (API keys) --------------------------------------------
 // Keys are entered in the Settings popup instead of a .env file, so a fresh PC
@@ -1454,7 +1667,7 @@ app.get('/api/config', (req, res) => {
     needsSetup: !status.TMDB_API_KEY, // TMDB is required for browsing/search
     fields: [
       { key: 'TMDB_API_KEY', label: 'TMDB API Key', required: true, help: 'Free at themoviedb.org → Settings → API. Powers all movie/TV browsing & search.' },
-      { key: 'OPENSUBTITLES_API_KEY', label: 'OpenSubtitles API Key', required: false, help: 'Free at opensubtitles.com. Needed only for subtitle search/download.' },
+      { key: 'OPENSUBTITLES_API_KEY', label: 'OpenSubtitles API Key', required: false, help: 'Optional. Subtitles work without it (YIFY/Gestdown/Addic7ed/SubsPlease scrapers); an opensubtitles.com key just adds one more source.' },
       { key: 'OPENSUBTITLES_USERNAME', label: 'OpenSubtitles Username', required: false },
       { key: 'OPENSUBTITLES_PASSWORD', label: 'OpenSubtitles Password', required: false, secret: true },
     ],
@@ -1557,7 +1770,13 @@ if (require.main === module) {
   // stays up for the whole life of the app — no per-stream start/stop churn. Streams just
   // add/remove torrents against it. It's stopped only when the app itself exits.
   const { getSharedClient } = require('./core/torrserver-client');
-  const torrServer = getSharedClient({ log: (m) => console.log(String(m)) });
+  const torrServer = getSharedClient({
+    log: (m) => console.log(String(m)),
+    // Engine lifecycle (crash / respawn / respawn-failed). The per-session view of
+    // the same fact rides stream_health.engineDown, fed by each session's stats poll;
+    // this callback is the app-level record of it.
+    onEvent: (ev) => console.warn('[torrserver] ' + JSON.stringify(ev)),
+  });
   torrServer.start().catch((e) => console.error('TorrServer failed to start:', e && e.message));
 
   let shuttingDown = false;
@@ -1587,5 +1806,9 @@ module.exports._internals = {
   startVlcProgress,
   getPlaybackTarget,
   stopExternalProgress,
+  pushSubtitleToVlc,
+  pickVlcSubtitle,
+  vlcSubtitleFile,
+  vlcSubtitleTrackIds,
 };
 

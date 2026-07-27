@@ -16,6 +16,9 @@ const state = {
   heroTimer: null,
   watchlist: { movie: {}, tv: {} },
   watchlistLoaded: false,
+  // Set by resumeFromHistory, consumed once when the auto path starts the stream.
+  resumeHint: null,
+  resumeSubtitle: null,
 };
 
 // --- API Client ---------------------------------------------------------------
@@ -561,6 +564,12 @@ async function renderHome() {
         // recorded; resume then just ranks releases normally.
         const lastSource = (item.lastPlayback && item.lastPlayback.source) || '';
         const srcArg = lastSource ? `, '${escape(lastSource).replace(/'/g, '&#39;')}'` : '';
+        // The remembered subtitle choice is an OBJECT, so it goes in a lookup rather than
+        // through the inline onclick — JSON inside an HTML attribute is an escaping bug
+        // waiting to happen, and these strings come from provider pages.
+        if (item.lastPlayback && item.lastPlayback.subtitle) {
+          resumeSubtitleByKey.set(`${type}:${Number(item.tmdbId)}`, item.lastPlayback.subtitle);
+        }
         return `
         <div class="new-ep-card cw-card" onclick="resumeFromHistory('${type}', ${Number(item.tmdbId)}, ${p.season != null ? Number(p.season) : 'null'}, ${p.episode != null ? Number(p.episode) : 'null'}, ${Number(p.positionSec)}, '${escape(item.title).replace(/'/g, '&#39;')}'${srcArg})">
           ${item.poster_path
@@ -651,6 +660,7 @@ async function renderHome() {
         </div>
         <div class="scroll-row">${tvRow}</div>
       </div>`;
+
   } catch (e) {
     app.innerHTML = errorState(e);
   }
@@ -1713,8 +1723,23 @@ const castTvState = {
   dlnaDeviceName: '',
   dlnaDevice: null,
   dlnaStatusText: '',
+  // The DLNA subtitle choice, kept SEPARATE from selectedSubtitleTrackId (Chromecast's).
+  // A UPnP renderer gets one sidecar baked into the DIDL at load time and cannot be
+  // switched afterwards, so the two surfaces don't share a selection. `null` means
+  // "not chosen yet" and defaults to the downloaded track; '' means the user said no
+  // subtitles.
+  dlnaSubtitleTrackId: null,
+  // How that track looked when we sent it. A DLNA renderer fetches the sidecar ONCE,
+  // so when the background auto-sync later rewrites that same track, the copy on the
+  // TV is the stale one — this signature is how the status poll notices.
+  dlnaSubtitleSig: '',
+  dlnaSubtitleReloadOffered: false, // whether the toast has fired (the card offer persists)
+  dlnaSubtitlePending: null, // { what, sig } — a corrected subtitle waiting to be applied
+  subtitleJob: null, // the manifest's background sync/generate job, for "still running"
+  dlnaRelTime: '', // last playhead the TV reported, "HH:MM:SS"
 };
 let dlnaStatusTimer = null;
+let dlnaSubtitleWatchTick = 0;
 const externalScriptPromises = new Map();
 let googleCastSdkPromise = null;
 let googleCastContextReady = false;
@@ -1899,6 +1924,10 @@ function applyActiveStreamMeta(meta, options = {}) {
   wizard.subtitleManifestUrl = normalized.subtitleManifestUrl;
   wizard.videoFormat = normalized.videoFormat || null;
   if (options.persist) persistWizardState();
+  // The stream is up, so the background timing fix is either running or already done.
+  // Adopting an existing session lands here too, which is the case that matters: the
+  // fix may have finished before this tab ever opened.
+  if (normalized.subtitleManifestUrl && wizard.subtitleToken) startSubtitleFixPolling();
   return normalized;
 }
 
@@ -1935,6 +1964,46 @@ async function resolveActivePlayerUrl(fallbackUrl) {
 // `lastSource` is the source this title last streamed from (remembered on the history
 // entry), so resume comes back to the same release. When the player opens for the SAME
 // title, the hint becomes a ?t= seek.
+// Remembered subtitle choices for the Continue Watching shelf, keyed "<type>:<tmdbId>".
+// Populated as the shelf renders and read by resumeFromHistory.
+const resumeSubtitleByKey = new Map();
+
+// The minimum needed to download this exact subtitle again later. Deliberately not the
+// whole provider row — that carries release blurbs and rating counts nobody will read
+// back — and deliberately not the downloaded FILE path, which lives in a temp dir that
+// may be gone by the time anyone resumes.
+function describeChosenSubtitle(sub) {
+  if (!sub || typeof sub !== 'object') return null;
+  const downloadUrl = sub.downloadUrl
+    || (sub.attributes && (sub.attributes.subsplease_url || sub.attributes.addic7ed_url))
+    || null;
+  if (!sub.id && !sub.fileId && !downloadUrl) return null;
+  return {
+    source: sub.source || null,
+    id: sub.id != null ? String(sub.id) : null,
+    fileId: sub.fileId != null ? String(sub.fileId) : null,
+    downloadUrl,
+    language: sub.language || (sub.attributes && sub.attributes.language) || null,
+  };
+}
+
+// Re-download a remembered subtitle choice and return a fresh token, or null. Best
+// effort by design: a provider that has since dropped the file must not block playback,
+// so resume continues without it rather than failing.
+async function reacquireSubtitleToken(sub) {
+  if (!sub) return null;
+  try {
+    const data = await fetchJson('/api/subtitles/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subtitle: sub }),
+    });
+    return data && data.subtitleToken ? data.subtitleToken : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 function resumeFromHistory(type, tmdbId, season, episode, positionSec, titleText, lastSource) {
   state.resumeHint = {
     type,
@@ -1943,6 +2012,9 @@ function resumeFromHistory(type, tmdbId, season, episode, positionSec, titleText
     episode: episode != null ? Number(episode) : null,
     positionSec: Number(positionSec) || 0,
   };
+  // Held separately from resumeHint: that hint is consumed the moment the player opens
+  // (applyResumeParam), while the subtitle is needed EARLIER, when the stream starts.
+  state.resumeSubtitle = resumeSubtitleByKey.get(`${type}:${Number(tmdbId)}`) || null;
   const title = encodeURIComponent(titleText || '');
   const srcParam = lastSource ? `&src=${encodeURIComponent(lastSource)}` : '';
   if (type === 'tv' && season != null && episode != null) {
@@ -2176,7 +2248,7 @@ function startNativeCast() {
       ? (castTvState.subtitleOptions || []).find((t) => String(t.trackId) === selInit)
       : null;
     if (pickedInit && pickedInit.ready) {
-      castTvState.subtitleReloadKey = selInit;
+      castTvState.subtitleReloadKey = castSubtitleReloadKey(selInit, pickedInit);
       castTvState.subtitleReloadStage = pickedInit.complete ? 2 : 1;
     } else {
       castTvState.subtitleReloadKey = null;
@@ -2335,9 +2407,17 @@ function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId
   const wantSubs = selectedSubtitleTrackId != null && String(selectedSubtitleTrackId).trim() !== '';
   const readyOnly = subtitleOptions.filter((t) => t.ready === true);
 
+  // Chromecast takes a real track LIST, so every ready track is sent and the selection
+  // only decides which one starts ACTIVE. Choosing "no subtitles" therefore means "start
+  // with them off", not "withhold them" — the viewer can still turn any track on from the
+  // TV's own subtitle menu. (Withholding them used to be the behaviour, which left that
+  // menu empty and made the choice unrecoverable without re-casting.)
+  //
+  // DLNA cannot do this: measured on an LG webOS TV, a DIDL carrying three sidecars had
+  // only the first one fetched. See core/dlna-caster buildDidl.
   let tracks = [];
   let activeTrackIds = [];
-  if (wantSubs && readyOnly.length > 0) {
+  if (readyOnly.length > 0) {
     // Cache-bust so the receiver re-fetches the (still-growing) VTT on every (re)load
     // instead of serving a stale/partial copy.
     const cacheBust = Date.now();
@@ -2355,9 +2435,15 @@ function buildCastMediaDraft(meta, subtitleOptions = [], selectedSubtitleTrackId
       };
     });
     tracks = tracks.filter((t) => isChromecastReceiverReachableUrl(t.trackContentId));
-    const wanted = Number(selectedSubtitleTrackId);
-    if (Number.isFinite(wanted) && tracks.some((t) => t.trackId === wanted)) {
-      activeTrackIds = [wanted];
+    // wantSubs is what separates "start with this track on" from "start with them all
+    // off but available". Without it an empty selection would rely on Number('') === 0
+    // failing to match any trackId — true today, and silently wrong the day a track is
+    // numbered 0.
+    if (wantSubs) {
+      const wanted = Number(selectedSubtitleTrackId);
+      if (Number.isFinite(wanted) && tracks.some((t) => t.trackId === wanted)) {
+        activeTrackIds = [wanted];
+      }
     }
   }
 
@@ -2438,7 +2524,7 @@ function renderCastTvModalContent(meta, state = {}) {
           ${subtitleOptions.length > 0 ? `
             <label class="cast-modal-label" for="castSubtitleSelect">Subtitle track</label>
             <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
-              <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>No subtitles (video only)</option>
+              <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>Off at start (switch on the TV)</option>
               ${subtitleOptions.map((track) => `
                 <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
                   ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
@@ -2457,7 +2543,7 @@ function renderCastTvModalContent(meta, state = {}) {
           ${subtitleOptions.length > 0 ? `
             <label class="cast-modal-label" for="castSubtitleSelect">Subtitle track</label>
             <select id="castSubtitleSelect" class="cast-modal-select" onchange="handleCastSubtitleSelection(this.value)">
-              <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>No subtitles (video only)</option>
+              <option value="" ${String(selectedSubtitleTrackId) === '' ? 'selected' : ''}>Off at start (switch on the TV)</option>
               ${subtitleOptions.map((track) => `
                 <option value="${escape(String(track.trackId))}" ${String(track.trackId) === String(selectedSubtitleTrackId) ? 'selected' : ''}>
                   ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
@@ -2503,9 +2589,25 @@ function renderCastTvModalContent(meta, state = {}) {
   const dlnaCasting = castTvState.dlnaCasting;
   let dlnaBody;
   if (dlnaCasting) {
+    // A TV fetches its subtitle sidecar ONCE, at load. So when the background auto-sync
+    // rewrites that track afterwards, the only way to get the corrected timing onto the
+    // TV is to re-send the URI — which restarts the title. That is disruptive enough to
+    // ask rather than do, and the ask has to persist: the viewer is watching the TV, not
+    // this tab, and a toast that expired is a fix they can never reach.
+    const pending = castTvState.dlnaSubtitlePending;
+    const pendingBlock = pending ? `
+      <div class="cast-modal-note" style="margin-top:.5rem;padding:.55rem .7rem;border:1px solid var(--accent);border-radius:6px">
+        <strong>${escape(pending.what)}.</strong>
+        <button type="button" class="btn btn-outline btn-sm" style="margin-left:.5rem" onclick="return reloadDlnaSubtitleOnTv()">Apply on TV</button>
+        <br><small>${pending.canSeek === false
+          ? 'This TV reports no seek support — applying restarts the film from the beginning.'
+          : 'The TV restarts the title and jumps back to where you are.'}</small>
+      </div>` : (isSubtitleSyncRunning() ? `
+      <p class="cast-modal-note" style="margin-top:.3rem;opacity:.8">Subtitle timing fix is still running — you'll be offered it here when it lands.</p>` : '');
     dlnaBody = `
       <p class="cast-modal-note">Casting to <strong>${escape(castTvState.dlnaDeviceName)}</strong> — original file, full quality, no transcoding.</p>
       <p class="cast-modal-note" style="margin-top:.3rem">TV status: <strong id="dlnaStatusLine">${escape(castTvState.dlnaStatusText || 'starting…')}</strong></p>
+      ${pendingBlock}
       <div class="cast-modal-actions" style="display:flex;gap:0.5rem;flex-wrap:wrap">
         <button type="button" class="btn btn-outline btn-sm" onclick="return pauseDlnaCast()">Pause</button>
         <button type="button" class="btn btn-outline btn-sm" onclick="return resumeDlnaCast()">Resume</button>
@@ -2515,7 +2617,25 @@ function renderCastTvModalContent(meta, state = {}) {
     // Devices discovered in the background are shown IMMEDIATELY — a refresh in progress
     // never hides them (it just shows a small "Refreshing…" hint), so the popup is ready
     // the moment it opens instead of flashing a "Scanning…" message.
+    //
+    // The subtitle picker is repeated here rather than shared with the Chromecast card:
+    // that card is hidden entirely unless the page is localhost/HTTPS, which is exactly
+    // the LAN case where DLNA is the option people use — so the shared control was
+    // unreachable for every DLNA cast, and the TV got no sidecar at all.
+    const dlnaPick = resolveDlnaSubtitleTrack(subtitleOptions, castTvState.dlnaSubtitleTrackId);
+    const dlnaPickId = dlnaPick ? String(dlnaPick.trackId) : '';
     dlnaBody = `
+      ${subtitleOptions.length > 0 ? `
+        <label class="cast-modal-label" for="dlnaSubtitleSelect">Subtitle to send</label>
+        <select id="dlnaSubtitleSelect" class="cast-modal-select" onchange="handleDlnaSubtitleSelection(this.value)">
+          <option value="" ${dlnaPickId === '' ? 'selected' : ''}>No subtitles (video only)</option>
+          ${subtitleOptions.map((track) => `
+            <option value="${escape(String(track.trackId))}" ${String(track.trackId) === dlnaPickId ? 'selected' : ''}>
+              ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
+            </option>`).join('')}
+        </select>
+        <p class="cast-modal-note">DLNA carries only <strong>one</strong> subtitle file, chosen when casting starts — unlike Chromecast, which gets every track and switches on the TV. Subtitles inside the video stay available from the TV's own menu.</p>
+      ` : ''}
       <div style="display:flex;flex-direction:column;gap:0.4rem;margin:0.6rem 0">
         ${dlnaDevices.map((d) => `
           <button type="button" class="btn btn-outline" style="justify-content:flex-start;text-align:left"
@@ -2539,7 +2659,7 @@ function renderCastTvModalContent(meta, state = {}) {
         <span class="cast-chip ${dlnaCasting ? 'cast-chip-casting' : 'cast-chip-ready'}">${dlnaCasting ? 'Casting' : ((dlnaScanning && !dlnaDevices.length) ? 'Scanning' : 'DLNA')}</span>
       </div>
       ${dlnaBody}
-      <p class="cast-modal-note">Subtitles embedded in the file are selectable from the TV's own subtitle menu.</p>
+      <p class="cast-modal-note">Subtitles embedded in the file stay selectable from the TV's own subtitle menu; the track chosen above is sent alongside as a separate file.</p>
     </div>`;
 
   // The third option the header promises, for TVs that are neither a Chromecast nor a DLNA
@@ -2701,15 +2821,23 @@ async function ensureGoogleCastContext() {
   return castContext;
 }
 
-async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = null) {
-  if (!subtitleManifestUrl) return [];
+// The manifest carries two things: the tracks, and the state of the background subtitle
+// JOB (the auto-sync that fixes downloaded-subtitle timing). Chromecast only ever needed
+// the tracks — it can hot-swap a track, so it never has to reason about the job — while
+// the DLNA card does, because a TV loads its sidecar once and cannot be corrected in
+// place. Hence the split: this returns both, loadCastSubtitleOptions keeps its array.
+async function fetchSubtitleManifest(subtitleManifestUrl, metaForRewrite = null) {
+  if (!subtitleManifestUrl) return { options: [], job: null };
   const data = await fetchJson(subtitleManifestUrl);
   const subtitles = Array.isArray(data.subtitles) ? data.subtitles : [];
-  return subtitles.map((track, index) => {
+  const options = subtitles.map((track, index) => {
     const absolute = new URL(track.url, subtitleManifestUrl).href;
     const trackContentId = metaForRewrite
       ? rewriteLocalhostResourceUrlForChromecast(absolute, metaForRewrite)
       : absolute;
+    // The SRT twin of the same track, for DLNA TVs. Older servers don't advertise it;
+    // deriving it from the .vtt URL keeps this working against them too.
+    const srtAbsolute = new URL(track.srtUrl || String(track.url).replace(/\.vtt(\?|$)/, '.srt$1'), subtitleManifestUrl).href;
     const ready = typeof track.ready === 'boolean' ? track.ready : true;
     const complete = typeof track.complete === 'boolean' ? track.complete : true;
     return {
@@ -2717,12 +2845,86 @@ async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = nul
       name: track.label || `Subtitle ${index + 1}`,
       language: track.language || 'en',
       trackContentId,
+      srtContentId: metaForRewrite
+        ? rewriteLocalhostResourceUrlForChromecast(srtAbsolute, metaForRewrite)
+        : srtAbsolute,
       trackContentType: 'text/vtt',
       source: track.source || 'unknown',
       ready,
       complete,
     };
   });
+  return { options, job: data.job || null };
+}
+
+async function loadCastSubtitleOptions(subtitleManifestUrl, metaForRewrite = null) {
+  return (await fetchSubtitleManifest(subtitleManifestUrl, metaForRewrite)).options;
+}
+
+// --- "Subtitle loaded" fix status -------------------------------------------
+// The timing fix is automatic and runs in the background for minutes, so without this
+// the viewer cannot tell a fix that is still working from one that already ran from one
+// that never started — all three look identical. Reports what it did, by how much, and
+// how long it took, from the job the manifest already publishes.
+
+let subtitleFixTimer = null;
+
+function formatFixDuration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem ? `${m}m ${rem}s` : `${m}m`;
+}
+
+// The one line shown beside "Subtitle loaded". Pure so it can be tested without a stream.
+function describeSubtitleFix(job) {
+  if (!job || job.kind !== 'sync') return { text: '', color: '' };
+  if (job.running) {
+    const forMs = job.startedAt ? Date.now() - job.startedAt : 0;
+    return { text: `· checking timing… (${formatFixDuration(forMs)})`, color: 'var(--text-muted)' };
+  }
+  const took = job.durationMs ? ` in ${formatFixDuration(job.durationMs)}` : '';
+  if (job.error) return { text: `· timing unchanged (${job.error})`, color: 'var(--text-muted)' };
+  if (job.unchanged) return { text: `· timing was already correct${took}`, color: 'var(--text-muted)' };
+  if (typeof job.shiftMs === 'number' && job.shiftMs !== 0) {
+    // Sign matters to a viewer: "−" means the subtitle was running late and got pulled
+    // earlier. Seconds, one decimal — milliseconds would be noise here.
+    const dir = job.shiftMs < 0 ? '−' : '+';
+    return { text: `· timing fixed ${dir}${(Math.abs(job.shiftMs) / 1000).toFixed(1)}s${took}`, color: 'var(--green)' };
+  }
+  return { text: `· timing fixed${took}`, color: 'var(--green)' };
+}
+
+function renderSubtitleFixStatus(job) {
+  const el = document.getElementById('subtitleFixStatus');
+  if (!el) return false;
+  const { text, color } = describeSubtitleFix(job);
+  el.textContent = text;
+  el.style.color = color;
+  return true;
+}
+
+function startSubtitleFixPolling() {
+  stopSubtitleFixPolling();
+  const tick = async () => {
+    if (!document.getElementById('subtitleFixStatus')) return; // not on the streaming panel
+    const url = wizard.subtitleManifestUrl;
+    if (!url) return;
+    try {
+      const { job } = await fetchSubtitleManifest(url);
+      renderSubtitleFixStatus(job);
+      // Once it has finished there is nothing left to watch — a settled job never
+      // changes again, so keep polling only while it is running.
+      if (job && job.kind === 'sync' && !job.running) stopSubtitleFixPolling();
+    } catch (e) { /* transient — the next tick retries */ }
+  };
+  tick();
+  subtitleFixTimer = setInterval(tick, 4000);
+}
+
+function stopSubtitleFixPolling() {
+  if (subtitleFixTimer) { clearInterval(subtitleFixTimer); subtitleFixTimer = null; }
 }
 
 function renderCastQrCode(url) {
@@ -2750,6 +2952,18 @@ function closeCastTvModal() {
   if (!overlay) return;
   overlay.classList.remove('open');
   overlay.setAttribute('aria-hidden', 'true');
+}
+
+// The key the cast reload-poller compares against to decide "have I already pushed this?".
+//
+// It deliberately includes the track's LABEL, not just its id. The stage counter alone
+// tracks EXTRACTION progress (first cues -> fully extracted), and a downloaded subtitle
+// is complete the moment it lands — so it starts at the final stage and the poller never
+// fires again. The background auto-sync then rewrote that same track and Chromecast kept
+// showing the uncorrected timing forever. The label is what moves when the sync lands
+// (it gains "(auto-synced)"), so folding it in makes exactly one extra reload happen.
+function castSubtitleReloadKey(trackId, track) {
+  return `${trackId}|${(track && track.name) || ''}`;
 }
 
 function handleCastSubtitleSelection(value) {
@@ -2890,7 +3104,7 @@ function updateCastSubtitleSelectInPlace(options, selectedTrackId) {
   if (select.dataset.optsig === sig) return true; // nothing changed
 
   const sel = String(selectedTrackId || '');
-  let html = `<option value="" ${sel === '' ? 'selected' : ''}>No subtitles (video only)</option>`;
+  let html = `<option value="" ${sel === '' ? 'selected' : ''}>Off at start (switch on the TV)</option>`;
   html += (options || []).map((track) => `
     <option value="${escape(String(track.trackId))}" ${String(track.trackId) === sel ? 'selected' : ''}>
       ${escape(track.name || `Subtitle ${track.trackId}`)}${track.ready ? '' : ' — extracting…'}
@@ -3064,11 +3278,71 @@ async function discoverDlnaDevices(force) {
   return false;
 }
 
+// Which subtitle track the DLNA card is offering, given the current manifest.
+// `null` (never chosen) resolves to the DOWNLOADED (external) track: it is the file
+// the user picked in the wizard for this exact release, and the only track the
+// background auto-sync ever corrects — so it is what "subtitles on the TV" means here.
+// '' means the user explicitly chose none.
+function resolveDlnaSubtitleTrack(options, choice) {
+  const list = Array.isArray(options) ? options : [];
+  if (choice === '') return null;
+  if (choice != null) return list.find((t) => String(t.trackId) === String(choice)) || null;
+  // Only the external track is auto-attached. An EMBEDDED track is already inside the
+  // container the TV is playing and shows up in its own subtitle menu — pushing it as a
+  // sidecar too would just duplicate it.
+  return list.find((t) => t.source === 'external') || null;
+}
+
+// A TV re-fetches the sidecar only when the URI is re-sent, so we need to know whether
+// the track we handed it has changed underneath. Label carries the auto-sync marker
+// ("… (auto-synced)"); `complete` carries the extraction milestone.
+function dlnaSubtitleSignature(track) {
+  return track ? `${track.trackId}|${track.name}|${track.complete ? 1 : 0}` : '';
+}
+
+// The URL a DLNA TV should fetch: SRT, not WebVTT. Smart-TV sidecar parsers largely
+// don't accept WebVTT — the server serves the same track in both dialects.
+function dlnaSubtitleUrlFor(track) {
+  if (!track || !track.ready) return '';
+  return track.srtContentId || track.trackContentId || '';
+}
+
+// Re-read the manifest so the pick reflects the CURRENT state of the tracks — the
+// auto-sync swaps the corrected file in at the same index, and a cast started after
+// it finished should carry the corrected timing rather than a cached stale entry.
+async function refreshDlnaSubtitleOptions() {
+  const meta = castTvState.meta || normalizeActiveStreamMeta({
+    sessionId: wizard.sessionId, playerUrl: wizard.playerUrl,
+    castUrl: wizard.castUrl, subtitleManifestUrl: wizard.subtitleManifestUrl,
+  });
+  if (!meta || !meta.subtitleManifestUrl) return castTvState.subtitleOptions || [];
+  try {
+    const { options, job } = await fetchSubtitleManifest(meta.subtitleManifestUrl, meta);
+    castTvState.subtitleOptions = options;
+    castTvState.subtitleJob = job;
+    return options;
+  } catch (e) {
+    return castTvState.subtitleOptions || [];
+  }
+}
+
+// True while the background auto-sync is still working on the downloaded subtitle — i.e.
+// the sidecar a TV is holding right now is the UNCORRECTED one, and a better version is
+// coming. Worth saying out loud at cast time so off-by-seconds timing on the TV reads as
+// "not finished yet" rather than "broken".
+function isSubtitleSyncRunning() {
+  const job = castTvState.subtitleJob;
+  return !!(job && job.running && job.kind === 'sync');
+}
+
 async function castToDlnaDevice(deviceId) {
   const dev = (castTvState.dlnaDevices || []).find((d) => d.id === deviceId);
   if (!dev) return false;
   toast('Sending to ' + dev.name + '…', 'info');
   try {
+    const options = await refreshDlnaSubtitleOptions();
+    const track = resolveDlnaSubtitleTrack(options, castTvState.dlnaSubtitleTrackId);
+    const subtitleUrl = dlnaSubtitleUrlFor(track);
     const res = await fetch('/api/dlna/play', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3076,6 +3350,7 @@ async function castToDlnaDevice(deviceId) {
         deviceId,
         sessionId: (castTvState.meta && castTvState.meta.sessionId) || wizard.sessionId || null,
         title: wizard.titleText || 'Uplayer',
+        subtitleUrl,
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -3084,13 +3359,31 @@ async function castToDlnaDevice(deviceId) {
     castTvState.dlnaDeviceName = dev.name;
     castTvState.dlnaDevice = dev;
     castTvState.dlnaStatusText = 'starting…';
+    // Recorded even when the track wasn't ready yet (so no URL went out): the signature
+    // carries `complete`, so the watcher below still fires once it finishes extracting.
+    castTvState.dlnaSubtitleSig = dlnaSubtitleSignature(track);
+    castTvState.dlnaSubtitleReloadOffered = false;
+    castTvState.dlnaSubtitlePending = null; // this cast just sent the current version
     toast('Casting to ' + dev.name, 'success');
+    if (track && !subtitleUrl) {
+      toast('Subtitle is still extracting — the TV is playing without it for now.', 'info', 6000);
+    } else if (subtitleUrl && isSubtitleSyncRunning()) {
+      // The subtitle went out at its ORIGINAL timing because the fix isn't done. Say so
+      // now: otherwise drifting subtitles on the TV look like a broken file rather than
+      // a job still running, and the offer to apply the fix arrives out of nowhere.
+      toast('Subtitle sent at its original timing — the timing fix is still running. You\'ll be offered it here when it lands.', 'info', 8000);
+    }
     startDlnaStatusPolling();
   } catch (e) {
     toast('DLNA cast failed: ' + (e.message || e), 'error');
   } finally {
     rerenderCastTvModal();
   }
+  return false;
+}
+
+function handleDlnaSubtitleSelection(value) {
+  castTvState.dlnaSubtitleTrackId = String(value || '');
   return false;
 }
 
@@ -3104,14 +3397,22 @@ async function recastDlnaForCurrentSession() {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     if (!castTvState.dlnaCasting || wizard.sessionId !== targetSession) return; // user stopped / moved on
     try {
+      // The next episode is a NEW session with its own subtitle tracks, so the sidecar
+      // is resolved fresh here rather than reusing the previous episode's URL.
+      const options = await refreshDlnaSubtitleOptions();
+      const track = resolveDlnaSubtitleTrack(options, castTvState.dlnaSubtitleTrackId);
+      const subtitleUrl = dlnaSubtitleUrlFor(track);
       const res = await fetch('/api/dlna/play', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceId: dev.id, sessionId: targetSession, title: wizard.titleText || 'Uplayer' }),
+        body: JSON.stringify({ deviceId: dev.id, sessionId: targetSession, title: wizard.titleText || 'Uplayer', subtitleUrl }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && !data.error) {
         castTvState.dlnaStatusText = 'starting…';
+        castTvState.dlnaSubtitleSig = dlnaSubtitleSignature(track);
+        castTvState.dlnaSubtitleReloadOffered = false;
+        castTvState.dlnaSubtitlePending = null; // new episode, new subtitle, clean slate
         startDlnaStatusPolling();
         rerenderCastTvModal();
         toast('Continuing on ' + dev.name, 'success');
@@ -3137,13 +3438,148 @@ function startDlnaStatusPolling() {
       if (d && (d.state || d.relTime)) {
         const pos = (d.relTime && d.duration && !/NOT_IMPLEMENTED/i.test(d.relTime)) ? ` — ${d.relTime} / ${d.duration}` : '';
         castTvState.dlnaStatusText = (d.state || '') + pos;
+        // Remembered so a subtitle reload (which re-sends the URI and therefore
+        // restarts the title) can put the viewer back where they were.
+        if (d.relTime && /^\d{1,2}:\d{2}:\d{2}$/.test(d.relTime)) castTvState.dlnaRelTime = d.relTime;
         const line = document.getElementById('dlnaStatusLine');
         if (line) line.textContent = castTvState.dlnaStatusText;
       }
     } catch (e) { /* ignore poll errors */ }
+    // Every 10th tick (~30s), not every one: this is a manifest fetch, and the thing
+    // it watches for — the background auto-sync finishing — takes minutes.
+    dlnaSubtitleWatchTick += 1;
+    if (dlnaSubtitleWatchTick % 10 === 0) watchDlnaSubtitleForCorrection();
   };
+  dlnaSubtitleWatchTick = 0;
   tick();
   dlnaStatusTimer = setInterval(tick, 3000);
+}
+
+// The auto-sync that fixes downloaded-subtitle TIMING runs in the background and can
+// land minutes into playback — long after the TV fetched its copy. UPnP has no way to
+// swap a sidecar in place, so the only fix is to re-send the URI, which restarts the
+// title; that is disruptive enough to ASK rather than do. Offered once per cast.
+async function watchDlnaSubtitleForCorrection() {
+  if (!castTvState.dlnaCasting || castTvState.dlnaSubtitleReloadOffered) return;
+  if (!castTvState.dlnaSubtitleSig) return; // nothing was sent — nothing to correct
+  const options = await refreshDlnaSubtitleOptions();
+  const track = resolveDlnaSubtitleTrack(options, castTvState.dlnaSubtitleTrackId);
+  if (!track || !dlnaSubtitleUrlFor(track)) return;
+  const sig = dlnaSubtitleSignature(track);
+  if (sig === castTvState.dlnaSubtitleSig) return;
+  // Two different things move this signature: the auto-sync renaming the track
+  // "(auto-synced)", and an extraction finishing. Say which one happened.
+  const wasLabel = String(castTvState.dlnaSubtitleSig).split('|')[1] || '';
+  const what = wasLabel && wasLabel !== track.name
+    ? 'Subtitle timing was corrected'
+    : 'The subtitle finished loading';
+
+  // The offer LIVES IN THE CARD, not only in a toast. Someone casting to a TV is looking
+  // at the TV, not at this tab — a 20-second toast they never saw would strand them on
+  // the uncorrected subtitle with no way back to the fix.
+  // Ask the TV whether it can seek, so the offer can say what applying it will cost.
+  // Unknown (the query is optional in the spec) is left as unknown — no false alarm.
+  let canSeek = null;
+  try {
+    const res = await fetch('/api/dlna/capabilities?deviceId=' + encodeURIComponent(castTvState.dlnaDevice.id));
+    const caps = await res.json();
+    if (caps && caps.ok === true) canSeek = !!caps.canSeek;
+  } catch (e) { /* unknown */ }
+
+  castTvState.dlnaSubtitlePending = { what, sig, canSeek };
+  rerenderCastTvModal();
+  if (!castTvState.dlnaSubtitleReloadOffered) {
+    castTvState.dlnaSubtitleReloadOffered = true;
+    toast(
+      escape(what) + '. <button type="button" class="btn btn-outline btn-sm" '
+      + 'style="margin-left:.5rem" onclick="return reloadDlnaSubtitleOnTv()">Apply on TV</button>'
+      + '<br><small>The TV restarts the title and jumps back to where you are.</small>',
+      'info', 20000
+    );
+  }
+}
+
+const dlnaTimeToSeconds = (t) => {
+  const m = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(String(t || ''));
+  return m ? (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) : null;
+};
+
+// Did the TV actually end up near `target`? Renderers can ACK a Seek and ignore it, and
+// a transport still TRANSITIONING reports the old position for a beat — so this polls a
+// few times before concluding it didn't take.
+async function dlnaPositionWithin(deviceId, target, toleranceSec) {
+  const want = dlnaTimeToSeconds(target);
+  if (want == null) return false;
+  for (let i = 0; i < 4; i += 1) {
+    try {
+      const res = await fetch('/api/dlna/status?deviceId=' + encodeURIComponent(deviceId));
+      const d = await res.json();
+      const at = dlnaTimeToSeconds(d && d.relTime);
+      if (at != null && Math.abs(at - want) <= toleranceSec) return true;
+    } catch (e) { /* keep trying */ }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  return false;
+}
+
+async function reloadDlnaSubtitleOnTv() {
+  const dev = castTvState.dlnaDevice;
+  if (!dev || !castTvState.dlnaCasting) return false;
+  const resumeAt = castTvState.dlnaRelTime || '';
+  try {
+    const options = await refreshDlnaSubtitleOptions();
+    const track = resolveDlnaSubtitleTrack(options, castTvState.dlnaSubtitleTrackId);
+    const subtitleUrl = dlnaSubtitleUrlFor(track);
+    if (!subtitleUrl) { toast('No subtitle to apply yet', 'info'); return false; }
+    const res = await fetch('/api/dlna/play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: dev.id,
+        sessionId: (castTvState.meta && castTvState.meta.sessionId) || wizard.sessionId || null,
+        title: wizard.titleText || 'Uplayer',
+        subtitleUrl,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+    castTvState.dlnaSubtitleSig = dlnaSubtitleSignature(track);
+    castTvState.dlnaSubtitlePending = null;
+    castTvState.dlnaSubtitleReloadOffered = false; // a later correction can offer again
+    rerenderCastTvModal();
+    // The renderer has to be PLAYING before it will accept a Seek — a fresh
+    // SetAVTransportURI leaves it transitioning for a moment.
+    if (/^\d{1,2}:\d{2}:\d{2}$/.test(resumeAt) && resumeAt !== '00:00:00') {
+      await new Promise((r) => setTimeout(r, 3000));
+      let seeked = false;
+      try {
+        const sr = await fetch('/api/dlna/seek', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceId: dev.id, target: resumeAt }),
+        });
+        const sd = await sr.json().catch(() => ({}));
+        seeked = sr.ok && sd.ok !== false && !sd.error;
+      } catch (e) { seeked = false; }
+      // Ask the TV where it actually is rather than claiming the seek worked. Some
+      // renderers ACK a Seek and ignore it; announcing "resuming at 41:12" while the
+      // film restarts from the top is worse than saying plainly what happened.
+      const landed = seeked ? await dlnaPositionWithin(dev.id, resumeAt, 30) : false;
+      if (landed) {
+        toast('Corrected subtitle applied — resumed at ' + resumeAt, 'success');
+      } else {
+        toast(
+          'Corrected subtitle applied, but the TV would not seek back — it is playing from the start. '
+          + 'Use its own remote to skip to ' + escape(resumeAt) + '.', 'info', 9000
+        );
+      }
+    } else {
+      toast('Corrected subtitle applied', 'success');
+    }
+  } catch (e) {
+    toast('Could not reload the subtitle on the TV: ' + (e.message || e), 'error', 5000);
+  }
+  return false;
 }
 function stopDlnaStatusPolling() { if (dlnaStatusTimer) { clearInterval(dlnaStatusTimer); dlnaStatusTimer = null; } }
 
@@ -3385,7 +3821,7 @@ function startChromecastCast(event) {
     const selInit = String(castTvState.selectedSubtitleTrackId || '');
     const pickedInit = selInit ? subtitleOptions.find((t) => String(t.trackId) === selInit) : null;
     if (pickedInit && pickedInit.ready) {
-      castTvState.subtitleReloadKey = selInit;
+      castTvState.subtitleReloadKey = castSubtitleReloadKey(selInit, pickedInit);
       castTvState.subtitleReloadStage = pickedInit.complete ? 2 : 1;
     } else {
       castTvState.subtitleReloadKey = null;
@@ -3613,32 +4049,86 @@ function streamFileLabel(s) {
   } catch (e) {}
   return 'Stream';
 }
-function renderActiveStreamsList(sessions) {
-  const running = (sessions || []).filter((s) => (s.running || !s.exited) && s.playerUrl);
-  if (running.length < 1) return '';
+// Prefer the title the session was started with; the release file name is the
+// fallback for sessions that carry no media metadata.
+function streamSessionLabel(s) {
+  const m = s && s.media;
+  if (m && m.title) {
+    const ep = m.type === 'tv' && m.season != null && m.episode != null ? ` · S${m.season}E${m.episode}` : '';
+    return m.title + ep;
+  }
+  return streamFileLabel(s);
+}
+// One line of live state per stream. Read straight from the session's last
+// stream_health payload — nothing recomputed client-side, same as the health panel.
+function streamSessionState(s) {
+  if (s.exited) return 'Ended';
+  const h = s.streamHealth;
+  if (!h) return s.playerUrl ? 'Ready' : 'Starting…';
+  if (h.engineDown) return 'Engine restarting…';
+  const pct = h.percent != null ? Math.round(h.percent * 100) + '% downloaded' : '';
+  const spd = h.downloadSpeedBps > 0 ? fmtBps(h.downloadSpeedBps) : '';
+  return [pct, spd].filter(Boolean).join(' · ') || (s.playerUrl ? 'Ready' : 'Starting…');
+}
+// The OTHER running streams — the one the page is currently viewing is deliberately
+// not listed (its controls ARE the page; repeating it in a banner was just noise).
+// Empty when nothing else runs, so a single stream adds no extra box at all.
+function renderActiveStreamsList(sessions, currentId) {
+  const others = (sessions || []).filter((s) => (s.running || !s.exited) && s.id !== currentId);
+  if (others.length < 1) return '';
   return `
     <div class="active-streams">
-      <div class="active-streams-head">Active streams <span class="badge">${running.length}</span></div>
-      ${running.map((s) => `
+      <div class="active-streams-head">
+        <span>${currentId ? 'Other streams' : 'Active streams'}</span> <span class="badge">${others.length}</span>
+        <span class="active-streams-spacer"></span>
+        ${others.length > 1 ? `<button class="btn btn-outline btn-sm" onclick="stopAllStreamSessions(this)">Stop all</button>` : ''}
+      </div>
+      ${others.map((s) => {
+        const label = escape(streamSessionLabel(s));
+        return `
         <div class="active-stream-row">
-          <div class="as-dot"></div>
-          <div class="as-title" title="${escape(streamFileLabel(s))}">${escape(streamFileLabel(s))}</div>
+          <div class="as-dot${s.exited ? ' ended' : ''}"></div>
+          <div class="as-main" onclick="viewStreamSession('${escape(s.id)}')" role="button" tabindex="0" title="Show this stream's controls">
+            <div class="as-title" title="${label}">${label}</div>
+            <div class="as-sub">${escape(streamSessionState(s))}</div>
+          </div>
           <div class="as-actions">
-            <a class="btn btn-primary btn-sm" href="${escape(s.playerUrl)}" target="_blank" rel="noopener">Open</a>
+            <button class="btn btn-outline btn-sm" onclick="viewStreamSession('${escape(s.id)}')">Manage</button>
+            ${s.playerUrl ? `<a class="btn btn-primary btn-sm" href="${escape(s.playerUrl)}" target="_blank" rel="noopener">Open</a>` : ''}
             <button class="btn btn-outline btn-sm" onclick="openCastForSession('${escape(s.id)}')">Cast</button>
             <button class="btn btn-outline btn-sm" onclick="stopStreamSessionById('${escape(s.id)}', this)">Stop</button>
           </div>
-        </div>`).join('')}
+        </div>`;
+      }).join('')}
     </div>`;
 }
-function injectActiveStreams(sessions) {
-  const html = renderActiveStreamsList(sessions);
+// Stream page only, in the page flow BELOW the wizard — not a banner pushed above
+// everything (that placement made it read as a duplicate of the current stream).
+function injectActiveStreams(sessions, currentId) {
+  const html = renderActiveStreamsList(sessions, currentId);
   const app = document.getElementById('app');
-  if (html && app) app.insertAdjacentHTML('afterbegin', html);
+  if (html && app) app.insertAdjacentHTML('beforeend', html);
+}
+// Switch the wizard to another running session. Routing (not direct mutation) so the
+// whole page — SSE subscription, health panel, next-episode context — rebuilds for
+// the chosen session through the one entry point that knows how.
+function viewStreamSession(id) {
+  navigate('/stream?session=' + encodeURIComponent(id));
 }
 async function stopStreamSessionById(id, btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
   try { await fetch('/api/stream/stop/' + encodeURIComponent(id), { method: 'DELETE' }); } catch (e) {}
+  refreshNavStreamIndicator();
+  route();
+}
+async function stopAllStreamSessions(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+  try {
+    const sessions = await fetchJson('/api/stream/status');
+    await Promise.all((sessions || [])
+      .filter((s) => s.running || !s.exited)
+      .map((s) => fetch('/api/stream/stop/' + encodeURIComponent(s.id), { method: 'DELETE' }).catch(() => {})));
+  } catch (e) {}
   refreshNavStreamIndicator();
   route();
 }
@@ -3649,6 +4139,8 @@ function openCastForSession(id) {
   }).catch(() => {});
 }
 window.stopStreamSessionById = stopStreamSessionById;
+window.stopAllStreamSessions = stopAllStreamSessions;
+window.viewStreamSession = viewStreamSession;
 window.openCastForSession = openCastForSession;
 
 async function renderStreamPage() {
@@ -3661,6 +4153,7 @@ async function renderStreamPage() {
   const routeEpisode = params.get('e') ? Number(params.get('e')) : null;
   const routeAuto = params.get('auto') === '1'; // binge: auto-pick best torrent + stream
   const routeSource = params.get('src') || null; // binge: prefer the source the user was already watching
+  const routeSessionId = params.get('session') || null; // "Manage" in the active-streams list: view THIS session
   const restoredAny = loadAnyWizardState();
 
   let activeSessions = [];
@@ -3669,7 +4162,16 @@ async function renderStreamPage() {
   } catch (e) {
     activeSessions = [];
   }
-  const runningSession = activeSessions.find((session) => session.running || !session.exited) || null;
+  // Adopt a running session only when this navigation isn't asking for a different
+  // title (decision in session-adopt.js, where it is unit-testable). A Watch click
+  // on another title gets null here and the wizard runs normally — that is what
+  // starts a SECOND concurrent session. The backend always allowed several
+  // (UPLAYER_MAX_STREAMS); this line was the thing that didn't.
+  const runningSession = adoptableSession(activeSessions, {
+    sessionId: routeSessionId,
+    type: routeType, tmdbId: routeTmdbId,
+    season: routeSeason, episode: routeEpisode,
+  });
 
   const type = routeType || restoredAny?.type || 'movie';
   const tmdbId = routeTmdbId || (restoredAny?.tmdbId != null ? String(restoredAny.tmdbId) : '');
@@ -3714,6 +4216,14 @@ async function renderStreamPage() {
 
   const restored = tmdbId ? loadWizardState(type, tmdbId) : restoredAny;
   if (restored) {
+    // Session-scoped URLs are only as alive as the session that minted them. After
+    // an app restart the stream hub issues a new stream path (and the LAN IP or
+    // port can change too), so a restored playerUrl points at a DEAD socket — and
+    // because the step-4 UI falls back to wizard URLs until player_ready arrives,
+    // the "Open in Web Player" button's first click landed on a no-connection
+    // page. Restore the URLs only while their own session is still live.
+    const restoredSessionAlive = !!restored.sessionId
+      && activeSessions.some((s) => s.id === restored.sessionId && (s.running || !s.exited));
     Object.assign(wizard, {
       selectedSeason: restored.selectedSeason || null,
       selectedEpisode: restored.selectedEpisode || null,
@@ -3723,11 +4233,11 @@ async function renderStreamPage() {
       subtitleToken: restored.subtitleToken || null,
       subtitleTokenExpiresAt: restored.subtitleTokenExpiresAt || null,
       skipSubtitles: !!restored.skipSubtitles,
-      sessionId: restored.sessionId || null,
-      playerUrl: restored.playerUrl || null,
-      vlcUrl: restored.vlcUrl || null,
-      castUrl: restored.castUrl || null,
-      subtitleManifestUrl: restored.subtitleManifestUrl || null,
+      sessionId: restoredSessionAlive ? restored.sessionId : null,
+      playerUrl: restoredSessionAlive ? restored.playerUrl || null : null,
+      vlcUrl: restoredSessionAlive ? restored.vlcUrl || null : null,
+      castUrl: restoredSessionAlive ? restored.castUrl || null : null,
+      subtitleManifestUrl: restoredSessionAlive ? restored.subtitleManifestUrl || null : null,
       step: restored.step || (type === 'tv' ? 1 : 2),
     });
   }
@@ -3761,6 +4271,24 @@ async function renderStreamPage() {
     // episode stay unset and the "Next Episode" button never renders.
     const media = runningSession.media;
     if (media) {
+      // The adopted session is the source of truth for WHAT is streaming. Saved
+      // wizard state outlives streams in localStorage, so a bare #/stream can
+      // restore a DIFFERENT title than the session it then attaches to — the page
+      // showed the previous movie's name (and would have written its history) over
+      // the stream actually playing. On a title mismatch the session's media wins
+      // outright; the fill-in-the-blanks merge below is only for same-title state.
+      if (media.tmdbId && wizard.tmdbId && Number(media.tmdbId) !== Number(wizard.tmdbId)) {
+        wizard.type = media.type || wizard.type;
+        wizard.tmdbId = Number(media.tmdbId);
+        wizard.titleText = media.title || 'Active Stream';
+        wizard.selectedSeason = media.season != null ? Number(media.season) : null;
+        wizard.selectedEpisode = media.episode != null ? Number(media.episode) : null;
+        wizard.seasons = [];
+        wizard.detail = null;
+        wizard.selectedTorrent = null;
+        wizard.resolvedMagnet = null;
+        wizard.historySaved = false;
+      }
       if (media.type && (!wizard.type || wizard.type === 'movie')) wizard.type = media.type;
       if (media.tmdbId && !wizard.tmdbId) wizard.tmdbId = Number(media.tmdbId);
       if (media.season && !wizard.selectedSeason) wizard.selectedSeason = Number(media.season);
@@ -3784,12 +4312,12 @@ async function renderStreamPage() {
     renderEmptyStreamPage();
     injectActiveStreams(activeSessions);
     clearWizardState();
-    updateNavStreamIndicator(false);
+    refreshNavStreamIndicator(); // other sessions may still be live — count, don't clear
     return;
   }
 
   renderWizardUI();
-  injectActiveStreams(activeSessions);
+  injectActiveStreams(activeSessions, wizard.sessionId);
   persistWizardState();
 
   if (wizard.step === 4) {
@@ -3827,12 +4355,18 @@ async function resumeStreamSession() {
     return false;
   }
 
+  // Our session by id first; failing that, only a session playing the SAME title
+  // (page restored on another device, server restarted underneath us). Grabbing any
+  // running session here would silently rebind this page to a different movie the
+  // moment ours ended — with concurrent streams that is a real state, not a
+  // theoretical one.
   const session = active.find((s) => s.id === wizard.sessionId)
-    || active.find((s) => s.running || !s.exited)
-    || null;
+    || (wizard.tmdbId
+      ? adoptableSession(active, { tmdbId: wizard.tmdbId, season: wizard.selectedSeason, episode: wizard.selectedEpisode })
+      : null);
 
   if (!session) {
-    updateNavStreamIndicator(false);
+    refreshNavStreamIndicator(); // other sessions may still be live — recount, don't blank
     return false;
   }
 
@@ -3926,12 +4460,44 @@ function renderWizardStep() {
 }
 
 // -- Step 1: Season & Episode picker (TV only) ---------------------------------
+
+// `airDateStatus` — released / today / upcoming / TBA for a TMDB air_date —
+// lives in public/js/air-date.js (loaded before this file) so it can be tested
+// without vm-slicing app.js. See the header there for why it has four states.
+
+// "Hide watched" is a viewing preference, not wizard state, so unlike
+// WIZARD_STORAGE_KEY it lives in localStorage — a viewer who never wants to see
+// finished episodes means it across tabs and across days, not just this one
+// sessionStorage-scoped visit.
+const HIDE_WATCHED_KEY = 'uplayer.hideWatchedEpisodes';
+
+function hideWatchedPref() {
+  try {
+    return localStorage.getItem(HIDE_WATCHED_KEY) === '1';
+  } catch (e) {
+    return false; // storage blocked (private mode) — show everything
+  }
+}
+
+function setHideWatchedPref(on) {
+  try {
+    localStorage.setItem(HIDE_WATCHED_KEY, on ? '1' : '0');
+  } catch (e) {
+    // Ignore storage write failures; the toggle still works for this render.
+  }
+}
+
+// Anything at or before the show's lastSeason/lastEpisode counts as watched —
+// marking a later episode implicitly marks everything before it. Shared by the
+// grid, the filter and the summary so all three agree on the same episode.
+function wizardEpisodeWatched(ep) {
+  const lastS = wizard._lastWatchedS || 0;
+  const lastE = wizard._lastWatchedE || 0;
+  return ep.season_number < lastS || (ep.season_number === lastS && ep.episode_number <= lastE);
+}
+
 function renderWizardStep1(panel) {
   const seasons = wizard.seasons;
-
-  if (!wizard.selectedSeason && seasons.length > 0) {
-    wizard.selectedSeason = seasons[0].season_number;
-  }
 
   // Show user's progress so already-watched seasons render greyed-out and
   // already-watched episodes carry a check-mark. Mirrors the modal's
@@ -3942,39 +4508,98 @@ function renderWizardStep1(panel) {
   wizard._lastWatchedS = lastS;
   wizard._lastWatchedE = lastE;
 
+  // Open on the season the viewer is actually up to, not season 1. Only when
+  // nothing has picked a season already — arriving via openStreamWizardEp (the
+  // modal's per-episode Watch button) carries an explicit season that must win.
+  const resume = resumeTarget(seasons, lastS, lastE);
+  if (!wizard.selectedSeason && resume) wizard.selectedSeason = resume.s;
+  wizard._resumeEpisode = resume && resume.s === wizard.selectedSeason ? resume.e : null;
+
+  const hideWatched = hideWatchedPref();
+
+  // How far the viewer got, per season. Shared by the desktop pill and the
+  // phone <option> so the two never disagree about what "watched" means.
+  const seasonMark = (s) => {
+    const air = airDateStatus(s.air_date);
+    if (s.season_number < lastS) return { kind: 'watched', short: '✓', long: 'watched' };
+    if (s.season_number === lastS && lastE > 0) return { kind: 'partial', short: `E${lastE}`, long: `up to E${lastE}` };
+    if (air.state === 'upcoming') return { kind: 'upcoming', short: 'Soon', long: 'not aired yet' };
+    return { kind: '', short: '', long: '' };
+  };
+
+  // Phone control. The pill strip is 123px per season, so The Simpsons rendered
+  // a 5,400px-wide row on a 375px screen — reaching season 38 meant dozens of
+  // swipes past seasons nobody was looking for. A native <select> hands that to
+  // the OS picker: one tap, one scroll, any season, and the whole control is a
+  // single 44px row instead of a 48px strip plus a separate tools row.
+  const seasonOptionsHTML = seasons.map((s) => {
+    const mark = seasonMark(s);
+    const label = `Season ${s.season_number} · ${s.episode_count} ep${mark.long ? ` · ${mark.long}` : ''}`;
+    return `<option value="${s.season_number}"${wizard.selectedSeason === s.season_number ? ' selected' : ''}>${escape(label)}</option>`;
+  }).join('');
+
   const seasonTabsHTML = seasons.map((s) => {
+    const air = airDateStatus(s.air_date);
     const fullyWatched = s.season_number < lastS;
     const partiallyWatched = s.season_number === lastS && lastE > 0;
+    const isActive = wizard.selectedSeason === s.season_number;
     const cls = [
       'season-tab',
-      wizard.selectedSeason === s.season_number ? 'active' : '',
+      isActive ? 'active' : '',
       fullyWatched ? 'season-tab-watched' : '',
       partiallyWatched ? 'season-tab-partial' : '',
+      air.state === 'upcoming' ? 'season-tab-upcoming' : '',
     ].filter(Boolean).join(' ');
-    const watchedTag = fullyWatched
-      ? ' <span title="Watched" style="color:var(--green,#3a3);margin-left:.25rem">✓</span>'
+    const flag = fullyWatched
+      ? '<span class="season-tab-flag is-watched" title="Watched">✓</span>'
       : partiallyWatched
-        ? ` <span title="Watched up to E${lastE}" style="color:var(--accent);margin-left:.25rem;font-size:.7rem">(E${lastE})</span>`
-        : '';
+        ? `<span class="season-tab-flag is-partial" title="Watched up to E${lastE}">E${lastE}</span>`
+        : air.state === 'upcoming'
+          ? '<span class="season-tab-flag is-upcoming" title="Has not aired yet">Soon</span>'
+          : '';
+    const when = air.state === 'upcoming'
+      ? `Airs ${air.date}`
+      : air.date ? `Premiered ${air.date}` : 'Air date TBA';
     return `
-    <button class="${cls}" onclick="wizardSelectSeason(${s.season_number})">
-      S${String(s.season_number).padStart(2,'0')} <span style="opacity:.6;font-weight:400">(${s.episode_count}ep)</span>${watchedTag}
+    <button class="${cls}" data-season="${s.season_number}" role="tab" aria-selected="${isActive}"
+      onclick="wizardSelectSeason(${s.season_number})"
+      title="Season ${s.season_number} — ${s.episode_count} episodes — ${escape(when)}">
+      <span class="season-tab-name">Season ${s.season_number}</span>
+      <span class="season-tab-count">${s.episode_count} ep</span>
+      ${flag}
     </button>`;
   }).join('');
 
   panel.innerHTML = `
     <div class="wizard-panel">
-      <div class="wizard-panel-title">Select Season and Episode</div>
-      <div class="season-tabs" id="seasonTabs">${seasonTabsHTML}</div>
-      <div id="episodeGrid" class="episode-grid">
-        <div class="page-loader" style="grid-column:1/-1;min-height:80px"><div class="spinner"></div></div>
+      <div class="wizard-panel-head">
+        <div class="wizard-panel-title">Select Season and Episode</div>
+        <span class="wizard-panel-hint">Pick an episode to search torrents</span>
       </div>
-      <div class="wizard-nav">
-        <span class="text-muted" style="font-size:.8rem" id="epSelection">
-          Tap an episode to search torrents
-        </span>
+      <div class="season-picker">
+        <div class="season-select-wrap">
+          <select class="season-select" id="seasonSelect" aria-label="Season"
+            onchange="wizardSelectSeason(Number(this.value))">${seasonOptionsHTML}</select>
+        </div>
+        <div class="season-tabs" id="seasonTabs" role="tablist">${seasonTabsHTML}</div>
+        <button class="ep-filter-toggle${hideWatched ? ' active' : ''}" id="hideWatchedToggle"
+          onclick="wizardToggleHideWatched()" aria-pressed="${hideWatched}"
+          title="Hide episodes you have already watched">
+          <span class="ep-filter-box">✓</span>
+          <span class="ep-filter-label">Hide watched</span>
+          <span class="ep-filter-label-short">Watched</span>
+        </button>
+      </div>
+      <div class="season-summary" id="seasonSummary" hidden></div>
+      <div id="episodeGrid" class="episode-grid">
+        <div class="page-loader" style="grid-column:1/-1;min-height:120px"><div class="spinner"></div></div>
       </div>
     </div>`;
+
+  // The strip scrolls horizontally, so a resumed show on season 17 would
+  // otherwise open parked on season 1 with the active tab off-screen.
+  const activeTab = panel.querySelector('.season-tab.active');
+  if (activeTab) activeTab.scrollIntoView({ block: 'nearest', inline: 'center' });
 
   if (wizard.selectedSeason) loadSeasonEpisodes(wizard.selectedSeason);
 }
@@ -3982,13 +4607,171 @@ function renderWizardStep1(panel) {
 async function wizardSelectSeason(n) {
   wizard.selectedSeason = n;
   wizard.selectedEpisode = null;
+  // Recompute, or the "Up next" marker would follow the episode *number* into
+  // whatever season the user browsed to next.
+  const resume = resumeTarget(wizard.seasons, wizard._lastWatchedS, wizard._lastWatchedE);
+  wizard._resumeEpisode = resume && resume.s === n ? resume.e : null;
   persistWizardState();
-  document.querySelectorAll('.season-tab').forEach((t, i) => {
-    t.classList.toggle('active', wizard.seasons[i]?.season_number === n);
+  // Match on data-season, not list position — the tab list and wizard.seasons
+  // can only be assumed to line up while nothing filters either one.
+  document.querySelectorAll('.season-tab').forEach((t) => {
+    const on = Number(t.dataset.season) === n;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', String(on));
   });
+  // Both controls are always in the DOM — CSS decides which one is visible —
+  // so the hidden one has to follow, or rotating the phone mid-flow would show
+  // a picker still pointing at the previous season.
+  const select = document.getElementById('seasonSelect');
+  if (select && Number(select.value) !== n) select.value = String(n);
+  const summary = document.getElementById('seasonSummary');
+  if (summary) summary.hidden = true;
   const grid = document.getElementById('episodeGrid');
-  if (grid) grid.innerHTML = `<div class="page-loader" style="grid-column:1/-1;min-height:80px"><div class="spinner"></div></div>`;
+  if (grid) grid.innerHTML = `<div class="page-loader" style="grid-column:1/-1;min-height:120px"><div class="spinner"></div></div>`;
   await loadSeasonEpisodes(n);
+}
+
+// Header strip above the episode list: how much of this season exists yet, and
+// when the next one lands. Answers "is there anything to watch" before the user
+// has to scan every card for a date.
+function renderSeasonSummary(seasonNum, episodes) {
+  const el = document.getElementById('seasonSummary');
+  if (!el) return;
+  if (!episodes.length) { el.hidden = true; return; }
+
+  const stats = episodes.map((ep) => airDateStatus(ep.air_date));
+  const released = stats.filter((a) => a.state === 'aired' || a.state === 'today').length;
+  const pending = stats.filter((a) => a.state === 'upcoming');
+  const nextIdx = stats.findIndex((a) => a.state === 'upcoming');
+  const nextEp = nextIdx >= 0 ? episodes[nextIdx] : null;
+
+  const watched = episodes.filter(wizardEpisodeWatched).length;
+  const chips = [
+    `<span class="season-summary-chip is-released">${released} released</span>`,
+    pending.length ? `<span class="season-summary-chip is-upcoming">${pending.length} upcoming</span>` : '',
+    watched && hideWatchedPref()
+      ? `<span class="season-summary-chip is-hidden-count">${watched} watched hidden</span>`
+      : watched ? `<span class="season-summary-chip is-watched">${watched} watched</span>` : '',
+  ].filter(Boolean).join('');
+
+  // Only prefix the relative form when it says something the date doesn't —
+  // beyond three weeks airDateStatus falls back to the date itself, and
+  // "Sep 27, 2026 · Sep 27, 2026" is noise.
+  const nextWhen = nextEp && stats[nextIdx].label !== stats[nextIdx].date
+    ? `${escape(stats[nextIdx].label)}<span class="season-summary-sep">·</span>${escape(stats[nextIdx].date)}`
+    : nextEp ? escape(stats[nextIdx].date) : '';
+  const next = nextEp
+    ? `<span class="season-summary-next">Next: <strong>E${nextEp.episode_number}</strong> ${nextWhen}</span>`
+    : '';
+
+  el.innerHTML = `
+    <span class="season-summary-main">Season ${seasonNum}<span class="season-summary-sep">·</span>${episodes.length} episode${episodes.length === 1 ? '' : 's'}</span>
+    <span class="season-summary-chips">${chips}</span>
+    ${next}`;
+  el.hidden = false;
+}
+
+// Renders from wizard.episodes only — no fetch. Split out of
+// loadSeasonEpisodes so the "Hide watched" toggle can redraw without a round
+// trip to TMDB for a season the browser already has.
+function renderEpisodeGrid() {
+  const grid = document.getElementById('episodeGrid');
+  if (!grid) return;
+
+  const hideWatched = hideWatchedPref();
+  const all = wizard.episodes || [];
+  const shown = hideWatched ? all.filter((ep) => !wizardEpisodeWatched(ep)) : all;
+
+  if (!all.length) {
+    grid.innerHTML = `<p class="text-muted" style="grid-column:1/-1;font-size:.85rem">No episodes listed for this season</p>`;
+    return;
+  }
+  if (!shown.length) {
+    // Every episode filtered away. Offer the way back out here rather than
+    // making the user find the toggle again — an empty grid with no explanation
+    // reads as a load failure.
+    grid.innerHTML = `
+      <div class="episode-grid-empty">
+        <p>You have watched every episode in this season.</p>
+        <button class="btn btn-outline btn-sm" onclick="wizardToggleHideWatched()">Show watched episodes</button>
+      </div>`;
+    return;
+  }
+
+  grid.innerHTML = shown.map((ep) => {
+    const air = airDateStatus(ep.air_date);
+    const wasWatched = wizardEpisodeWatched(ep);
+    // Only a *confirmed future* date blocks selection. 'tba' stays clickable:
+    // TMDB leaves the date empty for plenty of specials that already exist.
+    const unreleased = air.state === 'upcoming';
+    const isNext = wizard._resumeEpisode === ep.episode_number && !wasWatched;
+    const cls = [
+      'ep-card',
+      wizard.selectedEpisode === ep.episode_number ? 'selected' : '',
+      wasWatched ? 'is-watched' : '',
+      unreleased ? 'is-upcoming' : '',
+      air.state === 'today' ? 'is-today' : '',
+      isNext ? 'is-next' : '',
+    ].filter(Boolean).join(' ');
+
+    const when = air.state === 'tba' ? 'Air date TBA'
+      : unreleased ? `Airs ${air.date}`
+        : air.date;
+    const meta = [
+      `<span class="ep-card-date">${escape(when)}</span>`,
+      ep.runtime ? `<span>${ep.runtime}m</span>` : '',
+      ep.vote_average ? `<span class="ep-card-rating">★ ${Number(ep.vote_average).toFixed(1)}</span>` : '',
+    ].filter(Boolean).join('<span class="ep-card-sep">·</span>');
+
+    // One flag per card, most blocking fact first: an episode that has not been
+    // released is that before it is anything else. "Up next" only claims the
+    // slot when the episode can actually be played today.
+    const flag = unreleased
+      // The meta line already carries the date; the flag only earns its space
+      // when it adds the countdown, so far-off episodes just read "Upcoming".
+      ? `<span class="ep-card-flag is-upcoming">${escape(air.label === air.date ? 'Upcoming' : air.label)}</span>`
+      : air.state === 'today'
+        ? '<span class="ep-card-flag is-today">Out today</span>'
+        : isNext
+          ? '<span class="ep-card-flag is-next">Up next</span>'
+          : wasWatched
+            ? '<span class="ep-card-flag is-watched" title="Watched">✓ Watched</span>'
+            : '';
+
+    const tip = unreleased
+      ? `Not released yet — airs ${air.date}`
+      : `${ep.name || `Episode ${ep.episode_number}`}${wasWatched ? ' — already watched' : isNext ? ' — where you left off' : ''}`;
+
+    return `
+    <button class="${cls}" data-ep="${ep.episode_number}"${unreleased ? ' disabled aria-disabled="true"' : ''}
+      onclick="wizardSelectEpisode(${ep.episode_number})"
+      title="${escape(tip)}">
+      <span class="ep-card-num">${ep.episode_number}</span>
+      <span class="ep-card-body">
+        <span class="ep-card-name">${escape(ep.name || `Episode ${ep.episode_number}`)}</span>
+        <span class="ep-card-meta">${meta}</span>
+      </span>
+      ${flag}
+    </button>`;
+  }).join('');
+
+  // A long season scrolls internally, so the resume episode can render below
+  // the fold — the whole point of opening on this season is to put it in front
+  // of the viewer.
+  const nextCard = grid.querySelector('.ep-card.is-next');
+  if (nextCard) nextCard.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+function wizardToggleHideWatched() {
+  const on = !hideWatchedPref();
+  setHideWatchedPref(on);
+  const btn = document.getElementById('hideWatchedToggle');
+  if (btn) {
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-pressed', String(on));
+  }
+  renderSeasonSummary(wizard.selectedSeason, wizard.episodes || []);
+  renderEpisodeGrid();
 }
 
 async function loadSeasonEpisodes(seasonNum) {
@@ -3997,40 +4780,17 @@ async function loadSeasonEpisodes(seasonNum) {
   try {
     const data = await api(`/api/tv/${wizard.tmdbId}/season/${seasonNum}`);
     wizard.episodes = data.episodes || [];
-    // Per-episode watched-state for visual feedback. Anything <= the show's
-    // lastSeason/lastEpisode is treated as already watched (the user
-    // implicitly sees earlier episodes as watched when they mark a later one).
-    const lastS = wizard._lastWatchedS || 0;
-    const lastE = wizard._lastWatchedE || 0;
-    grid.innerHTML = wizard.episodes.map((ep) => {
-      const wasWatched =
-        ep.season_number < lastS ||
-        (ep.season_number === lastS && ep.episode_number <= lastE);
-      const cls = [
-        'ep-btn',
-        wizard.selectedEpisode === ep.episode_number ? 'selected' : '',
-        wasWatched ? 'ep-btn-watched' : '',
-      ].filter(Boolean).join(' ');
-      const checkMark = wasWatched
-        ? '<span class="ep-btn-check" title="Watched" style="color:var(--green,#3a3);margin-left:.2rem">✓</span>'
-        : '';
-      return `
-      <button class="${cls}"
-        onclick="wizardSelectEpisode(${ep.episode_number})"
-        title="${escape(ep.name || '')}${wasWatched ? ' — already watched' : ''}">
-        <span class="ep-btn-num">${ep.episode_number}${checkMark}</span>
-        <span class="ep-btn-label">${escape((ep.name || '').slice(0, 12))}</span>
-      </button>`;
-    }).join('');
+    renderSeasonSummary(seasonNum, wizard.episodes);
+    renderEpisodeGrid();
   } catch (e) {
-    grid.innerHTML = `<p class="text-muted" style="grid-column:1/-1;font-size:.8rem">Failed to load episodes</p>`;
+    grid.innerHTML = `<p class="text-muted" style="grid-column:1/-1;font-size:.85rem">Failed to load episodes</p>`;
   }
 }
 
 function wizardSelectEpisode(n) {
   wizard.selectedEpisode = n;
-  document.querySelectorAll('.ep-btn').forEach((b, i) => {
-    b.classList.toggle('selected', wizard.episodes[i]?.episode_number === n);
+  document.querySelectorAll('.ep-card').forEach((b) => {
+    b.classList.toggle('selected', Number(b.dataset.ep) === n);
   });
   // Update wizard title
   const h1 = document.querySelector('.wizard-title');
@@ -4248,8 +5008,19 @@ async function autoStreamBest() {
       }).then((r) => r.json());
       if (!data.magnet) throw new Error(data.error || 'no magnet');
       wizard.resolvedMagnet = data.magnet;
-      wizard.subtitleToken = null;
-      wizard.skipSubtitles = true; // embedded subs still appear via the player's manifest poll
+      // Resume takes this path, and it used to arrive with no subtitle at all — fine for
+      // a release with embedded tracks, but a YIFY-style rip has none, so resuming a film
+      // you were watching WITH subtitles gave you none. If the history entry remembers
+      // which one was chosen, fetch that same one again; the timing auto-fix then runs
+      // for this session as it did for the first.
+      const remembered = state.resumeSubtitle;
+      state.resumeSubtitle = null; // one use only — never leak onto an unrelated title
+      wizard.subtitleToken = remembered ? await reacquireSubtitleToken(remembered) : null;
+      if (remembered && !wizard.subtitleToken) {
+        toast('Could not re-download the saved subtitle — resuming without it.', 'info', 5000);
+      }
+      wizard.selectedSubtitle = wizard.subtitleToken ? remembered : null;
+      wizard.skipSubtitles = !wizard.subtitleToken; // embedded subs still arrive via the manifest poll
       wizard.step = 4;
       persistWizardState();
       renderWizardUI();
@@ -4568,7 +5339,7 @@ function renderWizardStep4(panel) {
 
       <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.4rem">
         Torrent: <span style="color:var(--text)">${escape((torrentName || '').slice(0, 80))}</span>
-        ${wizard.subtitleToken ? `<span style="color:var(--green);margin-left:.5rem">Subtitle loaded</span>` : ''}
+        ${wizard.subtitleToken ? `<span style="color:var(--green);margin-left:.5rem">Subtitle loaded</span><span id="subtitleFixStatus" style="margin-left:.4rem"></span>` : ''}
       </div>
 
       <div class="stream-terminal" id="streamTerminal"></div>
@@ -4614,10 +5385,17 @@ function updateStreamReadyActions(url) {
 async function wizardStartStream() {
   if (!wizard.resolvedMagnet) return;
 
-  // Check if there's already an active session with a player URL (e.g. page was refreshed)
+  // Check if there's already an active session for THIS stream (e.g. page was
+  // refreshed): our own session id, or a session playing this exact title. It used
+  // to fall back to ANY running session — the single-stream assumption that made
+  // the wizard attach movie B's start to movie A's stream instead of starting a
+  // second concurrent session.
   try {
     const active = await fetchJson('/api/stream/status');
-    const running = active.find((s) => s.id === wizard.sessionId) || active.find((s) => s.running);
+    const running = active.find((s) => s.id === wizard.sessionId)
+      || (wizard.tmdbId
+        ? adoptableSession(active, { tmdbId: wizard.tmdbId, season: wizard.selectedSeason, episode: wizard.selectedEpisode })
+        : null);
     if (running) {
       applyActiveStreamMeta(running);
       persistWizardState();
@@ -4657,6 +5435,9 @@ async function wizardStartStream() {
           source: (wizard.selectedTorrent && wizard.selectedTorrent.source) || null,
           season: wizard.selectedSeason,
           episode: wizard.selectedEpisode,
+          // The subtitle CHOICE rides along so Resume can fetch the same one again —
+          // resume takes the auto path, which never visits the subtitle step.
+          subtitle: describeChosenSubtitle(wizard.selectedSubtitle),
         },
       }),
     });
@@ -4672,6 +5453,7 @@ async function wizardStartStream() {
     connectStreamSSE(data.sessionId);
     startWaitingTimer();
     startStreamStatusPolling();
+    refreshNavStreamIndicator(); // a session was just added — recount for "Live · N"
   } catch (e) {
     appendTerminalLine(`Error: ${e.message}`, 'error');
     const badge = document.getElementById('streamStatusBadge');
@@ -4688,7 +5470,7 @@ function startStreamStatusPolling() {
       const ours = active.find((s) => s.id === wizard.sessionId);
       if (!ours && wizard.sessionId) {
         clearStreamStatusPolling();
-        updateNavStreamIndicator(false);
+        refreshNavStreamIndicator(); // OUR stream is gone; others may still be live
         clearPlayerBanner();
         updateStreamReadyActions(null);
         const badge = document.getElementById('streamStatusBadge');
@@ -4703,7 +5485,7 @@ function startStreamStatusPolling() {
         clearWizardState();
       } else if (ours && ours.exited) {
         clearStreamStatusPolling();
-        updateNavStreamIndicator(false);
+        refreshNavStreamIndicator(); // OUR stream ended; others may still be live
         clearPlayerBanner();
         updateStreamReadyActions(null);
         const badge = document.getElementById('streamStatusBadge');
@@ -4815,11 +5597,17 @@ function renderStreamHealth(health) {
 
   const engine = document.getElementById('healthEngine');
   if (engine) {
-    const label = health.engineStateText || 'Working';
-    engine.textContent = label;
-    // Green only for TorrServer's actual working state (3); anything else is neutral —
-    // guessing a colour for a state we don't recognise would be worse than no colour.
-    engine.style.color = health.engineState === 3 ? 'var(--green)' : 'var(--text-dim)';
+    if (health.engineDown) {
+      // The engine stopped answering (server-decided, see core/stream-health.js) —
+      // without this the panel would just freeze at its last numbers.
+      engine.textContent = 'Engine down — restarting…';
+      engine.style.color = 'var(--red)';
+    } else {
+      engine.textContent = health.engineStateText || 'Working';
+      // Green only for TorrServer's actual working state (3); anything else is neutral —
+      // guessing a colour for a state we don't recognise would be worse than no colour.
+      engine.style.color = health.engineState === 3 ? 'var(--green)' : 'var(--text-dim)';
+    }
   }
 
   const buf = health.buffer;
@@ -5168,6 +5956,7 @@ async function wizardStopStream() {
   if (wizard.sseSource) { wizard.sseSource.close(); wizard.sseSource = null; }
   clearWaitingTimer();
   clearStreamStatusPolling();
+  stopSubtitleFixPolling();
   if (wizard.sessionId) {
     await fetch(`/api/stream/stop/${wizard.sessionId}`, { method: 'DELETE' }).catch(() => {});
     wizard.sessionId = null;
@@ -5202,10 +5991,14 @@ function wizardGoStep(n) {
 }
 
 // -- Nav stream indicator ------------------------------------------------------
-function updateNavStreamIndicator(active, url) {
+// `count` defaults to the last refresh's live-session count: most call sites are
+// per-session paths ("my player is ready") that know nothing about OTHER streams,
+// and letting them default to 1 reset the badge from "Live · 2" back to "Live".
+function updateNavStreamIndicator(active, url, count = state.liveStreamCount || 1) {
   let indicator = document.getElementById('navStreamIndicator');
   if (!active) {
     if (indicator) indicator.remove();
+    state.liveStreamCount = 0;
     return;
   }
   if (!indicator) {
@@ -5214,7 +6007,15 @@ function updateNavStreamIndicator(active, url) {
     indicator.id = 'navStreamIndicator';
     navLinks.appendChild(indicator);
   }
-  indicator.innerHTML = `
+  // One stream keeps the old shortcut (straight into its player). Several streams
+  // have no single player to open — the badge shows the count and lands on the
+  // stream page, where the active-streams list offers each one.
+  indicator.innerHTML = count > 1
+    ? `
+    <a href="#/stream" class="nav-stream-indicator" title="${count} streams running — open the list">
+      Live · ${count}
+    </a>`
+    : `
     <a href="${url || '#/stream'}" onclick="return openActivePlayer(event, '${escape(url || '')}')"
        class="nav-stream-indicator" title="${url ? 'Open Player' : 'Streaming active'}">
       Live
@@ -5224,9 +6025,10 @@ function updateNavStreamIndicator(active, url) {
 async function refreshNavStreamIndicator() {
   try {
     const active = await fetchJson('/api/stream/status');
-    const running = active.find((s) => s.running);
-    if (running) {
-      updateNavStreamIndicator(true, running.playerUrl || null);
+    const running = active.filter((s) => s.running);
+    state.liveStreamCount = running.length;
+    if (running.length) {
+      updateNavStreamIndicator(true, running[0].playerUrl || null, running.length);
     } else {
       updateNavStreamIndicator(false);
     }
@@ -5291,7 +6093,8 @@ async function maybeReloadCastForSubtitleProgress() {
     if (!picked || !picked.ready) return; // no usable content yet
 
     const desiredStage = picked.complete ? 2 : 1;
-    const doneStage = castTvState.subtitleReloadKey === sel ? (castTvState.subtitleReloadStage || 0) : 0;
+    const key = castSubtitleReloadKey(sel, picked);
+    const doneStage = castTvState.subtitleReloadKey === key ? (castTvState.subtitleReloadStage || 0) : 0;
     if (doneStage >= desiredStage) return; // already loaded at this stage or beyond
 
     const session = castTvState.castSession;
@@ -5309,7 +6112,7 @@ async function maybeReloadCastForSubtitleProgress() {
     const loadRequest = buildCastLoadRequest(draft);
     if (resumeTime > 0) loadRequest.currentTime = resumeTime;
     await session.loadMedia(loadRequest);
-    castTvState.subtitleReloadKey = sel;
+    castTvState.subtitleReloadKey = key;
     castTvState.subtitleReloadStage = desiredStage;
   } catch (e) {
     // transient — a later tick will retry
@@ -5347,7 +6150,8 @@ async function maybeReloadNativeCastForSubtitleProgress() {
     if (!picked || !picked.ready) return; // no usable content yet
 
     const desiredStage = picked.complete ? 2 : 1;
-    const doneStage = castTvState.subtitleReloadKey === sel ? (castTvState.subtitleReloadStage || 0) : 0;
+    const key = castSubtitleReloadKey(sel, picked);
+    const doneStage = castTvState.subtitleReloadKey === key ? (castTvState.subtitleReloadStage || 0) : 0;
     if (doneStage >= desiredStage) return; // already pushed at this stage or beyond
 
     const draft = buildCastMediaDraft(meta, options, sel, castTvState.castTitle);
@@ -5370,7 +6174,7 @@ async function maybeReloadNativeCastForSubtitleProgress() {
       subtitleUrl,
       subtitleLang,
     }));
-    castTvState.subtitleReloadKey = sel;
+    castTvState.subtitleReloadKey = key;
     castTvState.subtitleReloadStage = desiredStage;
   } catch (e) {
     // transient — a later tick will retry
@@ -5483,6 +6287,8 @@ window.setCastVolume = setCastVolume;
 window.toggleCastMute = toggleCastMute;
 window.discoverDlnaDevices = discoverDlnaDevices;
 window.castToDlnaDevice = castToDlnaDevice;
+window.handleDlnaSubtitleSelection = handleDlnaSubtitleSelection;
+window.reloadDlnaSubtitleOnTv = reloadDlnaSubtitleOnTv;
 window.stopDlnaCast = stopDlnaCast;
 window.pauseDlnaCast = pauseDlnaCast;
 window.resumeDlnaCast = resumeDlnaCast;
@@ -5498,6 +6304,7 @@ window.openStreamWizard = openStreamWizard;
 window.openStreamWizardEp = openStreamWizardEp;
 window.wizardSelectSeason = wizardSelectSeason;
 window.wizardSelectEpisode = wizardSelectEpisode;
+window.wizardToggleHideWatched = wizardToggleHideWatched;
 window.wizardStep1Next = wizardStep1Next;
 window.wizardSelectTorrent = wizardSelectTorrent;
 window.wizardStep2Next = wizardStep2Next;

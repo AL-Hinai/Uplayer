@@ -202,6 +202,14 @@ function subInfo(url) {
 
 // DIDL-Lite metadata for the item. It rides INSIDE the SOAP XML, so the whole thing is
 // XML-escaped once more by the caller.
+//
+// ONE subtitle, not a list — and that is a measured limit, not an assumption. DIDL-Lite
+// permits repeated <res> elements, so a build carrying three sidecars (plus a
+// sec:CaptionInfoEx each) was sent to an LG webOS QNED816RA: it accepted the payload,
+// played fine, and fetched ONLY THE FIRST subtitle URL. The others were never requested.
+// There is no track list in AVTransport to switch between anyway. So the choice of which
+// subtitle to send has to be made before casting — which is why the DLNA card has a
+// picker and the Chromecast path (which takes a real track array) does not.
 function buildDidl(mediaUrl, title, subtitleUrl) {
   const mime = mimeFor(mediaUrl);
   const si = subInfo(subtitleUrl);
@@ -310,6 +318,25 @@ const pause = (id) => action(id, 'Pause', '<InstanceID>0</InstanceID>');
 const resume = (id) => action(id, 'Play', '<InstanceID>0</InstanceID><Speed>1</Speed>');
 const seek = (id, target) => action(id, 'Seek', '<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>' + xmlEscape(target) + '</Target>');
 
+// What the renderer says it can do RIGHT NOW — "Play,Stop,Pause,Seek,X_DLNA_SeekTime".
+//
+// Asked before offering to re-send a corrected subtitle: that re-send restarts the title,
+// and only a Seek puts the viewer back where they were. A TV without Seek would strand
+// them at 00:00, which they deserve to know BEFORE choosing it rather than after.
+//
+// GetCurrentTransportActions is OPTIONAL in the AVTransport spec, so a fault means
+// "unknown", not "no" — hence ok:false rather than canSeek:false. Never warn on unknown;
+// a false alarm would talk people out of something that works.
+async function transportActions(id) {
+  const dev = cache.get(id);
+  if (!dev) return { ok: false, actions: [], canSeek: false };
+  const r = await soapSafe(dev.controlUrl, 'GetCurrentTransportActions', '<InstanceID>0</InstanceID>', 5000);
+  if (faulted(r)) return { ok: false, actions: [], canSeek: false };
+  const raw = pick(/<Actions>([^<]*)<\/Actions>/i, r.body);
+  const actions = raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  return { ok: true, actions, canSeek: actions.some((a) => /seek/i.test(a)) };
+}
+
 async function status(id) {
   const dev = cache.get(id);
   if (!dev) return { ok: false };
@@ -328,7 +355,7 @@ async function status(id) {
 
 module.exports = {
   discover, publicList, getLastRaw, getDevice: (id) => cache.get(id) || null,
-  play, stop, pause, resume, seek, status,
+  play, stop, pause, resume, seek, status, transportActions,
   // exposed for unit tests
   _internals: { buildDidl, subInfo, faultText, faulted, xmlEscape, isLoadingOrPlaying, cacheDevice: (d) => cache.set(d.id, d) },
 };

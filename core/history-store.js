@@ -167,7 +167,7 @@ class HistoryStore {
    * been streamed simply has no entry to attach to, and resume falls back to
    * ranking releases normally.
    */
-  setLastPlayback(type, id, { source, season, episode } = {}) {
+  setLastPlayback(type, id, { source, season, episode, subtitle } = {}) {
     if (type !== 'movie' && type !== 'tv') throw new Error('type must be movie or tv');
     const db = this.read();
     const bucket = type === 'movie' ? db.movies : db.tvShows;
@@ -178,6 +178,10 @@ class HistoryStore {
     if (source) last.source = String(source);
     if (type === 'tv' && Number.isFinite(Number(season))) last.season = Number(season);
     if (type === 'tv' && Number.isFinite(Number(episode))) last.episode = Number(episode);
+    // The subtitle CHOICE, not the file — enough to download it again on Resume. The
+    // downloaded file lives in a temp dir and cannot be relied on to still exist, and
+    // re-fetching also means the timing auto-fix runs again for the new session.
+    if (subtitle && typeof subtitle === 'object') last.subtitle = subtitle;
     if (!Object.keys(last).length) return db; // nothing worth remembering
 
     last.savedAt = new Date().toISOString();

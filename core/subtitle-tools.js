@@ -78,6 +78,13 @@ function runProcess(bin, args, { timeoutMs = 600000, cwd } = {}) {
     } catch (e) {
       return resolve({ code: -1, error: e.message, stderr: '' });
     }
+    // BOTH pipes must be drained. alass writes a per-cue progress bar to STDOUT
+    // (1600+ lines on a movie-length subtitle); leaving that pipe unread fills
+    // its 64KB buffer, the child blocks mid-write, and the timeout reaps a
+    // process that finishes in seconds when its output is consumed. Small
+    // (trailer-sized) files stayed under the buffer — which is why this
+    // deadlock masqueraded as "works sometimes".
+    if (proc.stdout) proc.stdout.on('data', () => {});
     if (proc.stderr) proc.stderr.on('data', (d) => { stderr = (stderr + d.toString()).slice(-2000); });
     const to = setTimeout(() => { try { proc.kill(); } catch (e) {} resolve({ code: -1, error: 'timeout', stderr }); }, timeoutMs);
     proc.on('close', (code) => { clearTimeout(to); resolve({ code, stderr }); });
@@ -116,3 +123,5 @@ module.exports = {
   isAlassAvailable, isWhisperAvailable,
   syncSubtitle, generateSubtitle,
 };
+// exposed for unit tests
+module.exports._internals = { runProcess };

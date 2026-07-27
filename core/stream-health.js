@@ -21,6 +21,11 @@ function num(value) {
   return n == null ? 0 : n;
 }
 
+// One failed poll is a timeout blip; this many in a row (~3s at the caller's 1s tick)
+// is an engine that is actually gone. Below the threshold nothing changes, so a
+// single dropped request never flashes "engine down" at the user.
+const ENGINE_DOWN_AFTER = 3;
+
 class StreamHealth {
   constructor() {
     this.sizeBytes = null;
@@ -40,6 +45,12 @@ class StreamHealth {
     this.playheadSec = null;
     this.playheadFrom = null;
     this.updatedAt = null;
+    // The engine stopped answering entirely — distinct from answering with zeros
+    // (a stalled swarm still has a live engine). Set after ENGINE_DOWN_AFTER
+    // consecutive unreachable polls; cleared by the first successful one.
+    this.engineDown = false;
+    this.engineDownSince = null;
+    this._unreachableStreak = 0;
   }
 
   /**
@@ -58,6 +69,21 @@ class StreamHealth {
   /** Fold one TorrServer stats poll in. Field names are TorrServer's, snake_case. */
   report(stats) {
     const s = stats && typeof stats === 'object' ? stats : {};
+
+    // `unreachable` is the client's marker for "the poll itself failed" (see
+    // torrserver-client stats()). The zeros it carries still fold in below — they
+    // are what the caller has always seen — but the REASON is preserved here.
+    if (s.unreachable) {
+      this._unreachableStreak += 1;
+      if (this._unreachableStreak >= ENGINE_DOWN_AFTER && !this.engineDown) {
+        this.engineDown = true;
+        this.engineDownSince = Date.now();
+      }
+    } else {
+      this._unreachableStreak = 0;
+      this.engineDown = false;
+      this.engineDownSince = null;
+    }
 
     // Monotonic: TorrServer can report a smaller cache after eviction, but "downloaded"
     // going backwards would make the progress bar jump about.
@@ -117,10 +143,12 @@ class StreamHealth {
    * Buffer ahead of the playhead — AN ESTIMATE, and it says so.
    *
    * Verified against a live TorrServer: there is no piece bitmap and no positional
-   * field in the API. `preloaded_bytes` equals `loaded_size` — it is a total-cached
-   * counter, not a contiguous window. So this is only sound if the download is
-   * sequential from the front, which is what the reader does but not a guarantee. It's
-   * also averaged over the whole file, so a VBR-heavy scene will read wrong.
+   * field in the /torrents API. `preloaded_bytes` equals `loaded_size` — it is a
+   * total-cached counter, not a contiguous window. So this is only sound if the
+   * download is sequential from the front, which is what the reader does but not a
+   * guarantee. It's also averaged over the whole file, so a VBR-heavy scene will
+   * read wrong. (POST /cache DOES expose a real piece bitmap — see
+   * exactBufferAheadBytes below for the honest successor; not yet wired in here.)
    *
    * Null — never a guess — when the duration is unknown or nothing has reported a
    * playhead yet.
@@ -157,9 +185,54 @@ class StreamHealth {
       engineStateText: this.engineStateText,
       wasteRatio: this.wasteRatio,
       buffer: this.buffer,
+      engineDown: this.engineDown,
+      engineDownSince: this.engineDownSince,
       updatedAt: this.updatedAt,
     };
   }
+}
+
+/**
+ * EXACT contiguous buffer ahead of an absolute torrent byte position, computed from
+ * TorrServer's /cache piece map (see torrserver-client cacheState()).
+ *
+ * This is what the `buffer` estimate above cannot do: the estimate divides a
+ * TOTAL-cached counter by average bitrate and assumes the download is sequential, so
+ * a hole right after the playhead (the seek-then-stall case, or a swarm that
+ * delivered pieces out of order) reads as a healthy cushion. Here the piece map is
+ * walked forward from the position and stops at the first incomplete piece — a hole
+ * IS the answer.
+ *
+ * `absoluteByte` is torrent-absolute: for a multi-file torrent the caller adds the
+ * file's start offset (sum of preceding file lengths). That also fixes the second
+ * estimate failure — `preloaded_bytes` is torrent-wide, so other files' bytes
+ * inflate the estimate; a piece walk cannot be inflated by bytes elsewhere.
+ *
+ * Pure, like everything in this module: the caller polls /cache and hands it in.
+ * Null when the cache state is unusable (never a guess); 0 when the piece under the
+ * position itself is missing. The torrent's final piece may be shorter than
+ * pieceLength, so a window reaching end-of-torrent can overcount by up to one piece.
+ */
+function exactBufferAheadBytes(cache, absoluteByte) {
+  if (!cache || typeof cache !== 'object') return null;
+  const pieceLength = num(cache.pieceLength);
+  const piecesCount = num(cache.piecesCount);
+  const pieces = cache.pieces;
+  if (pieceLength <= 0 || piecesCount <= 0 || !pieces || typeof pieces !== 'object') return null;
+  const pos = finiteOrNull(absoluteByte);
+  if (pos == null || pos < 0) return null;
+
+  // JSON map keys arrive as strings; tolerate either casing of Completed.
+  const complete = (i) => {
+    const p = pieces[i] != null ? pieces[i] : pieces[String(i)];
+    return !!p && (p.Completed === true || p.completed === true);
+  };
+
+  let i = Math.floor(pos / pieceLength);
+  if (i >= piecesCount || !complete(i)) return 0;
+  let bytes = (i + 1) * pieceLength - pos; // remainder of the piece under the position
+  for (i += 1; i < piecesCount && complete(i); i++) bytes += pieceLength;
+  return bytes;
 }
 
 /**
@@ -185,4 +258,5 @@ function legacyProgressPayload(status) {
 module.exports = {
   StreamHealth,
   legacyProgressPayload,
+  exactBufferAheadBytes,
 };

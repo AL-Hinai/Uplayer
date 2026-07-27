@@ -147,6 +147,44 @@ function testLegacyPeersFallbackPreservesOldCollapse() {
   assert.strictEqual(legacyProgressPayload(swarmOnly).peers, 205, 'then to the swarm');
 }
 
+// --- engine down -----------------------------------------------------------------
+
+// The real failure this covers: TorrServer died mid-movie, every poll failed, and the
+// UI showed a percent frozen at 38% with 0 speed forever. The client now marks failed
+// polls `unreachable`; a streak of them must become an explicit engineDown flag.
+function testEngineDownNeedsAStreakNotOneBlip() {
+  const h = new StreamHealth().attachSource({ sizeBytes: 1000 });
+  const dead = { downloadSpeed: 0, peers: 0, seeds: 0, preloadedBytes: 0, unreachable: true };
+
+  assert.strictEqual(h.report(dead).engineDown, false, 'one failed poll is a blip');
+  assert.strictEqual(h.report(dead).engineDown, false, 'two is still a blip');
+  const s = h.report(dead);
+  assert.strictEqual(s.engineDown, true, 'three in a row is a dead engine');
+  assert.ok(Number.isFinite(s.engineDownSince), 'stamped when it crossed the threshold');
+}
+
+function testEngineDownClearsOnFirstGoodPoll() {
+  const h = new StreamHealth().attachSource({ sizeBytes: 1000 });
+  const dead = { unreachable: true };
+  h.report(dead); h.report(dead); h.report(dead);
+  assert.strictEqual(h.status().engineDown, true);
+
+  const s = h.report(liveStats());
+  assert.strictEqual(s.engineDown, false, 'the engine answered — it is back');
+  assert.strictEqual(s.engineDownSince, null);
+
+  // And the streak restarts from zero: a fresh blip is a blip again.
+  assert.strictEqual(h.report(dead).engineDown, false);
+}
+
+function testEngineDownKeepsDownloadedMonotonic() {
+  // The dead poll carries zeros; the progress bar must not jump back because of it.
+  const h = new StreamHealth().attachSource({ sizeBytes: 1000 });
+  h.report(liveStats({ preloadedBytes: 380 }));
+  const s = h.report({ preloadedBytes: 0, unreachable: true });
+  assert.strictEqual(s.downloadedBytes, 380, 'frozen at last real value, not zeroed');
+}
+
 function testEmptyStatsDoNotThrow() {
   const h = new StreamHealth();
   const s = h.report(null);
@@ -167,6 +205,9 @@ function main() {
   testLastPlayheadWins();
   testLegacyProgressPayloadIsByteIdentical();
   testLegacyPeersFallbackPreservesOldCollapse();
+  testEngineDownNeedsAStreakNotOneBlip();
+  testEngineDownClearsOnFirstGoodPoll();
+  testEngineDownKeepsDownloadedMonotonic();
   testEmptyStatsDoNotThrow();
   console.log('stream-health.test.js passed');
 }

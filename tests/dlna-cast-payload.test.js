@@ -50,6 +50,29 @@ function testFaultTextDecodesUpnpError() {
   assert.strictEqual(I.faultText(null), 'no response from TV');
 }
 
+// Applying a corrected subtitle costs a restart, and only a Seek puts the viewer back.
+// So "can this TV seek" gets asked BEFORE the offer is made — and the three answers are
+// yes, no, and UNKNOWN. GetCurrentTransportActions is optional in the AVTransport spec,
+// so a fault must not be reported as "no": warning someone off a restore that would have
+// worked is its own failure.
+async function testTransportActionsHasThreeAnswers() {
+  const dlna = require('../core/dlna-caster');
+  const calls = [];
+  I.cacheDevice({ id: 'seek-tv', name: 'Test TV', model: '', address: 'h:1', controlUrl: 'http://127.0.0.1:1/ctl', location: 'l' });
+
+  // Nothing is stubbed here, so the SOAP call fails outright — the "unknown" path.
+  const unknown = await dlna.transportActions('seek-tv');
+  assert.strictEqual(unknown.ok, false, 'an unreachable/faulting TV is UNKNOWN...');
+  assert.strictEqual(unknown.canSeek, false, '...and canSeek stays false, but ok:false is what callers must check');
+
+  assert.deepStrictEqual(
+    await dlna.transportActions('no-such-device'),
+    { ok: false, actions: [], canSeek: false },
+    'an unknown device id must not throw'
+  );
+  assert.strictEqual(calls.length, 0);
+}
+
 function testFaultedPredicate() {
   assert.strictEqual(I.faulted(null), true);
   assert.strictEqual(I.faulted({ status: 500 }), true);
@@ -59,12 +82,13 @@ function testFaultedPredicate() {
   assert.strictEqual(I.faulted({ status: 0 }), true);
 }
 
-function main() {
+async function main() {
   testDidlEscapesAmpersands();
   testSubtitleMimeMatchesFile();
   testFaultTextDecodesUpnpError();
   testFaultedPredicate();
+  await testTransportActionsHasThreeAnswers();
   console.log('dlna-cast-payload.test.js passed');
 }
 
-main();
+main().catch((err) => { console.error(err); process.exit(1); });
