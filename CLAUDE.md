@@ -123,6 +123,19 @@ Two consequences that are easy to break:
 - **A no-op fix must change nothing.** A subtitle that was already correctly timed comes back
   from alass unchanged; relabelling it, adding a duplicate track, or (on DLNA) offering to
   restart the film for a difference of zero are all wrong. See `_syncChangedTiming`.
+- **alass is bounded by its reference, and its answer is checked.** The reference is only the
+  first 20 minutes of audio — all the swarm has delivered when the fix runs — so `syncSubtitle`
+  passes `--no-split` whenever that is shorter than the subtitle: with nothing under minute 20,
+  split mode's best-scoring move is to drag the whole track into the window, and on a real
+  140-minute film it did exactly that. alass exits 0 on a confidently wrong alignment, so
+  `_implausibleSync` is the only thing between one and every playback target. Both entry
+  points also ask `_subtitleMisfitReason` first — a subtitle that does not span this film's
+  runtime is not a subtitle for this film, and the viewer picks these by hand from search
+  results that are often mislabelled. `tests/subtitle-sync-guard.test.js` pins the guards;
+  `tests/subtitle-sync-matrix.test.js` runs the real binary end-to-end across four scripts,
+  four runtimes and six kinds of mis-timing, and asserts the residual stays under 1s.
+  Loosening any of it needs a reason in the file. Known and accepted limit: a subtitle for a
+  DIFFERENT film of similar runtime is indistinguishable from timestamps alone.
 
 `tests/subtitle-coexistence.test.js` pins all of this; `tests/auto-sync-subtitle.test.js` covers
 the fix's own behaviour. Note also that `streamManager.subtitlePath` is **not** a reliable

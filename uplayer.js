@@ -34,6 +34,20 @@ const {
 
 loadEnvFileOnce();
 
+// Ceilings on what the subtitle timing auto-fix is allowed to call a fix. Both are
+// deliberately far above any real correction — they exist to catch a MISALIGNMENT, not
+// to grade one. See StreamManager._implausibleSync for what each one is measuring.
+const MAX_PLAUSIBLE_SHIFT_MS = 5 * 60 * 1000;
+const MAX_SPAN_WARP = 0.06;
+
+// How much of the film a subtitle has to cover to be a subtitle FOR that film. Asymmetric
+// on purpose: subtitles routinely stop a few minutes early (untranslated credits, a song
+// left alone), so the floor is generous — but one that runs PAST the end is describing a
+// longer cut or a different title, and there is no innocent reason for it.
+// See StreamManager._subtitleMisfitReason.
+const MIN_SUBTITLE_COVERAGE = 0.4;
+const MAX_SUBTITLE_OVERRUN = 1.1;
+
 // Stream manager
 class StreamManager extends EventEmitter {
   constructor(lowMemoryMode = false, memoryTracker = null) {
@@ -748,6 +762,12 @@ class StreamManager extends EventEmitter {
     const tools = require('./core/subtitle-tools');
     if (!tools.isAlassAvailable()) return { ok: false, reason: 'alass not installed' };
     if (!subPath || !fs.existsSync(subPath)) return { ok: false, reason: 'subtitle missing' };
+    // Before spending minutes extracting audio: is this a subtitle for this film at all?
+    // The auto path asks the same question earlier (it can skip the whole job); this is
+    // the backstop for the player's CC⇄ button, where the file came from a hand-picked
+    // search result and nothing has vetted it.
+    const misfit = this._subtitleMisfitReason(subPath);
+    if (misfit) return { ok: false, reason: `sync skipped (${misfit})` };
     const wav = path.join(this.tempDir, `alass_${Date.now()}.wav`);
     this._log('Extracting audio for subtitle sync…');
     if (!(await this._extractStreamAudio(wav, { maxSeconds: opts.maxSeconds }))) return { ok: false, reason: 'audio extraction failed' };
@@ -762,14 +782,32 @@ class StreamManager extends EventEmitter {
       opts.maxSeconds || Infinity,
       (this.streamHealth && this.streamHealth.durationSec) || Infinity
     );
+    let wavDur = null;
     if (Number.isFinite(expected)) {
-      let wavDur = null;
       try { wavDur = await this._probeDurationSeconds(wav); } catch (e) { /* probe unavailable → trust ffmpeg */ }
       if (wavDur != null && wavDur < expected * 0.9) {
         try { fs.unlinkSync(wav); } catch (e) {}
         return { ok: false, reason: `audio incomplete (${Math.round(wavDur)}s of ${Math.round(expected)}s cached) — retry once more is buffered` };
       }
     }
+
+    // The reference is the FIRST `maxSeconds` of the film — 20 minutes of a 140-minute
+    // feature, because that is all the swarm has delivered when this runs. alass's
+    // default mode cuts the subtitle into segments and moves each independently
+    // (--split-penalty 7), which needs reference audio UNDER every segment. Give it a
+    // reference that stops at minute 20 and the best-scoring alignment is to drag the
+    // whole track into that window — which is precisely what it did on a real run:
+    // cues pulled up to 43 minutes early, the first 45 minutes of the film clamped to
+    // 00:00:00 (alass writes 0 for a negative timestamp), the subtitle destroyed.
+    //
+    // A partial reference can only honestly support ONE inference: a constant offset
+    // for the whole track (plus alass's framerate correction, which is a global scale
+    // and stays enabled). So ask for exactly that. Full coverage — a short subtitle, or
+    // a user-triggered sync on a fully cached film — keeps split mode, where per-scene
+    // retiming is a real thing worth fixing.
+    const subSpan = this._subtitleSpanSeconds(subPath);
+    const refSeconds = wavDur != null ? wavDur : (opts.maxSeconds || null);
+    const noSplit = !!(subSpan && refSeconds && refSeconds < subSpan * 0.98);
 
     // This name is for humans reading a temp dir, and nothing else. It was chosen when
     // VLC was believed to name an external track after its filename; VLC 3.0.23 does not
@@ -780,8 +818,22 @@ class StreamManager extends EventEmitter {
     // alass's VAD over a 20-minute WAV takes minutes on its own — the library
     // default of 3 killed real runs mid-analysis ("error":"timeout" with a warm
     // cache). 10 minutes is generous without letting a hang live forever.
-    const r = await tools.syncSubtitle(wav, subPath, out, { timeoutMs: 10 * 60 * 1000 });
+    const r = await tools.syncSubtitle(wav, subPath, out, { timeoutMs: 10 * 60 * 1000, noSplit });
     try { fs.unlinkSync(wav); } catch (e) {}
+
+    // --no-split narrows what alass CAN do wrong; it does not make it right. alass exits
+    // 0 on a confidently wrong alignment exactly as it does on a good one, so the only
+    // thing standing between a bad alignment and every playback target is this check.
+    // A rejected fix leaves the downloaded subtitle exactly as it arrived, which is the
+    // right failure: out by a few seconds beats out by half an hour.
+    if (r.ok) {
+      const bad = this._implausibleSync(subPath, r.output);
+      if (bad) {
+        try { fs.unlinkSync(r.output); } catch (e) {}
+        this._log(`Subtitle sync rejected — ${bad}. Keeping the original timing.`);
+        return { ok: false, reason: `sync rejected (${bad})` };
+      }
+    }
     return r;
   }
 
@@ -814,6 +866,99 @@ class StreamManager extends EventEmitter {
       if (Math.abs(a[i] - b[i]) > 50) return true;
     }
     return false;
+  }
+
+  // Is this subtitle even FOR this film? Returns a human reason string when it plainly
+  // is not, or null when nothing rules it out. Judged only by how much of the runtime it
+  // covers, which is the one thing comparable without understanding either.
+  //
+  // This exists because the viewer picks the subtitle by hand, from provider search
+  // results that are frequently mislabelled — a trailer that charts high on download
+  // count, an episode file in a film's results, a different cut of the same title. alass
+  // will align any of them to something and exit 0, and the cost of letting it is not
+  // just a useless subtitle: it is minutes of audio extraction, a green "timing fixed"
+  // badge that says the opposite of the truth, and on a TV an offer to RESTART the film
+  // to apply it. Cheaper and more honest to say no first.
+  //
+  // Both entry points must ask — the background auto-fix AND the player's CC⇄ button —
+  // which is why the rule lives here and not in either caller.
+  //
+  // Note the limit of this test: a subtitle for a DIFFERENT film of similar runtime
+  // passes it, and nothing downstream can tell either. Timing cannot distinguish two
+  // 164-minute films; only the words could, and we do not read them. What is guaranteed
+  // is narrower and more useful — a wrong subtitle stays wrong, and a RIGHT one is never
+  // made wrong.
+  _subtitleMisfitReason(subPath) {
+    const mediaDur = this.streamHealth && this.streamHealth.durationSec;
+    const span = this._subtitleSpanSeconds(subPath);
+    // Duration arrives from the probe and the span from the file; without both there is
+    // no ratio, and a missing input is not evidence of anything.
+    if (!mediaDur || span == null) return null;
+    const mins = (s) => Math.round(s / 60);
+    if (span < mediaDur * MIN_SUBTITLE_COVERAGE) {
+      return `it covers only ${mins(span)}min of a ${mins(mediaDur)}min film (a trailer or sample?)`;
+    }
+    if (span > mediaDur * MAX_SUBTITLE_OVERRUN) {
+      return `its last line falls ${mins(span - mediaDur)}min past the end of a ${mins(mediaDur)}min film (a different cut, or another title?)`;
+    }
+    return null;
+  }
+
+  // Is this "correction" too large to be a correction? Returns a human reason string when
+  // the result should be thrown away, or null when it is worth keeping.
+  //
+  // Three independent signals, because a bad alignment usually trips all three and any
+  // one of them alone is enough to know. Deliberately loose: this is not a quality
+  // score, it is a floor under catastrophe. A sync that is merely mediocre gets through,
+  // and should — the viewer can still pick "Original timing".
+  //
+  //   * Cues clamped to zero. alass writes 00:00:00,000 for any negative timestamp, so
+  //     cues appearing at zero that were not there before means the alignment ran the
+  //     subtitle off the front of the film. Nothing legitimate does that.
+  //   * An implausible shift. A downloaded subtitle was cut for a different release of
+  //     the SAME film, so its error is a distributor intro or a missing pre-roll —
+  //     seconds, at worst a minute or two. Half an hour is not a mis-timing, it is a
+  //     misalignment.
+  //   * A warped span. First-cue-to-last-cue must survive the correction. An offset does
+  //     not change it at all and alass's framerate correction scales it by a known ratio
+  //     — 25/23.976 is the widest pair in play, 4.3% — so anything past 6% is the track
+  //     being squashed or stretched to fit something it is not.
+  _implausibleSync(originalPath, syncedPath) {
+    const a = this._subtitleCueStarts(originalPath);
+    const b = this._subtitleCueStarts(syncedPath);
+    // Unreadable or empty: no evidence either way. _syncChangedTiming already treats
+    // that case as "keep the correction", and disagreeing here would silently undo it.
+    if (!a || !b || a.length === 0 || b.length === 0) return null;
+
+    // Three, not one: a subtitle whose opening cue sits a few seconds in can legitimately
+    // lose that one cue to a small negative correction. Three or more is a track being
+    // walked off the front of the film, which is what a squashed alignment looks like.
+    const zeros = (list) => list.filter((t) => t === 0).length;
+    const clamped = zeros(b) - zeros(a);
+    if (clamped >= 3) return `${clamped} cues pushed off the start of the film`;
+
+    // The median, not _subtitleUniformShiftMs: that one pairs mismatched cue lists by
+    // NEAREST neighbour, which on a badly misaligned file quietly pairs cue 800 with cue
+    // 40 and reports a small offset for a huge error. Index pairing is the honest
+    // measure here, so a length mismatch skips this signal rather than faking it — the
+    // other two still apply.
+    if (a.length === b.length) {
+      const offsets = a.map((t, i) => b[i] - t).sort((x, y) => x - y);
+      const median = offsets[Math.floor(offsets.length / 2)];
+      if (Math.abs(median) > MAX_PLAUSIBLE_SHIFT_MS) {
+        return `it moves the subtitle by ${(Math.abs(median) / 60000).toFixed(0)} minutes`;
+      }
+    }
+
+    const spanA = a[a.length - 1] - a[0];
+    const spanB = b[b.length - 1] - b[0];
+    if (spanA > 0) {
+      const ratio = spanB / spanA;
+      if (Math.abs(ratio - 1) > MAX_SPAN_WARP) {
+        return `it ${ratio < 1 ? 'compresses' : 'stretches'} the subtitle to ${(ratio * 100).toFixed(0)}% of its length`;
+      }
+    }
+    return null;
   }
 
   // The constant offset between two subtitle files in ms, or null when the correction is
@@ -938,15 +1083,15 @@ class StreamManager extends EventEmitter {
       // incomplete extraction as "not yet", not as a result. Syncing against a
       // fragment is worse than not syncing: it once shifted a correct subtitle
       // by four minutes and every player dutifully showed the damage.
-      // Junk guard: a "subtitle" spanning a small fraction of the runtime is a
-      // trailer/sample upload (they chart high on download counts), and aligning
-      // one against the movie's audio produces meaningless shifts. Leave it be —
-      // the user can see it's junk; a sync would only disguise that.
-      const mediaDur = this.streamHealth && this.streamHealth.durationSec;
-      const span = this._subtitleSpanSeconds(entry.path);
-      if (mediaDur && span != null && span < mediaDur * 0.4) {
-        this._log(`Subtitle covers only ${Math.round(span / 60)}min of a ${Math.round(mediaDur / 60)}min film (trailer/sample upload?) — auto-sync skipped.`);
-        this._subtitleJob = { kind: 'sync', running: false, error: 'subtitle looks like a trailer/sample — sync skipped', startedAt: this._subtitleJob.startedAt };
+      // Junk guard: a subtitle that does not span this film is not a subtitle for this
+      // film, and aligning it against the movie's audio produces a meaningless shift.
+      // Leave it be — the user can see it is wrong; a sync would only disguise that.
+      // Asked here as well as inside syncSubtitle so the whole job — audio extraction
+      // included — is skipped rather than merely wasted.
+      const misfit = this._subtitleMisfitReason(entry.path);
+      if (misfit) {
+        this._log(`Auto-sync skipped — ${misfit}`);
+        this._subtitleJob = { kind: 'sync', running: false, error: `sync skipped (${misfit})`, startedAt: this._subtitleJob.startedAt };
         return;
       }
 

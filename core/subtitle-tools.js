@@ -94,11 +94,20 @@ function runProcess(bin, args, { timeoutMs = 600000, cwd } = {}) {
 
 // Sync `incorrectSubPath` to `referencePath` (a subtitle or a video/audio file),
 // writing `outputPath`. Returns { ok, output?, reason? }.
+//
+// `opts.noSplit` passes alass's --no-split: the whole track may only be SHIFTED, never
+// cut into segments that each move by a different amount. That is not a tuning
+// preference — split mode needs reference material under every segment, so it is only
+// honest when the reference covers the whole subtitle. The caller owns that judgement;
+// see uplayer.js syncSubtitle for why it is usually false here.
 async function syncSubtitle(referencePath, incorrectSubPath, outputPath, opts = {}) {
   const bin = resolveAlass();
   if (!bin) return { ok: false, reason: 'alass not installed' };
   if (!fs.existsSync(referencePath) || !fs.existsSync(incorrectSubPath)) return { ok: false, reason: 'input file missing' };
-  const r = await runProcess(bin, [referencePath, incorrectSubPath, outputPath], { timeoutMs: opts.timeoutMs || 180000 });
+  const args = [];
+  if (opts.noSplit) args.push('--no-split');
+  args.push(referencePath, incorrectSubPath, outputPath);
+  const r = await runProcess(bin, args, { timeoutMs: opts.timeoutMs || 180000 });
   if (r.code === 0 && fs.existsSync(outputPath)) return { ok: true, output: outputPath };
   return { ok: false, reason: r.error || ('alass exit ' + r.code), stderr: (r.stderr || '').slice(-300) };
 }
