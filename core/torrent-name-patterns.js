@@ -33,11 +33,27 @@ const LONGFORM_RE = /season[\s_]+(\d{1,3})[\s_]+episode[\s_]+(\d{1,5})/i;
 // to the episode marker.
 const ANIME_SEASON_DASH_RE = /\b(?:s|season)[\s_]*(\d{1,3})[\s_]*-[\s_]*(\d{1,4})\b/i;
 
+// Explicit part/cour tag: "Part 2", "Cour 2". Signals the episode number that follows is
+// numbered within that part, not within the season.
+const PART_TAG_RE = /\b(?:part|cour)[\s._-]*0*(\d{1,2})\b/i;
+
 // Resolution / audio markers we should NEVER treat as episode numbers.
 const RESOLUTION_RE = /\b(?:480|540|576|720|1080|1440|2160|4320)p\b/i;
 
 // 4-digit year in the name (used for cross-show / wrong-show heuristic).
 const YEAR_RE = /\b(19[5-9]\d|20\d{2})\b/;
+
+// Canonical form for title-hint containment: macrons folded to double vowels (Yūsha→Yuusha,
+// matching tracker romaji), lowercased, every punctuation run collapsed to one space. Must
+// stay in sync with normalizeTitle in core/episode-numbering.js, which produces the hints.
+function normalizeReleaseText(rawName) {
+  return String(rawName || '')
+    .replace(/ā/g, 'aa').replace(/ī/g, 'ii').replace(/ū/g, 'uu')
+    .replace(/ē/g, 'ee').replace(/ō/g, 'ou')
+    .replace(/Ā/g, 'Aa').replace(/Ī/g, 'Ii').replace(/Ū/g, 'Uu')
+    .replace(/Ē/g, 'Ee').replace(/Ō/g, 'Ou')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
 
 /**
  * Extract a structured verdict from a torrent name. Pure function — no I/O,
@@ -118,27 +134,40 @@ function parseName(rawName) {
 
   const hasResolution = RESOLUTION_RE.test(lower);
 
+  let partTag = null;
+  const partMatch = sanitized.match(PART_TAG_RE);
+  if (partMatch) {
+    partTag = parseInt(partMatch[1], 10);
+    patternsHit.push('PART_TAG');
+  }
+
   // Bare numeric tokens — used by the anime absolute-episode rule for cases
   // like `One Piece 1163` (no S/E marker, no `Show - NN` dash). We exclude
   // plausible years, the SE-pair episode we already captured, and tokens
   // that are inside a `start-end` range (manga/season compilations like
   // `1044-1163` would otherwise false-positive on every absolute episode in
   // the range). Resolution numbers were stripped above.
+  // We also need a precondition that the candidate is preceded by a word-boundary (start,
+  // space, or non-alphanumeric). A trailing `start-end` range is consumed but NOT captured.
   const bareTokens = [];
-  const tokenRe = /(\d+)?(?:-)?(\d{2,5})(?=[^a-z0-9p]|$)/gi;
-  // The split is intentional: capture a hyphen-prefixed number so we can skip
-  // it. We also need a precondition that the candidate is preceded by a
-  // word-boundary (start, space, or non-alphanumeric).
-  const tokenRe2 = /(?:^|[^a-z0-9])(\d+)(?:[\-–]\d+)?(?=[^a-z0-9p]|$)/gi;
+  const tokenRe = /(?:^|[^a-z0-9])(\d+)(?:[\-–]\d+)?(?=[^a-z0-9p]|$)/gi;
   let m;
-  while ((m = tokenRe2.exec(sanitized)) != null) {
-    // m[1] is the leading number. If a range follows, the trailing number is
-    // consumed by the regex but NOT captured — we just skip it.
+  while ((m = tokenRe.exec(sanitized)) != null) {
     const n = parseInt(m[1], 10);
     if (!Number.isFinite(n)) continue;
     if (n < 10) continue; // too short to disambiguate from version markers
     if (n >= 1950 && n <= 2099) continue; // skip year-like tokens
     if (exactSE && n === exactSE.episode) continue;
+    // Codec and bit-depth numbers are not episodes. `H.264`, `x265`, `HEVC 10 bit` all leave
+    // a bare 2-3 digit token behind, and any of them landing on the absolute episode number
+    // made an unrelated release look like an exact hit (`Bleach - 003 [H.265]` scored as
+    // absolute episode 265). Judge by the neighbouring word, which is what distinguishes them.
+    // The match starts one separator char before the digits (or at position 0 via `^`).
+    const digitsAt = m.index + (m[0].startsWith(m[1]) ? 0 : 1);
+    const before = sanitized.slice(Math.max(0, digitsAt - 12), digitsAt);
+    const after = sanitized.slice(digitsAt + m[1].length, digitsAt + m[1].length + 6);
+    if (/(?:^|[^a-z])(?:h|x|avc|hevc|av|mpeg|aac|ac|dd|dts|ddp|opus|flac)[\s._-]*$/i.test(before)) continue;
+    if (/^[\s._-]*(?:bits?|kbps|fps|khz)\b/i.test(after)) continue;
     bareTokens.push(n);
   }
 
@@ -150,9 +179,55 @@ function parseName(rawName) {
     longformSE,
     year,
     hasResolution,
+    partTag,
     bareTokens,
+    normalized: normalizeReleaseText(name),
     patternsHit,
   };
+}
+
+// When a release name carries a season-pinning title hint, a bare episode number is only
+// trustworthy if it sits right after the hint with nothing unexplained in between —
+// "Sennen Kessen-hen - 14" yes, "Sennen Kessen-hen ~Kashin-tan~ - 14" no (that unknown
+// subtitle is a cour title, and its numbering restarts). Years and episode-marker tokens
+// (e/ep/episode, v2) are allowed through; any other word or number means the number we
+// found belongs to something else.
+function relativeNumberNearHint(normalized, hint, episode) {
+  if (!hint || episode == null) return false;
+  const padded = ' ' + normalized + ' ';
+  const needle = ' ' + hint + ' ';
+  // Every occurrence, not just the first: a group tag that repeats the season title
+  // ("[Sennen Kessen-hen Subs] Bleach - Sennen Kessen-hen - 14") would otherwise be judged
+  // on the tag and never reach the real one.
+  for (let from = 0; ; ) {
+    const idx = padded.indexOf(needle, from);
+    if (idx < 0) return false;
+    from = idx + 1;
+    if (readsAs(normalized.slice(idx + hint.length), episode)) return true;
+  }
+}
+
+// Does the text immediately following a season title read as `episode`?
+function readsAs(rest, episode) {
+  for (const tok of rest.trim().split(' ')) {
+    if (!tok) continue;
+    const asNum = /^0*(\d{1,5})(?:v\d+)?$/.exec(tok);
+    if (asNum) {
+      const n = parseInt(asNum[1], 10);
+      if (n === episode) return true;
+      if (n >= 1950 && n <= 2099) continue; // a year in the title line, not a number
+      return false; // some other number first — a different episode or part numbering
+    }
+    // An explicit S##E## tag is NOT a relative number: it names a season, and only the alias
+    // machinery knows which alternate numberings are legitimate for this episode. Reading it
+    // positionally accepted "Thousand-Year Blood War S05E14" for S2E14.
+    if (/^s0*\d{1,3}e0*\d{1,5}$/.test(tok)) return false;
+    const et = /^(?:e|ep)0*(\d{1,5})$/.exec(tok);
+    if (et) return parseInt(et[1], 10) === episode;
+    if (/^(?:e|ep|episode)$/.test(tok)) continue;
+    return false; // an unexplained word between the season title and any number
+  }
+  return false;
 }
 
 /**
@@ -162,6 +237,63 @@ function parseName(rawName) {
  */
 function classify(parsed, expected) {
   const { season, episode, absoluteEpisode, isAnime } = expected;
+  // Optional numbering profile from core/episode-numbering.js. Without it every new flag
+  // stays false and the function behaves exactly as before.
+  const seasonHints = expected.seasonHints || [];
+  const foreignHints = expected.foreignHints || [];
+  const partHints = expected.partHints || [];
+  const seAliases = expected.seAliases || [];
+  const partLengths = expected.partLengths || null;
+  const ownShowSeasonCount = expected.ownShowSeasonCount != null ? expected.ownShowSeasonCount : null;
+
+  const padded = ' ' + (parsed.normalized || '') + ' ';
+  const containsHint = (h) => !!h && padded.includes(' ' + h + ' ');
+  const seasonHintHits = seasonHints.filter(containsHint);
+  const seasonHintHit = seasonHintHits.length > 0;
+  const foreignHintHit = foreignHints.some(containsHint);
+
+  // ---- Cour / part reasoning ---------------------------------------------------
+  // A part title in the name is only allowed to OVERRIDE the normal rules when the profile
+  // can actually adjudicate it — i.e. a split episode group told us which episodes that cour
+  // holds (`resolved`). An unresolved part hint, or a bare "Part 2" we cannot map to a cour,
+  // is not evidence of anything and must fall through, or perfectly-tagged releases get
+  // dropped ("Attack on Titan The Final Season Part 2 S04E17" is exactly how those ship).
+  const partHits = partHints.filter((p) => p && containsHint(p.hint));
+  const namedRightPart = partHits.some((p) => p.episode != null);
+  // Named a cour that provably does NOT contain the requested episode → wrong release.
+  const namedWrongPart = !namedRightPart
+    && partHits.some((p) => p.resolved && p.episode == null);
+
+  // A bare "Part N" is only readable when no cour was named outright and the profile knows
+  // the boundaries; otherwise it is ignored entirely.
+  const bareTagPart = (!partHits.length && parsed.partTag != null && seasonHintHit)
+    ? partHints.find((p) => p && p.part === parsed.partTag && p.resolved) || null
+    : null;
+  const wrongPart = namedWrongPart || !!(bareTagPart && bareTagPart.episode == null);
+
+  // Explicit S/E under an alternate numbering of the same episode (TVDB order, own-show
+  // continuous, own-show part split). Aliases that collide with plausible TMDB numbering
+  // only count when a season-pinning hint confirms the alternate context.
+  const aliasHit = (se) => !!se && seAliases.some((a) =>
+    a && a.season === se.season && a.episode === se.episode && (!a.needsHint || seasonHintHit));
+  const aliasSEMatch = aliasHit(parsed.exactSE) || aliasHit(parsed.longformSE);
+
+  // A name that pins the season by title AND tags an S/E inside the own-show season range is
+  // using the sequel-series' own numbering (Hulu/Plex style). If that reading is valid (the
+  // part is long enough to contain the episode) and it is not an alias of the requested
+  // episode, it is some other episode — even when the tag happens to equal the requested
+  // TMDB pair.
+  // Requires KNOWN boundaries: without them there is nothing to check the alternate reading
+  // against, and firing anyway rejected plainly-correct releases ("Thousand-Year Blood War
+  // S02E45" for S2E45 — no cour is 45 episodes long, so the own-show reading was never
+  // plausible in the first place).
+  let ownShowMismatch = false;
+  if (seasonHintHit && parsed.exactSE && !aliasSEMatch
+      && ownShowSeasonCount != null && Array.isArray(partLengths)
+      && parsed.exactSE.season >= 2 && parsed.exactSE.season <= ownShowSeasonCount
+      && parsed.exactSE.season <= partLengths.length) {
+    ownShowMismatch = parsed.exactSE.episode <= partLengths[parsed.exactSE.season - 1];
+  }
 
   const exactSEMatch =
     parsed.exactSE &&
@@ -230,14 +362,49 @@ function classify(parsed, expected) {
   const wrongSeason =
     parsed.exactSE && parsed.exactSE.season !== season;
 
+  // A season-pinning title hint makes the release's own numbering readable: the number that
+  // follows the hint is the episode within that (sub-)series, whatever season tag the name
+  // carries ("Bleach - Thousand-Year Blood War - 014", "Sennen Kessen-hen S01E14"). Part
+  // context disables this — a part title means the numbering restarted at the part boundary.
+  const hintedRelativeMatch = !aliasSEMatch && !ownShowMismatch && !wrongPart && !namedRightPart
+    && seasonHintHits.some((h) => relativeNumberNearHint(parsed.normalized || '', h, episode));
+
+  // When the name identifies the cour that holds the requested episode, a bare number in it
+  // is that episode's position WITHIN the cour. Only cours actually named in this release
+  // count — consulting every known part let a "Part 2" tag borrow another cour's numbering.
+  const wantedLocal = new Set();
+  for (const p of partHits) if (p.episode != null) wantedLocal.add(p.episode);
+  if (!partHits.length && bareTagPart && bareTagPart.episode != null) wantedLocal.add(bareTagPart.episode);
+  const partRelativeMatch = wantedLocal.size > 0 && [
+    parsed.animeDashEpisode,
+    parsed.episodeTag,
+    parsed.exactSE ? parsed.exactSE.episode : null,
+  ].some((n) => n != null && wantedLocal.has(n));
+
+  // A hint for a DIFFERENT season, with nothing pinning the requested one, is the strongest
+  // wrong-release signal there is — the name literally says which sub-series it belongs to.
+  // Absolute numbering can still redeem such a name (batches list absolute ranges), but only
+  // when the absolute number differs from the plain episode number — otherwise the "absolute"
+  // hit is indistinguishable from the foreign sub-series' own restarted numbering (requesting
+  // S1E20 must not accept "Thousand-Year Blood War - 20").
+  const foreignSeason = foreignHintHit && !seasonHintHit;
+  const absoluteDistinct = absoluteMatch && !(foreignSeason && absoluteEpisode === episode);
+
   return {
     exactSEMatch: !!exactSEMatch,
     longformMatch: !!longformMatch,
     episodeOnlyMatch: !!episodeOnlyMatch,
     animeDashMatch: !!animeDashMatch,
-    absoluteMatch: !!absoluteMatch,
+    absoluteMatch: !!absoluteDistinct,
     wrongSeason: !!wrongSeason,
     hasContradictingSeason: !!hasContradictingSeason,
+    aliasSEMatch: !!aliasSEMatch,
+    hintedRelativeMatch: !!hintedRelativeMatch,
+    partRelativeMatch: !!partRelativeMatch,
+    ownShowMismatch: !!ownShowMismatch,
+    foreignSeason: !!foreignSeason,
+    seasonHintHit: !!seasonHintHit,
+    wrongPart: !!wrongPart,
   };
 }
 
@@ -246,14 +413,35 @@ function classify(parsed, expected) {
  * requested (show, season, episode)? Used by the production filter and by
  * the test runner's TopHit assertion.
  */
-function isMatch(parsed, expected) {
-  const c = classify(parsed, expected);
+// The keep/drop decision over a classify() verdict. Split out so the production filter in
+// torrent-scraper (which already holds the verdict for scoring) and isMatch stay one rule set.
+//
+// Unifying them changed one thing on the production side, deliberately: the old inline filter
+// also dropped anything with `hasContradictingSeason && !absoluteMatch`, which `isMatch` never
+// had. That rule fired on names carrying a matching S##E## AND a separate standalone season
+// tag ("Attack on Titan S01 S02 S03 S04E17"), i.e. multi-season packs that name the episode —
+// which are legitimate sources for it. An exact S/E match is the strongest signal available;
+// a stray season token elsewhere in the name does not outrank it.
+function verdictIsMatch(c) {
+  // Naming a cour that provably excludes this episode outranks everything: the release says
+  // in words which part of the season it is, and it is not this one. It beats even an alias
+  // tag, because "The Conflict S01E14" is that cour's episode 14, not the season's.
+  if (c.wrongPart) return !!c.absoluteMatch;
+  if (c.aliasSEMatch) return true;
+  if (c.ownShowMismatch) return false;
+  if (c.foreignSeason) return !!c.absoluteMatch;
   if (c.exactSEMatch || c.longformMatch) return true;
   if (c.absoluteMatch) return true;
+  if (c.partRelativeMatch) return true;
+  if (c.hintedRelativeMatch) return true;
   if (c.wrongSeason) return false;
   if (c.episodeOnlyMatch) return true;
   if (c.animeDashMatch) return true;
   return false;
+}
+
+function isMatch(parsed, expected) {
+  return verdictIsMatch(classify(parsed, expected));
 }
 
 // Quality tier from the release name: 2160p/4K → 4, 1080p → 3, 720p → 2,
@@ -289,11 +477,14 @@ module.exports = {
   ANIME_DASH_RE,
   LONGFORM_RE,
   ANIME_SEASON_DASH_RE,
+  PART_TAG_RE,
   RESOLUTION_RE,
   YEAR_RE,
   parseName,
   classify,
   isMatch,
+  verdictIsMatch,
+  normalizeReleaseText,
   qualityTier,
   qualityLabel,
   extractInfohash,

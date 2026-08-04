@@ -1,9 +1,9 @@
 # Uplayer — conventions
 
 Read `docs/ARCHITECTURE.md` for the module map, the design planes, and the known landmines.
-This file is the short version: the rules to follow when writing code here.
+VThis file is the short version: the rules to follow when writing code here.
 
-These conventions are not aspirational. `core/` (26 modules, ~5,800 lines) already follows all
+These conventions are not aspirational. `core/` (31 modules, ~7,590 lines) already follows all
 of them. The rest of the codebase is mid-migration toward them. When in doubt, copy
 `core/stream-health.js` or `core/playback-target.js`.
 
@@ -124,17 +124,25 @@ Two consequences that are easy to break:
   from alass unchanged; relabelling it, adding a duplicate track, or (on DLNA) offering to
   restart the film for a difference of zero are all wrong. See `_syncChangedTiming`.
 - **alass is bounded by its reference, and its answer is checked.** The reference is only the
-  first 20 minutes of audio — all the swarm has delivered when the fix runs — so `syncSubtitle`
-  passes `--no-split` whenever that is shorter than the subtitle: with nothing under minute 20,
-  split mode's best-scoring move is to drag the whole track into the window, and on a real
-  140-minute film it did exactly that. alass exits 0 on a confidently wrong alignment, so
+  first 20 minutes of audio — all the swarm has delivered when the fix runs — and alass scores
+  an alignment by overlap with reference speech, so a 2-hour track scores best by sliding
+  *backward into the window*, dragging the cues that follow it in. `--no-split` does not stop
+  that; it only decides whether the damage arrives as one shift or as many (it arrived as
+  `-20:37`, 152 cues clamped to zero, on a subtitle that was already right). So when the
+  reference is partial, `_syncAgainstPartialReference` aligns **only the excerpt the reference
+  covers** and carries alass's answer to the rest of the track as the affine map it is — offset
+  plus framerate scale, fitted by `core/subtitle-timing.js`. Carrying only the offset is not
+  enough: on a 25→23.976fps subtitle it is five minutes wrong by the credits. Full coverage (a
+  short subtitle, or a sync on a fully cached film) still gets the plain call with split mode.
+  alass exits 0 on a confidently wrong alignment, so
   `_implausibleSync` is the only thing between one and every playback target. Both entry
   points also ask `_subtitleMisfitReason` first — a subtitle that does not span this film's
   runtime is not a subtitle for this film, and the viewer picks these by hand from search
-  results that are often mislabelled. `tests/subtitle-sync-guard.test.js` pins the guards;
-  `tests/subtitle-sync-matrix.test.js` runs the real binary end-to-end across four scripts,
-  four runtimes and six kinds of mis-timing, and asserts the residual stays under 1s.
-  Loosening any of it needs a reason in the file. Known and accepted limit: a subtitle for a
+  results that are often mislabelled. `tests/auto-sync-subtitle.test.js` pins the guards;
+  `tests/subtitle-window-sync.test.js` pins the partial-reference path and runs the real
+  binary end-to-end over three kinds of mis-timing, asserting the residual stays under 1s
+  across the whole film (it skips itself when alass is not vendored, since `vendor/` is not
+  in git). Loosening any of it needs a reason in the file. Known and accepted limit: a subtitle for a
   DIFFERENT film of similar runtime is indistinguishable from timestamps alone.
 
 `tests/subtitle-coexistence.test.js` pins all of this; `tests/auto-sync-subtitle.test.js` covers

@@ -242,6 +242,57 @@ function testSyncChangedTimingComparison() {
   fsx.rmSync(dir, { recursive: true, force: true });
 }
 
+// The last line of defence, over real files. alass exits 0 on a confidently wrong
+// alignment exactly as it does on a good one, so this check is the only thing between a
+// destroyed subtitle and every playback target. It is a floor under catastrophe, not a
+// quality score: a merely mediocre sync must get through, because the viewer can still
+// pick "Original timing", and dropping a real correction is the worse error.
+function testImplausibleSyncGuard() {
+  const os = require('os');
+  const fsx = require('fs');
+  const pathx = require('path');
+  const dir = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'uplayer-sync-guard-'));
+  const stamp = (ms) => {
+    const p = (n, w) => String(n).padStart(w, '0');
+    return `${p(Math.floor(ms / 3600000), 2)}:${p(Math.floor(ms / 60000) % 60, 2)}:${p(Math.floor(ms / 1000) % 60, 2)},${p(ms % 1000, 3)}`;
+  };
+  // 200 cues every 30s — a film-length track, so a wrong alignment has room to look wrong.
+  const write = (name, map) => {
+    const body = [];
+    for (let i = 0; i < 200; i += 1) {
+      const t = Math.max(0, Math.round(map(30000 + i * 30000)));
+      body.push(`${i + 1}\n${stamp(t)} --> ${stamp(t + 2000)}\nline ${i + 1}`);
+    }
+    const p = pathx.join(dir, name);
+    fsx.writeFileSync(p, body.join('\n\n') + '\n', 'utf8');
+    return p;
+  };
+  const guard = (a, b) => StreamManager.prototype._implausibleSync.call(
+    { _subtitleCueStarts: StreamManager.prototype._subtitleCueStarts }, a, b
+  );
+
+  const base = write('base.srt', (t) => t);
+  assert.strictEqual(guard(base, write('same.srt', (t) => t)), null, 'no change is not a catastrophe');
+  assert.strictEqual(guard(base, write('small.srt', (t) => t + 7000)), null, 'a 7s fix is exactly what this is for');
+  assert.strictEqual(guard(base, write('fps.srt', (t) => t * (25 / 23.976))), null, 'a framerate correction is a real fix');
+
+  assert.ok(/pushed off the start/.test(guard(base, write('front.srt', (t) => t - 1200000))),
+    'a track walked off the front of the film');
+  assert.ok(/moves the subtitle by/.test(guard(base, write('late.srt', (t) => t + 30 * 60000))),
+    'half an hour is a misalignment, not a mis-timing');
+  // Squeezed about its own midpoint, so the median cue barely moves and only the SPAN
+  // gives it away — which is the third signal's whole reason for existing.
+  const mid = 30000 + (199 * 30000) / 2;
+  assert.ok(/compresses/.test(guard(base, write('squash.srt', (t) => mid + (t - mid) * 0.85))),
+    'a track squashed to fit something it is not');
+
+  // Unreadable or empty is no evidence either way, and _syncChangedTiming already treats
+  // that case as "keep the correction" — disagreeing here would silently undo it.
+  assert.strictEqual(guard(base, pathx.join(dir, 'missing.srt')), null, 'unreadable -> no verdict');
+
+  fsx.rmSync(dir, { recursive: true, force: true });
+}
+
 // The reason people ended up pressing the player's CC⇄ button: the automatic pass gave
 // up. It fires at stream START, the coldest the cache ever is, and "audio incomplete"
 // just means the bytes for the sync window have not arrived — on a 2.8-hour film that is
@@ -310,6 +361,7 @@ async function main() {
   await testWaitingSurvivesHealthDataNotBeingReadyYet();
   await testAlreadyCorrectTimingIsLeftCompletelyAlone();
   testSyncChangedTimingComparison();
+  testImplausibleSyncGuard();
   await testDownloadedSubtitleIsSyncedAndSwappedEverywhere();
   await testEmbeddedOnlyStreamsNeverSync();
   await testDisabledByEnvAndMissingAlass();

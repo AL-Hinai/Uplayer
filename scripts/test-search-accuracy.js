@@ -34,7 +34,7 @@ const path = require('path');
 
 const { loadEnvFileOnce } = require('../core/config');
 const { TorrentScraper } = require('../uplayer.js');
-const { parseName, classify } = require('../core/torrent-name-patterns');
+const { parseName, classify, verdictIsMatch } = require('../core/torrent-name-patterns');
 
 loadEnvFileOnce();
 
@@ -105,14 +105,10 @@ function annotate(result, expected) {
 
 function assertTopHit(annotated, expected) {
   const top5 = annotated.slice(0, 5);
-  const hit = top5.find(
-    (r) =>
-      r.verdict.exactSEMatch ||
-      r.verdict.longformMatch ||
-      r.verdict.episodeOnlyMatch ||
-      r.verdict.animeDashMatch ||
-      r.verdict.absoluteMatch
-  );
+  // Ask the shared decision function rather than re-listing flags here: a hand-rolled copy
+  // silently stops tracking the real filter the moment a rule is added, and then this harness
+  // reports a pass on behaviour production no longer has.
+  const hit = top5.find((r) => verdictIsMatch(r.verdict));
   return {
     pass: !!hit,
     detail: hit ? hit.name : '(no match in top 5)',

@@ -13,11 +13,16 @@ const cheerio = require('cheerio');
 const chalk = require('chalk');
 const path = require('path');
 const { getEnv } = require('./config');
-const { parseName, classify, qualityTier, qualityLabel } = require('./torrent-name-patterns');
+const { parseName, classify, verdictIsMatch, qualityTier, qualityLabel } = require('./torrent-name-patterns');
 const {
   dedupeTorrentResults, filterByPreferredQuality, parseSizeToBytes, parseUploadDate,
   x1337QueryPlan, x1337Normalize, X1337_MIRRORS, YTS_MIRRORS,
 } = require('./torrent-filters');
+
+// How long searchAllSources keeps issuing FOLLOW-UP queries. Every source always runs its
+// first (highest-yield) query; the budget only trims the tail, and only when the network is
+// slow enough to need it — a healthy search finishes in a few seconds and never reaches it.
+const QUERY_BUDGET_MS = 20000;
 
 // Scraper class for finding torrent links
 class TorrentScraper {
@@ -111,6 +116,13 @@ class TorrentScraper {
     let absoluteEpisode = null;
     let onPartial = null;
     let altTitles = [];
+    let seasonTitles = [];
+    let seasonHints = [];
+    let foreignHints = [];
+    let partHints = [];
+    let seAliases = [];
+    let partLengths = null;
+    let ownShowSeasonCount = null;
 
     if (rest.length === 1 && rest[0] && typeof rest[0] === 'object' && !Array.isArray(rest[0])) {
       const opts = rest[0];
@@ -120,6 +132,15 @@ class TorrentScraper {
       absoluteEpisode = opts.absoluteEpisode != null ? Number(opts.absoluteEpisode) : null;
       onPartial = typeof opts.onPartial === 'function' ? opts.onPartial : null;
       if (Array.isArray(opts.altTitles)) altTitles = opts.altTitles;
+      // Numbering profile (core/episode-numbering.js): season-scoped title variants for the
+      // query plan, plus hints/aliases the classifier uses to read non-TMDB numbering.
+      if (Array.isArray(opts.seasonTitles)) seasonTitles = opts.seasonTitles;
+      if (Array.isArray(opts.seasonHints)) seasonHints = opts.seasonHints;
+      if (Array.isArray(opts.foreignHints)) foreignHints = opts.foreignHints;
+      if (Array.isArray(opts.partHints)) partHints = opts.partHints;
+      if (Array.isArray(opts.seAliases)) seAliases = opts.seAliases;
+      if (Array.isArray(opts.partLengths)) partLengths = opts.partLengths;
+      if (opts.ownShowSeasonCount != null) ownShowSeasonCount = Number(opts.ownShowSeasonCount);
     } else {
       // legacy: (query, year, season, episode)
       season = rest[1] != null ? Number(rest[1]) : null;
@@ -174,22 +195,69 @@ class TorrentScraper {
       'SubsPlease': [],
     };
 
-    // Nyaa: formatted-SE and (for anime) absolute-episode queries, across every
-    // title variant so romaji-only listings are found.
-    for (const t of titleVariants) {
-      if (seTag) queriesPerSource.Nyaa.push(`${t} ${seTag}`);
-      if (isAnime && absoluteEpisode != null) {
-        queriesPerSource.Nyaa.push(`${t} ${absoluteEpisode}`);
-      }
+    // Nyaa throttles same-IP bursts hard (measured: of 14 parallel queries, 5 answer and the
+    // rest stall past the 10s timeout — which productive queries die is pure luck). So its
+    // list is PRIORITIZED and CAPPED: the highest-yield forms first, and never more than
+    // MAX_NYAA_QUERIES total. Queries run sequentially per source (see the task loop below).
+    const MAX_NYAA_QUERIES = 6;
+    const cappedSeasonTitles = seasonTitles.slice(0, 3);
+    const nyaaWanted = [];
+    // The two forms that between them cover almost every anime release go FIRST, one each, so
+    // neither can be squeezed out by the other's variants:
+    // 1. Season title + season-relative number — how sequel series are published
+    //    ("Bleach Thousand-Year Blood War 42").
+    if (cappedSeasonTitles.length && episode != null) nyaaWanted.push(`${cappedSeasonTitles[0]} ${episode}`);
+    // 2. Absolute number on the primary title — how long-running shows are published
+    //    ("One Piece 1159"). Only meaningful when it differs from the episode number.
+    if (isAnime && absoluteEpisode != null && absoluteEpisode !== episode) {
+      nyaaWanted.push(`${showName} ${absoluteEpisode}`);
     }
-    if (queriesPerSource.Nyaa.length === 0) {
-      for (const t of titleVariants) queriesPerSource.Nyaa.push(t);
+    // 3. Alias S/E tags (TVDB order — "Bleach S17E42", what Disney+/Hulu rips carry).
+    for (const a of seAliases) {
+      if (a && !a.needsHint) nyaaWanted.push(`${showName} S${pad2(a.season)}E${pad2(a.episode)}`);
+    }
+    // 4. Canonical TMDB tag.
+    if (seTag) nyaaWanted.push(`${showName} ${seTag}`);
+    // 5. Remaining season titles, then the romaji variants, filling whatever cap room is left.
+    for (const t of cappedSeasonTitles.slice(1)) {
+      if (episode != null) nyaaWanted.push(`${t} ${episode}`);
+    }
+    if (isAnime && absoluteEpisode != null) nyaaWanted.push(`${showName} ${absoluteEpisode}`);
+    for (const t of titleVariants) {
+      if (t === showName) continue;
+      if (isAnime && absoluteEpisode != null) nyaaWanted.push(`${t} ${absoluteEpisode}`);
+      if (seTag) nyaaWanted.push(`${t} ${seTag}`);
+    }
+    if (nyaaWanted.length === 0) for (const t of titleVariants) nyaaWanted.push(t);
+    const nyaaSeen = new Set();
+    for (const q of nyaaWanted) {
+      const key = q.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      if (nyaaSeen.has(key)) continue;
+      nyaaSeen.add(key);
+      queriesPerSource.Nyaa.push(q);
+      if (queriesPerSource.Nyaa.length >= MAX_NYAA_QUERIES) break;
     }
 
     // SubsPlease: anime-only. Search by show name only (no episode number) — the
     // API returns the show's episodes and scoring picks the right one.
     if (isAnime || season == null) {
       for (const t of titleVariants) queriesPerSource.SubsPlease.push(t);
+    }
+
+    // Season-scoped titles ("Bleach Thousand-Year Blood War") on the other indexers.
+    for (const t of cappedSeasonTitles) {
+      queriesPerSource.PirateBay.push(t);
+      queriesPerSource.SubsPlease.push(t);
+    }
+    if (cappedSeasonTitles.length > 0) {
+      queriesPerSource['1337x'].push(cappedSeasonTitles[0]);
+    }
+
+    // Alias S/E tags on PirateBay ("Bleach S17E42"). Only unambiguous aliases become
+    // queries — hint-gated ones would pull in the wrong show-season on TV-style indexers.
+    for (const a of seAliases) {
+      if (a.needsHint) continue;
+      queriesPerSource.PirateBay.push(`${showName} S${pad2(a.season)}E${pad2(a.episode)}`);
     }
 
     // Dedupe queries per source to avoid redundant requests.
@@ -215,7 +283,10 @@ class TorrentScraper {
 
     // Dedupe + classify + score + sort a set of raw results. Pure over its input
     // so it can be re-run on the growing accumulator as each source returns.
-    const expected = { season, episode, isAnime, absoluteEpisode };
+    const expected = {
+      season, episode, isAnime, absoluteEpisode,
+      seasonHints, foreignHints, partHints, seAliases, partLengths, ownShowSeasonCount,
+    };
     // Preferred quality: boosts matching releases, then filters the set down to
     // them (with a fallback when none match). Read per-rank so a live config
     // change (Settings) applies to the next search without a restart.
@@ -252,7 +323,14 @@ class TorrentScraper {
         let hasSeason = false;
         let hasEpisode = false;
 
-        if (verdict.exactSEMatch || verdict.longformMatch) {
+        if (verdict.aliasSEMatch) {
+          // Explicit S/E under an alternate numbering of this exact episode (TVDB order,
+          // own-show split) — as strong as a TMDB-numbered exact tag.
+          score += 2000;
+          exactMatch = true;
+          hasSeason = true;
+          hasEpisode = true;
+        } else if (verdict.exactSEMatch || verdict.longformMatch) {
           score += 2000;
           exactMatch = true;
           hasSeason = true;
@@ -260,6 +338,14 @@ class TorrentScraper {
         } else if (verdict.absoluteMatch) {
           // Anime absolute-episode hit (e.g. `One Piece - 1163`, `EP1163`).
           score += 1500;
+          hasEpisode = true;
+        } else if (verdict.partRelativeMatch) {
+          // Episode number read within a recognised cour/part title.
+          score += 1300;
+          hasEpisode = true;
+        } else if (verdict.hintedRelativeMatch) {
+          // Episode number read right after a season-pinning title.
+          score += 1200;
           hasEpisode = true;
         } else if (verdict.animeDashMatch) {
           score += 1000;
@@ -277,17 +363,9 @@ class TorrentScraper {
       });
 
       // ---- Filter: only keep real matches; drop wrong-season hard ----------
-      const filtered = scored.filter((r) => {
-        if (r.verdict.wrongSeason && !r.verdict.absoluteMatch) return false;
-        if (r.verdict.hasContradictingSeason && !r.verdict.absoluteMatch) return false;
-        return (
-          r.verdict.exactSEMatch ||
-          r.verdict.longformMatch ||
-          r.verdict.absoluteMatch ||
-          r.verdict.animeDashMatch ||
-          r.verdict.episodeOnlyMatch
-        );
-      });
+      // Same decision as isMatch — verdictIsMatch IS the rule set, applied to the
+      // verdict we already computed for scoring.
+      const filtered = scored.filter((r) => verdictIsMatch(r.verdict));
 
       filtered.sort((a, b) => {
         // Pin SubsPlease to the top for anime searches (no seeders to rank on).
@@ -305,27 +383,43 @@ class TorrentScraper {
       return filterByPreferredQuality(filtered, preferredTier);
     };
 
-    // ---- Issue all queries in parallel; rank+emit as each source returns ---
-    // Callers can pass opts.onPartial to receive a freshly-ranked snapshot every
-    // time a source resolves, so the UI can show results without waiting for all.
+    // ---- Issue queries: sources in parallel, queries per source SEQUENTIAL ---
+    // Sequential per host matters: firing a source's whole query list at once trips
+    // per-IP throttling. Measured against Nyaa with the same six queries — concurrency
+    // 1: 6/6 answered in 3.1s; concurrency 2: 6/6 but 9.9s (two stalled ~8.5s);
+    // concurrency 3: only 5/6, 10s. Overlapping requests are both slower AND lossier,
+    // so there is nothing to trade off here.
+    //
+    // The cost of serializing is that a sick network turns per-request timeouts into a
+    // SUM instead of a max (measured: 105s for one result during an ECONNRESET storm,
+    // where the parallel version would have stopped at one 10s timeout). QUERY_BUDGET_MS
+    // buys that back: every source always gets its first — highest-yield — query, and
+    // further queries are only issued while the budget holds. On a healthy link a whole
+    // search runs in a few seconds and never reaches it.
+    //
+    // Callers can pass opts.onPartial to receive a freshly-ranked snapshot after every
+    // query, so the UI shows results without waiting for the rest.
+    const deadline = Date.now() + QUERY_BUDGET_MS;
     const accumulated = [];
     const tasks = [];
     for (const src of sources) {
       const qs = queriesPerSource[src.name] || [];
-      for (const q of qs) {
-        tasks.push(
-          src.fn(q)
-            .catch(() => [])
-            .then((res) => {
-              if (Array.isArray(res) && res.length) {
-                for (const r of res) accumulated.push(r);
-              }
-              if (onPartial) {
-                try { onPartial(rankResults(accumulated)); } catch (e) { /* ignore */ }
-              }
-            })
-        );
-      }
+      if (qs.length === 0) continue;
+      tasks.push((async () => {
+        for (let i = 0; i < qs.length; i++) {
+          if (i > 0 && Date.now() > deadline) {
+            console.log(chalk.yellow(`  ${src.name}: time budget reached, skipping ${qs.length - i} queries`));
+            break;
+          }
+          const res = await src.fn(qs[i]).catch(() => []);
+          if (Array.isArray(res) && res.length) {
+            for (const r of res) accumulated.push(r);
+          }
+          if (onPartial) {
+            try { onPartial(rankResults(accumulated)); } catch (e) { /* ignore */ }
+          }
+        }
+      })());
     }
     await Promise.all(tasks);
 
@@ -445,7 +539,10 @@ class TorrentScraper {
       const results = [];
       const data = Array.isArray(response.data) ? response.data : [];
 
-      for (const item of data.slice(0, 10)) {
+      // apibay returns up to 100 rows sorted by seeders. Keep 30, not 10: an episode-filtered
+      // search (season packs, other episodes of the same title crowding the top) needs the
+      // deeper rows — the classifier drops the wrong ones afterwards.
+      for (const item of data.slice(0, 30)) {
         if (item.seeders > 0) {
           const magnet = `magnet:?xt=urn:btih:${item.info_hash}&dn=${encodeURIComponent(item.name)}`;
           results.push({

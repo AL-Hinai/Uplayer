@@ -24,7 +24,7 @@ If those don't match §1, assume every line citation here has drifted too.
 
 | Area | Lines | Was (phase 0) | State |
 |---|---|---|---|
-| `core/` — 26 modules | 5,821 | 3,780 / 18 | **Good.** Focused, documented, pure/IO separated. The pattern. |
+| `core/` — 31 modules | 7,591 | 3,780 / 18 | **Good.** Focused, documented, pure/IO separated. The pattern. |
 | `public/js/app.js` | 5,607 | 5,618 | Monolith. Entire SPA in one classic script. Untouched. |
 | `uplayer.js` | 2,568 | 4,458 | One hard knot (`StreamManager`) + the CLI. |
 | `server.js` | 1,591 | 2,139 | No huge functions; ~25 session-coupled routes still inline. |
@@ -45,12 +45,13 @@ the rest predate this document.
 |---|---|---|---|
 | `recommendation-service.js` | 677 | Watchlist CRUD, TMDB candidates, section assembly | injected |
 | `recommendation-engine.js` | 604 | Scoring, time decay, section building | **pure** |
-| `torrent-scraper.js` **[2a]** | 609 | Indexer fan-out (1337x, YTS, PirateBay, Nyaa, SubsPlease) | IO |
+| `torrent-scraper.js` **[2a]** | 707 | Indexer fan-out (1337x, YTS, PirateBay, Nyaa, SubsPlease) | IO |
 | `subtitle-manager.js` **[2a]** | 417 | Provider search/download fan-out, degrades quietly | IO |
 | `dlna-caster.js` | 334 | SSDP discovery + AVTransport SOAP control | IO + timers |
 | `media-searcher.js` **[2a]** | 310 | TMDB search + HTML-scraper fallback, season/episode lists | IO |
 | `torrserver-client.js` | 309 | TorrServer sidecar: spawn, HTTP API, magnet enrichment | IO |
-| `torrent-name-patterns.js` | 300 | Release-name parsing, quality tiers, infohash | **pure** |
+| `episode-numbering.js` | 525 | Every numbering an episode has in the wild (TVDB order, cour splits, season-title hints), from TMDB episode groups | injected + retry timer |
+| `torrent-name-patterns.js` | 492 | Release-name parsing + classification against a numbering profile, quality tiers, infohash | **pure** |
 | `playback-target.js` | 225 | Normalizes what any player is doing into one shape | **pure** |
 | `history-store.js` | 209 | Watch history / progress JSON persistence | IO |
 | `memory-tracker.js` **[2a]** | 203 | Memory diagnostics behind `--debug-memory` | timers |
@@ -61,6 +62,7 @@ the rest predate this document.
 | `stream-hub.js` **[2a]** | 139 | The one shared HTTP listener; N streams, one port | IO + singleton |
 | `torrent-filters.js` **[2a]** | 121 | Dedupe by infohash, size/date parsing, query planning | **pure** |
 | `subtitle-tools.js` | 118 | Wraps `alass` + `whisper.cpp`, degrades if absent | IO |
+| `subtitle-timing.js` | 138 | Cue arithmetic: window a track, fit and apply a linear retime | **pure** |
 | `stream-lifecycle.js` | 103 | Buffers last playback/health/targets, re-emits | **pure** |
 | `network-address.js` | 78 | LAN IPv4 detection, accessible URLs | os only |
 | `session-registry.js` **[3]** | 78 | Owns `streamSessions`; defines "the current stream" | in-memory |

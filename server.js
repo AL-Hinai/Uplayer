@@ -90,6 +90,17 @@ async function tmdb(endpoint, params = {}) {
   return getServices().tmdbClient.get(endpoint, params);
 }
 
+// Episode numbering profiles (core/episode-numbering.js) — lazy singleton so requiring
+// server.js stays free of getServices() calls (see tests/module-graph.test.js).
+let episodeNumberingService = null;
+function getEpisodeNumbering() {
+  if (!episodeNumberingService) {
+    const { createEpisodeNumberingService } = require('./core/episode-numbering');
+    episodeNumberingService = createEpisodeNumberingService({ tmdb });
+  }
+  return episodeNumberingService;
+}
+
 // --- API Routes ---------------------------------------------------------------
 
 // TMDB catalog routes live in routes/catalog.js (no session state).
@@ -882,71 +893,17 @@ app.post('/api/torrents/search', async (req, res) => {
     const seasonNum = season != null ? Number(season) : null;
     const episodeNum = episode != null ? Number(episode) : null;
 
-    // Derive anime metadata from TMDB so the scraper can pick the right query
-    // strategy (Nyaa/SubsPlease for anime, S##E## for live-action) and the
-    // right filter rules (absolute-episode matching for anime).
-    let isAnime = false;
-    let absoluteEpisode = null;
-    let altTitles = [];
+    // Derive the episode's numbering profile from TMDB: anime detection, romaji and
+    // season-title variants, the absolute number, and the alternate numberings (TVDB
+    // order, cour splits) that releases actually carry. See core/episode-numbering.js —
+    // all of it is data-driven, no show is special-cased.
+    let profile = null;
 
     if (type === 'tv' && tmdbId && seasonNum != null && episodeNum != null) {
       try {
-        const detail = await tmdb(`/tv/${tmdbId}`, { append_to_response: 'alternative_titles' });
-        const genres = (detail.genres || []).map((g) => g.id);
-        const origins = detail.origin_country || [];
-        const lang = detail.original_language;
-        isAnime = genres.includes(16) && (origins.includes('JP') || lang === 'ja');
-
-        if (isAnime) {
-          // Anime trackers (Nyaa/SubsPlease) list by romaji title. TMDB exposes it
-          // as a JP romaji/hepburn alternative title. Some shows also store their
-          // original_name already romanized (Latin script) — include that too, but
-          // skip the CJK/kanji original_name since these trackers never match it.
-          const altResults = (detail.alternative_titles && detail.alternative_titles.results) || [];
-          // Anime trackers use double-vowel romaji (Yuusha), but TMDB often stores
-          // the Hepburn macron form (Yūsha). Normalize macrons so the API's literal
-          // token match lands. ō→ou matches the おう the trackers spell out.
-          const deMacron = (s) => String(s || '')
-            .replace(/ā/g, 'aa').replace(/ī/g, 'ii').replace(/ū/g, 'uu')
-            .replace(/ē/g, 'ee').replace(/ō/g, 'ou')
-            .replace(/Ā/g, 'Aa').replace(/Ī/g, 'Ii').replace(/Ū/g, 'Uu')
-            .replace(/Ē/g, 'Ee').replace(/Ō/g, 'Ou');
-          // SubsPlease/Nyaa file a show under a SHORT title; TMDB frequently appends
-          // a long subtitle after a colon (e.g. "Yuusha-kei ni Shosu: Choubatsu
-          // Yuusha 9004-tai Keimu Kiroku"). Searching the full string returns nothing,
-          // so also emit the pre-colon form.
-          const stripSubtitle = (s) => String(s).split(/[:：]/)[0].trim();
-          const hasCjk = (s) => /[　-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ]/.test(String(s || ''));
-          // Seed from JP alt titles that are romaji-typed OR simply non-CJK (many
-          // romaji entries carry no type), plus a romanized original_name.
-          const romajiSeeds = altResults
-            .filter((a) => a && a.iso_3166_1 === 'JP' && (/romaji|hepburn/i.test(a.type || '') || !hasCjk(a.title)))
-            .map((a) => a.title);
-          if (detail.original_name && !hasCjk(detail.original_name)) romajiSeeds.push(detail.original_name);
-          const expanded = [];
-          for (const seed of romajiSeeds) {
-            const n = deMacron(seed);
-            expanded.push(n, stripSubtitle(n));
-          }
-          altTitles = [...new Set(expanded.map((s) => s.trim()).filter(Boolean))];
-        }
-
-        if (isAnime) {
-          // Two TMDB anime schemas: (a) reset-per-season (Bleach: S2E40 →
-          // abs = 366 + 40 = 406); (b) already-absolute (One Piece: S23E1159
-          // → abs = 1159, NOT priorSum + 1159). If the chosen episode_number
-          // is bigger than all prior seasons combined, it must already be the
-          // global counter — using priorSum + episode would double-count.
-          let priorSum = 0;
-          for (const s of detail.seasons || []) {
-            if (s && s.season_number > 0 && s.season_number < seasonNum) {
-              priorSum += s.episode_count || 0;
-            }
-          }
-          absoluteEpisode = episodeNum > priorSum ? episodeNum : priorSum + episodeNum;
-        }
+        profile = await getEpisodeNumbering().buildProfile(tmdbId, seasonNum, episodeNum);
       } catch (lookupErr) {
-        // Non-fatal: fall back to non-anime behaviour if TMDB is unreachable.
+        // Non-fatal: fall back to a plain title search if TMDB is unreachable.
         console.warn(`/api/torrents/search: TMDB lookup failed for tmdbId=${tmdbId}: ${lookupErr.message}`);
       }
     }
@@ -965,9 +922,7 @@ app.post('/api/torrents/search', async (req, res) => {
     const results = await scraper.searchAllSources(title, {
       season: seasonNum,
       episode: episodeNum,
-      isAnime,
-      absoluteEpisode,
-      altTitles,
+      ...(profile || {}),
       onPartial: (snapshot) => {
         if (res.writableEnded) return;
         try {

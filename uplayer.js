@@ -48,6 +48,19 @@ const MAX_SPAN_WARP = 0.06;
 const MIN_SUBTITLE_COVERAGE = 0.4;
 const MAX_SUBTITLE_OVERRUN = 1.1;
 
+// Aligning against a PARTIAL reference — the first 20 minutes of audio, all the swarm has
+// delivered — is done on the excerpt of the subtitle that falls inside it, and the result
+// is extrapolated over the rest of the track. See core/subtitle-timing.js for why.
+//
+// 12 cues is the floor on evidence: alass will happily fit a line through three lines of
+// dialogue, and the extrapolation multiplies whatever it gets by six. 250ms is the ceiling
+// on how far the excerpt's own correction may stray from a straight line — a real alass
+// answer is affine to within a millisecond, so anything past a quarter-second is per-scene
+// retiming, which is a real fix but not one an excerpt licenses applying to the 100
+// minutes of film with no audio to check it against.
+const MIN_WINDOW_CUES = 12;
+const MAX_WINDOW_FIT_RESIDUAL_MS = 250;
+
 // Stream manager
 class StreamManager extends EventEmitter {
   constructor(lowMemoryMode = false, memoryTracker = null) {
@@ -792,22 +805,24 @@ class StreamManager extends EventEmitter {
     }
 
     // The reference is the FIRST `maxSeconds` of the film — 20 minutes of a 140-minute
-    // feature, because that is all the swarm has delivered when this runs. alass's
-    // default mode cuts the subtitle into segments and moves each independently
-    // (--split-penalty 7), which needs reference audio UNDER every segment. Give it a
-    // reference that stops at minute 20 and the best-scoring alignment is to drag the
-    // whole track into that window — which is precisely what it did on a real run:
-    // cues pulled up to 43 minutes early, the first 45 minutes of the film clamped to
-    // 00:00:00 (alass writes 0 for a negative timestamp), the subtitle destroyed.
+    // feature, because that is all the swarm has delivered when this runs. alass scores
+    // an alignment by how much of the subtitle overlaps reference speech, so a track that
+    // runs an hour past the end of the reference scores BEST by sliding backward into it:
+    // the cues that follow the window get dragged in to replace the ones pushed off the
+    // front. Both real failures are that same move. First with split mode, which cuts the
+    // track into independently-moved segments (--split-penalty 7): cues pulled up to 43
+    // minutes early, the first 45 minutes clamped to 00:00:00. Then with --no-split, which
+    // only makes it one shift instead of many: -20:37 on a 916-cue subtitle that was
+    // already correct to within 10ms, 152 cues clamped.
     //
-    // A partial reference can only honestly support ONE inference: a constant offset
-    // for the whole track (plus alass's framerate correction, which is a global scale
-    // and stays enabled). So ask for exactly that. Full coverage — a short subtitle, or
-    // a user-triggered sync on a fully cached film — keeps split mode, where per-scene
-    // retiming is a real thing worth fixing.
+    // So when the reference is partial, do not ask about the part it cannot see. Align the
+    // excerpt that falls INSIDE the window and carry that answer to the rest of the track
+    // — see _syncAgainstPartialReference. Full coverage (a short subtitle, or a
+    // user-triggered sync on a fully cached film) keeps the plain call, split mode
+    // included, where per-scene retiming is a real thing worth fixing.
     const subSpan = this._subtitleSpanSeconds(subPath);
     const refSeconds = wavDur != null ? wavDur : (opts.maxSeconds || null);
-    const noSplit = !!(subSpan && refSeconds && refSeconds < subSpan * 0.98);
+    const partialReference = !!(subSpan && refSeconds && refSeconds < subSpan * 0.98);
 
     // This name is for humans reading a temp dir, and nothing else. It was chosen when
     // VLC was believed to name an external track after its filename; VLC 3.0.23 does not
@@ -818,10 +833,12 @@ class StreamManager extends EventEmitter {
     // alass's VAD over a 20-minute WAV takes minutes on its own — the library
     // default of 3 killed real runs mid-analysis ("error":"timeout" with a warm
     // cache). 10 minutes is generous without letting a hang live forever.
-    const r = await tools.syncSubtitle(wav, subPath, out, { timeoutMs: 10 * 60 * 1000, noSplit });
+    const r = partialReference
+      ? await this._syncAgainstPartialReference(wav, subPath, out, refSeconds)
+      : await tools.syncSubtitle(wav, subPath, out, { timeoutMs: 10 * 60 * 1000 });
     try { fs.unlinkSync(wav); } catch (e) {}
 
-    // --no-split narrows what alass CAN do wrong; it does not make it right. alass exits
+    // Windowing narrows what alass CAN do wrong; it does not make it right. alass exits
     // 0 on a confidently wrong alignment exactly as it does on a good one, so the only
     // thing standing between a bad alignment and every playback target is this check.
     // A rejected fix leaves the downloaded subtitle exactly as it arrived, which is the
@@ -835,6 +852,72 @@ class StreamManager extends EventEmitter {
       }
     }
     return r;
+  }
+
+  // Align a subtitle against a reference that only covers its FIRST few minutes, by
+  // aligning only the part the reference covers and extrapolating. Returns the same
+  // { ok, output } / { ok: false, reason } shape as tools.syncSubtitle.
+  //
+  // Three steps, and the middle one is the whole point:
+  //   1. Cut the subtitle at the end of the reference. Now the two inputs describe the
+  //      same span of film, so an alignment gains nothing by sliding the track backward
+  //      — the cues it would drag into the window no longer exist.
+  //   2. Let alass align that excerpt (--no-split: the excerpt is short enough that
+  //      per-scene segments would each get seconds of audio to fit against).
+  //   3. Recover what alass did as `t -> scale*t + offset` and apply it to the FULL
+  //      track. alass's correction genuinely is affine — an offset plus its framerate
+  //      guess, which is a global scale — so the fit is exact rather than approximate,
+  //      and it carries the framerate part that a plain offset would drop. On a
+  //      25 -> 23.976fps subtitle, offset-only lands five minutes wrong by the credits.
+  //
+  // The extrapolation is only as good as the fit, so both are checked: too few cues in
+  // the window is not enough evidence to multiply by six, and a fit that does not sit on
+  // a straight line means the excerpt needed per-scene retiming, which says nothing about
+  // the hour of film that has no audio here to check it against.
+  async _syncAgainstPartialReference(wavPath, subPath, outPath, refSeconds) {
+    const tools = require('./core/subtitle-tools');
+    const timing = require('./core/subtitle-timing');
+    const mins = Math.round(refSeconds / 60);
+    let text;
+    try { text = fs.readFileSync(subPath, 'utf8'); } catch (e) { return { ok: false, reason: 'subtitle unreadable' }; }
+
+    const excerpt = timing.trimToWindow(text, Math.round(refSeconds * 1000));
+    if (excerpt.count < MIN_WINDOW_CUES) {
+      return { ok: false, reason: `sync skipped (only ${excerpt.count} subtitle lines fall inside the ${mins}min of audio available — too little to align on)` };
+    }
+
+    const stamp = Date.now();
+    const windowIn = path.join(this.tempDir, `sync-window-${stamp}.srt`);
+    const windowOut = path.join(this.tempDir, `sync-window-${stamp}-aligned.srt`);
+    const cleanup = () => { for (const p of [windowIn, windowOut]) { try { fs.unlinkSync(p); } catch (e) {} } };
+    try {
+      fs.writeFileSync(windowIn, excerpt.text, 'utf8');
+      const r = await tools.syncSubtitle(wavPath, windowIn, windowOut, { timeoutMs: 10 * 60 * 1000, noSplit: true });
+      if (!r.ok) return r;
+
+      const before = timing.cueStartsMs(excerpt.text);
+      const after = timing.cueStartsMs(fs.readFileSync(windowOut, 'utf8'));
+      // --no-split moves cues; it does not add or drop them. A different count means the
+      // output is not the file we asked about, and pairing it by index would invent an
+      // answer out of the mismatch.
+      if (before.length !== after.length) {
+        return { ok: false, reason: `sync rejected (alass returned ${after.length} lines for ${before.length})` };
+      }
+      const fit = timing.fitLinear(before, after);
+      if (!fit) return { ok: false, reason: 'sync rejected (no usable alignment in the cached window)' };
+      if (fit.maxResidualMs > MAX_WINDOW_FIT_RESIDUAL_MS) {
+        return {
+          ok: false,
+          reason: `sync rejected (the correction varies by ${(fit.maxResidualMs / 1000).toFixed(1)}s across the first ${mins}min — not a single offset, and the rest of the film has no audio to check)`,
+        };
+      }
+      fs.writeFileSync(outPath, timing.applyLinear(text, fit), 'utf8');
+      return { ok: true, output: outPath };
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    } finally {
+      cleanup();
+    }
   }
 
   // Cue START times of a subtitle file, in ms — null when unreadable.
