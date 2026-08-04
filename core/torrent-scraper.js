@@ -208,10 +208,10 @@ class TorrentScraper {
     //    ("Bleach Thousand-Year Blood War 42").
     if (cappedSeasonTitles.length && episode != null) nyaaWanted.push(`${cappedSeasonTitles[0]} ${episode}`);
     // 2. Absolute number on the primary title — how long-running shows are published
-    //    ("One Piece 1159"). Only meaningful when it differs from the episode number.
-    if (isAnime && absoluteEpisode != null && absoluteEpisode !== episode) {
-      nyaaWanted.push(`${showName} ${absoluteEpisode}`);
-    }
+    //    ("One Piece 1159"). Reserved unconditionally: on TMDB's already-absolute schema the
+    //    absolute number EQUALS the episode number, and skipping it as "redundant" there
+    //    dropped the single best query for exactly the shows that depend on it.
+    if (isAnime && absoluteEpisode != null) nyaaWanted.push(`${showName} ${absoluteEpisode}`);
     // 3. Alias S/E tags (TVDB order — "Bleach S17E42", what Disney+/Hulu rips carry).
     for (const a of seAliases) {
       if (a && !a.needsHint) nyaaWanted.push(`${showName} S${pad2(a.season)}E${pad2(a.episode)}`);
@@ -222,7 +222,6 @@ class TorrentScraper {
     for (const t of cappedSeasonTitles.slice(1)) {
       if (episode != null) nyaaWanted.push(`${t} ${episode}`);
     }
-    if (isAnime && absoluteEpisode != null) nyaaWanted.push(`${showName} ${absoluteEpisode}`);
     for (const t of titleVariants) {
       if (t === showName) continue;
       if (isAnime && absoluteEpisode != null) nyaaWanted.push(`${t} ${absoluteEpisode}`);
