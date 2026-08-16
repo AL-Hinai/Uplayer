@@ -3,6 +3,8 @@ package com.uplayer.app
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -282,16 +284,70 @@ class MainActivity : AppCompatActivity() {
         false
     }
 
-    private fun currentWifiIpv4(): String? = try {
-        NetworkInterface.getNetworkInterfaces().toList()
-            .asSequence()
-            .filter { it.isUp && !it.isLoopback }
-            .flatMap { it.inetAddresses.toList().asSequence() }
-            .filterIsInstance<Inet4Address>()
-            .map { it.hostAddress }
-            .firstOrNull { ip -> ip != null && isPrivate(ip) }
+    /**
+     * The LAN address a TV must be able to reach — deliberately the Wi-Fi one, not
+     * "the first private IPv4 on the device".
+     *
+     * With mobile data on, the carrier hands out a CGNAT address inside 10.0.0.0/8 on
+     * rmnet_data0, and NetworkInterface.getNetworkInterfaces() enumerates the radio
+     * ahead of wlan0 on most phones. Taking the first private address therefore
+     * advertised the cellular IP as UPLAYER_PUBLIC_HOST while the TV sat on the Wi-Fi
+     * subnet — DLNA then failed with UPnP 716 "Resource not found", because the TV
+     * accepted the URI and could not route to it. The PC never hit this: it has no
+     * cellular interface. So ask ConnectivityManager which network Android itself
+     * classifies as Wi-Fi (or Ethernet) rather than guessing from the address.
+     */
+    private fun currentWifiIpv4(): String? = wifiIpFromConnectivity() ?: lanIpFromInterfaces()
+
+    /** The address of the network Android reports as Wi-Fi/Ethernet transport. */
+    @Suppress("DEPRECATION") // allNetworks: the callback API cannot answer synchronously at boot
+    private fun wifiIpFromConnectivity(): String? = try {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        cm?.allNetworks?.asSequence()
+            ?.filter { net ->
+                val caps = cm.getNetworkCapabilities(net)
+                caps != null && (
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                    )
+            }
+            ?.flatMap { net -> (cm.getLinkProperties(net)?.linkAddresses ?: emptyList()).asSequence() }
+            ?.map { it.address }
+            ?.filterIsInstance<Inet4Address>()
+            ?.mapNotNull { it.hostAddress }
+            ?.firstOrNull { isPrivate(it) }
     } catch (e: Exception) {
         null
+    }
+
+    /**
+     * Fallback for when ConnectivityManager reports nothing (no Wi-Fi network object
+     * yet, hotspot mode). Same idea, by interface name: cellular is excluded outright
+     * and wlan/eth/ap are preferred over anything unrecognised.
+     */
+    private fun lanIpFromInterfaces(): String? = try {
+        NetworkInterface.getNetworkInterfaces().toList()
+            .asSequence()
+            .filter { it.isUp && !it.isLoopback && !isCellular(it.name) }
+            .sortedByDescending { if (isLanInterface(it.name)) 1 else 0 }
+            .flatMap { it.inetAddresses.toList().asSequence() }
+            .filterIsInstance<Inet4Address>()
+            .mapNotNull { it.hostAddress }
+            .firstOrNull { isPrivate(it) }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** Carrier data interfaces, by the names the common Android radio stacks use. */
+    private fun isCellular(name: String?): Boolean {
+        val n = name.orEmpty().lowercase()
+        return n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("pdp") ||
+            n.startsWith("ppp") || n.startsWith("clat") || n.startsWith("v4-rmnet")
+    }
+
+    private fun isLanInterface(name: String?): Boolean {
+        val n = name.orEmpty().lowercase()
+        return n.startsWith("wlan") || n.startsWith("eth") || n.startsWith("ap")
     }
 
     private fun isPrivate(ip: String): Boolean =

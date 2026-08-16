@@ -13,6 +13,11 @@ function isPrivateIPv4(address) {
 
 function interfacePriority(name = '') {
   const normalized = String(name).toLowerCase();
+  // Cellular first, and below the virtual adapters: a phone on mobile data holds a
+  // carrier CGNAT address inside 10.0.0.0/8, which passes isPrivateIPv4 and would
+  // otherwise look like a perfectly good LAN address. Advertising it as the cast host
+  // hands the TV a URL that routes nowhere (DLNA answers UPnP 716 "Resource not found").
+  if (/^(rmnet|ccmni|pdp|ppp|clat|v4-rmnet)/.test(normalized)) return -10;
   if (/wi-?fi|wireless|wlan/.test(normalized)) return 5;
   if (/ethernet|en|eth/.test(normalized)) return 4;
   if (/lan/.test(normalized)) return 3;
