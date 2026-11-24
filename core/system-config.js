@@ -38,6 +38,16 @@ module.exports = {
   // place and — the part that matters — that an anonymous caller holding this key CANNOT read
   // the libraries table. If RLS is off, nothing else goes wrong: the app works perfectly while
   // being completely open.
-  SUPABASE_URL: 'https://uyrmizmgnqwkdofhbbqi.supabase.co',
-  SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_vf3APcaAD5A5mhk3IKbmuA_I-IhIjkW',
+  //
+  // LEFT BLANK ON PURPOSE IN THE REPOSITORY. This file is public, and while the publishable
+  // key is safe to expose by design, the project URL beside it is an open invitation to create
+  // accounts in somebody else's database. Day to day the values live in .env, which is
+  // gitignored, and the precedence above means a blank here falls through to it.
+  //
+  // THE CONSEQUENCE FOR RELEASES, which is easy to forget until someone reports that sync has
+  // vanished: a `pkg` binary bundles THIS FILE and cannot read a .env sitting next to the
+  // executable. Blank here means a shipped build has no project and offers no sync at all.
+  // Fill both in immediately before `npm run build`, and blank them again before committing.
+  SUPABASE_URL: '',
+  SUPABASE_PUBLISHABLE_KEY: '',
 };
