@@ -55,3 +55,10 @@ scripts/data/test-results.json
 
 
 truso.env
+
+# Generated benchmark output. Every run rewrites these wholesale with a fresh `runAt`
+# timestamp, so tracking them makes each commit look enormous and `git log -p` unreadable.
+# The conclusions worth keeping live in bench/*.md, which stay tracked — as do the files
+# named *-archive.*, which were kept on purpose.
+bench/results.json
+bench/*-results.json
