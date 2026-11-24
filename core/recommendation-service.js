@@ -253,10 +253,16 @@ class RecommendationService {
     const history = this.readHistory();
 
     return this.recommendationStore.update((state) => {
-      state.watchlist[normalizedType][String(savedItem.tmdbId)] = {
+      const key = String(savedItem.tmdbId);
+      state.watchlist[normalizedType][key] = {
         ...savedItem,
         addedAt,
+        // Sync compares numbers, not display strings; and a re-add has to be able to out-rank
+        // the tombstone left by an earlier removal on another device.
+        updatedAt: Date.now(),
       };
+      const bucket = normalizedType === 'movie' ? 'watchlistMovie' : 'watchlistTv';
+      if (state.deleted && state.deleted[bucket]) delete state.deleted[bucket][key];
       state.interactions.push({
         eventType: 'watchlist_add',
         type: normalizedType,
@@ -301,6 +307,11 @@ class RecommendationService {
       }
 
       delete state.watchlist[normalizedType][key];
+      // Leave a tombstone so the removal travels to the user's other devices instead of
+      // being undone by the next pull (HistoryStore.remove explains the failure mode).
+      const bucket = normalizedType === 'movie' ? 'watchlistMovie' : 'watchlistTv';
+      if (!state.deleted) state.deleted = {};
+      state.deleted[bucket] = { ...(state.deleted[bucket] || {}), [key]: Date.now() };
       state.interactions.push({
         eventType: 'watchlist_remove',
         type: normalizedType,

@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pruneTombstones } = require('./history-merge');
 
 class HistoryStore {
   constructor(filePath = path.join(os.homedir(), '.uplayer-history.json')) {
@@ -10,7 +11,7 @@ class HistoryStore {
   }
 
   defaultValue() {
-    return { movies: {}, tvShows: {} };
+    return { movies: {}, tvShows: {}, deleted: {} };
   }
 
   read() {
@@ -20,6 +21,7 @@ class HistoryStore {
         return {
           movies: data.movies || {},
           tvShows: data.tvShows || {},
+          deleted: data.deleted || {},
         };
       }
     } catch (e) {
@@ -29,12 +31,17 @@ class HistoryStore {
   }
 
   write(data) {
-    fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2), 'utf8');
+    const out = { ...data, deleted: pruneTombstones(data.deleted || {}, Date.now()) };
+    fs.writeFileSync(this.filePath, JSON.stringify(out, null, 2), 'utf8');
   }
+
 
   markWatched(type, item) {
     const db = this.read();
-    const normalized = { ...item, watchedAt: new Date().toISOString() };
+    // `updatedAt` accompanies every mutation from here down. `watchedAt` is user-facing and
+    // formatted for display; sync needs a plain comparable number, and needs it to move even
+    // on writes that leave watchedAt alone (setTracking, setLastPlayback).
+    const normalized = { ...item, watchedAt: new Date().toISOString(), updatedAt: Date.now() };
     // This replaces the entry wholesale, so anything the caller's `item` doesn't carry
     // has to be lifted across explicitly — see `tracking` below. `lastPlayback` (which
     // release source to resume from) is written by a separate call and would otherwise
@@ -98,6 +105,11 @@ class HistoryStore {
     delete show.lastEpisode;
     delete show.progress;
     show.watchedAt = new Date().toISOString();
+    // Stamped separately from updatedAt because a reset is the one edit that moves the
+    // furthest-watched marker BACKWARDS — sync has to be able to tell it apart from a stale
+    // copy, or another device would helpfully restore what the user just cleared.
+    show.progressResetAt = Date.now();
+    show.updatedAt = show.progressResetAt;
     this.write(db);
     return db;
   }
@@ -155,6 +167,7 @@ class HistoryStore {
       }
     }
     entry.watchedAt = new Date().toISOString();
+    entry.updatedAt = Date.now();
     this.write(db);
     return db;
   }
@@ -186,6 +199,7 @@ class HistoryStore {
 
     last.savedAt = new Date().toISOString();
     entry.lastPlayback = last;
+    entry.updatedAt = Date.now();
     this.write(db);
     return db;
   }
@@ -195,14 +209,28 @@ class HistoryStore {
     const show = db.tvShows[String(id)];
     if (!show) throw new Error('TV show not found in history');
     show.tracking = !!tracking;
+    show.updatedAt = Date.now();
     this.write(db);
     return db;
   }
 
+  /**
+   * Removing leaves a tombstone rather than dropping the key. A hard delete is invisible to
+   * sync — the entry is simply absent, which is indistinguishable from "this device has
+   * never heard of it" — so the next pull would faithfully restore it, forever. The
+   * tombstone carries the timestamp that lets a later re-add win instead.
+   */
   remove(type, id) {
     const db = this.read();
-    if (type === 'movie') delete db.movies[id];
-    else if (type === 'tv') delete db.tvShows[id];
+    const key = String(id);
+    if (!db.deleted) db.deleted = {};
+    if (type === 'movie') {
+      delete db.movies[key];
+      db.deleted.movie = { ...(db.deleted.movie || {}), [key]: Date.now() };
+    } else if (type === 'tv') {
+      delete db.tvShows[key];
+      db.deleted.tv = { ...(db.deleted.tv || {}), [key]: Date.now() };
+    }
     this.write(db);
     return db;
   }

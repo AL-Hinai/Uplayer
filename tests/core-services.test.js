@@ -29,7 +29,8 @@ function testHistoryStore() {
   const tmpFile = path.join(os.tmpdir(), `uplayer-history-test-${Date.now()}.json`);
   const store = new HistoryStore(tmpFile);
   const empty = store.read();
-  assert.deepStrictEqual(empty, { movies: {}, tvShows: {} });
+  // `deleted` holds tombstones — see remove() below for why they exist.
+  assert.deepStrictEqual(empty, { movies: {}, tvShows: {}, deleted: {} });
 
   store.markWatched('movie', { tmdbId: 10, title: 'Test Movie' });
   const withMovie = store.read();
@@ -39,6 +40,9 @@ function testHistoryStore() {
   store.remove('movie', '10');
   const removed = store.read();
   assert.strictEqual(removed.movies['10'], undefined);
+  // A hard delete is invisible to sync — absent reads the same as never-seen, so the next
+  // pull would restore it forever. The tombstone is what makes the delete travel.
+  assert.ok(removed.deleted.movie['10'], 'removing must leave a tombstone');
 
   // Monotonic-progress semantics for TV: marking an EARLIER episode after a
   // later one must NOT regress lastSeason/lastEpisode — the later marker is

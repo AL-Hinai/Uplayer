@@ -52,6 +52,8 @@ the rest predate this document.
 | `torrserver-client.js` | 309 | TorrServer sidecar: spawn, HTTP API, magnet enrichment | IO |
 | `episode-numbering.js` | 525 | Every numbering an episode has in the wild (TVDB order, cour splits, season-title hints), from TMDB episode groups | injected + retry timer |
 | `torrent-name-patterns.js` | 492 | Release-name parsing + classification against a numbering profile, quality tiers, infohash | **pure** |
+| `anime-ids.js` | 170 | TMDB id → AniDB show/episode ids, incl. the cour bridge for split seasons | injected IO |
+| `tosho-client.js` | 130 | AnimeTosho queried by AniDB ids; exact + broad pair, scraper-shaped rows | IO |
 | `playback-target.js` | 225 | Normalizes what any player is doing into one shape | **pure** |
 | `history-store.js` | 209 | Watch history / progress JSON persistence | IO |
 | `memory-tracker.js` **[2a]** | 203 | Memory diagnostics behind `--debug-memory` | timers |
@@ -306,10 +308,15 @@ core/                      # existing modules unchanged — the pattern
   http-router.js           ← route array + a matcher that knows 405-vs-404
   stream-routes/           ← uplayer.js:1208-1720   video-range, subtitles, assets, hls, progress
   stream-manager.js        ← uplayer.js:38-1925 remainder
-# subsplease-client.js — REJECTED. The two searchSubsPlease methods (SubtitleManager vs
-#   TorrentScraper) share a name but not behaviour: one HTML-scrapes subsplease.org/?s= for
-#   subtitle files, the other hits /api/?f=search for magnets. Different endpoints, different
-#   return types. Not a dedup — the classes keep their own. (Finding from phase 2a.)
+# subsplease-client.js — REJECTED, and the question is now MOOT. Phase 2a found the two
+#   searchSubsPlease methods (SubtitleManager vs TorrentScraper) shared a name but not
+#   behaviour — different endpoints, different return types — so not a dedup. Since then
+#   SubtitleManager's copy has been DELETED outright: subsplease.org publishes no
+#   standalone subtitle files at all (show pages carry zero .ass/.srt links, /api/?f=search
+#   returns only magnets), so it was never a subtitle provider. Only TorrentScraper's
+#   magnet search remains, and there is nothing left to share. The Addic7ed scraper went
+#   with it — Gestdown serves the same catalogue as JSON. See core/subtitle-manager.js's
+#   header for the measurements, and tools/subtitle-diagnose.js to re-check the survivors.
 routes/                    # register(app, ctx); ctx = { getServices, sessions, onEvent }
   catalog.js library.js    [DONE 3]  the two zero-session-coupling clusters
   sessions.js playback-targets.js vlc-progress.js

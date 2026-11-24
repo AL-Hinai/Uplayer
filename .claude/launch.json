@@ -7,6 +7,12 @@
       "runtimeArgs": ["run", "web"],
       "port": 3000,
       "autoPort": true
+    },
+    {
+      "name": "Account UI check (isolated home)",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["C:/Users/msali/AppData/Local/Temp/claude/E--Projects-Uplayer/af505b38-66fb-4878-bbde-79ff9766fdf0/scratchpad/ui-check.js"],
+      "port": 3113
     }
   ]
 }

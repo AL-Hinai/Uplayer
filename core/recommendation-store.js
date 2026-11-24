@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pruneTombstones } = require('./history-merge');
 
 class RecommendationStore {
   constructor(filePath = path.join(os.homedir(), '.uplayer-recommendations.json')) {
@@ -17,6 +18,10 @@ class RecommendationStore {
         updatedAt: null,
         totalSignalWeight: 0,
       },
+      // Tombstones for watchlist removals, keyed the way the sync wire format keys them
+      // (watchlistMovie / watchlistTv). See HistoryStore.remove for why a delete cannot
+      // simply drop the key.
+      deleted: {},
     };
   }
 
@@ -30,6 +35,7 @@ class RecommendationStore {
       profile: data.profile && typeof data.profile === 'object'
         ? data.profile
         : { updatedAt: null, totalSignalWeight: 0 },
+      deleted: data.deleted && typeof data.deleted === 'object' ? data.deleted : {},
     };
   }
 
@@ -46,7 +52,9 @@ class RecommendationStore {
   }
 
   write(data) {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.normalize(data), null, 2), 'utf8');
+    const normalized = this.normalize(data);
+    normalized.deleted = pruneTombstones(normalized.deleted, Date.now());
+    fs.writeFileSync(this.filePath, JSON.stringify(normalized, null, 2), 'utf8');
   }
 
   update(mutator) {

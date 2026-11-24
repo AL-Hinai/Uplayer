@@ -6,6 +6,10 @@ Logs: `logs/run-2026-07-07.log`, `logs/subtitle-run2.log`. The rendered `*-resul
 bench scripts emit alongside the JSON were deleted as redundant — re-running any bench
 regenerates its own. DLNA has no JSON twin, so its numbers live in §4 below and nowhere else.
 
+This document compares two **versions of the app**. The separate question of which **metadata
+provider** to depend on — TMDB (key required) vs the keyless stack — has its own run and its
+own report: `CATALOG-COMPARISON.md` (`catalog-bench.js`, `catalog-results.json`).
+
 ## What changed between the two versions
 
 V0.17 streams torrents with an in-process **WebTorrent** client — one active stream at a

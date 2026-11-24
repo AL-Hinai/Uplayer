@@ -1,0 +1,151 @@
+{
+  "runAt": "2026-11-24T13:22:07.821Z",
+  "rows": [
+    {
+      "show": "Bleach (TYBW)",
+      "requested": "S2E14",
+      "absoluteEpisode": 380,
+      "isAnime": true,
+      "pathA": {
+        "ms": 21219,
+        "queryCombos": 22,
+        "results": 15,
+        "withInfohash": 15,
+        "maxSeeders": 77,
+        "has1080p": true,
+        "top": "[LGH] Bleach (2004) - S17E14-E26 (BD Remux 1080p AVC FLAC 2.0) [Dual",
+        "seasonTitles": [
+          "Bleach thousand year blood war",
+          "Bleach sennen kessen hen",
+          "Bleach tybw"
+        ],
+        "seAliases": 3
+      },
+      "pathB": {
+        "ms": 1693,
+        "requests": 2,
+        "declined": null,
+        "anidbId": 2369,
+        "anidbEid": null,
+        "exactRows": 0,
+        "broadRows": 75,
+        "maxSeeders": 0,
+        "has1080p": false,
+        "top": null
+      },
+      "overlap": {
+        "bothFound": 0,
+        "onlyIdPath": 0,
+        "onlyNamePath": 14,
+        "nameRecallOfIdSet": null
+      }
+    },
+    {
+      "show": "One Piece",
+      "requested": "S13E1",
+      "absoluteEpisode": 422,
+      "isAnime": true,
+      "pathA": {
+        "ms": 21702,
+        "queryCombos": 15,
+        "results": 4,
+        "withInfohash": 4,
+        "maxSeeders": 14,
+        "has1080p": false,
+        "top": "[A&C] One Piece Season 13 - Impel Down [422-458] (WEB) [Multi-Audio-",
+        "seasonTitles": [
+          "One Piece impel down marineford"
+        ],
+        "seAliases": 1
+      },
+      "pathB": {
+        "ms": 2931,
+        "requests": 3,
+        "declined": null,
+        "anidbId": 69,
+        "anidbEid": 109084,
+        "exactRows": 0,
+        "broadRows": 75,
+        "maxSeeders": 0,
+        "has1080p": false,
+        "top": null
+      },
+      "overlap": {
+        "bothFound": 0,
+        "onlyIdPath": 0,
+        "onlyNamePath": 4,
+        "nameRecallOfIdSet": null
+      }
+    },
+    {
+      "show": "Frieren",
+      "requested": "S1E5",
+      "absoluteEpisode": 5,
+      "isAnime": true,
+      "pathA": {
+        "ms": 20579,
+        "queryCombos": 12,
+        "results": 11,
+        "withInfohash": 11,
+        "maxSeeders": 36,
+        "has1080p": true,
+        "top": "[Arg0] Frieren: Beyond Journey's End (2023) - S01E05 (WEB 1080p HEVC",
+        "seasonTitles": [],
+        "seAliases": 0
+      },
+      "pathB": {
+        "ms": 2715,
+        "requests": 3,
+        "declined": null,
+        "anidbId": 17617,
+        "anidbEid": 271708,
+        "exactRows": 30,
+        "broadRows": 75,
+        "maxSeeders": 680,
+        "has1080p": true,
+        "top": "[Shalouf] Frieren Henshu 05 - A Reason to Begin the Journey 1080p.x2"
+      },
+      "overlap": {
+        "bothFound": 9,
+        "onlyIdPath": 21,
+        "onlyNamePath": 2,
+        "nameRecallOfIdSet": 30
+      }
+    },
+    {
+      "show": "Severance (control)",
+      "requested": "S1E1",
+      "absoluteEpisode": null,
+      "isAnime": false,
+      "pathA": {
+        "ms": 20452,
+        "queryCombos": 4,
+        "results": 0,
+        "withInfohash": 0,
+        "maxSeeders": 0,
+        "has1080p": false,
+        "top": null,
+        "seasonTitles": [],
+        "seAliases": 0
+      },
+      "pathB": {
+        "ms": 372,
+        "requests": 1,
+        "declined": "no AniDB mapping",
+        "anidbId": null,
+        "anidbEid": null,
+        "exactRows": 0,
+        "broadRows": 0,
+        "maxSeeders": 0,
+        "has1080p": false,
+        "top": null
+      },
+      "overlap": {
+        "bothFound": 0,
+        "onlyIdPath": 0,
+        "onlyNamePath": 0,
+        "nameRecallOfIdSet": null
+      }
+    }
+  ]
+}

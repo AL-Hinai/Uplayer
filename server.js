@@ -40,12 +40,20 @@ let servicesWarningsShown = false;
 function getServices() {
   if (services) return services;
   const { TorrentScraper, SubtitleManager, StreamManager } = require('./uplayer.js');
+  // Which library files to open depends on who is signed in. Signed out resolves to the
+  // original top-level paths, so an install that never signs in is untouched by any of this.
+  const { readActiveAccount } = require('./core/account-session');
+  const { resolveDataPaths } = require('./core/account-paths');
+  const account = readActiveAccount();
+  const paths = resolveDataPaths(account ? account.id : null);
   services = createSharedServices({
     constructors: {
       TorrentScraper,
       SubtitleManager,
       StreamManager,
     },
+    historyPath: paths.historyPath,
+    recommendationPath: paths.recommendationPath,
   });
   if (!servicesWarningsShown) {
     for (const warning of services.runtime.warnings) {
@@ -54,6 +62,13 @@ function getServices() {
     servicesWarningsShown = true;
   }
   return services;
+}
+
+// Signing in or out changes WHICH library files the stores point at, and the stores are built
+// once and cached above. Dropping the cache is how the next getServices() picks up the new
+// paths — cheap, because everything in there is lazily constructed anyway.
+function resetServices() {
+  services = null;
 }
 
 // Deliberately a function, not a const. As a const this ran getServices() at module load,
@@ -101,6 +116,41 @@ function getEpisodeNumbering() {
   return episodeNumberingService;
 }
 
+// AniDB id resolution for the id-keyed torrent lane (core/anime-ids.js). Lazy for the
+// same reason as above: requiring server.js must not pull the world in.
+let animeIdResolver = null;
+function getAnimeIds() {
+  if (!animeIdResolver) {
+    const https = require('https');
+    const getJson = (url, body) => new Promise((resolve, reject) => {
+      const req = https.request(new URL(url), {
+        method: body ? 'POST' : 'GET',
+        headers: Object.assign(
+          { 'User-Agent': 'Uplayer', Accept: 'application/json' },
+          body ? { 'Content-Type': 'application/json' } : {}
+        ),
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (e) { reject(e); }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(12000, () => req.destroy(new Error('timeout')));
+      if (body) req.write(body);
+      req.end();
+    });
+    const { createAnimeIdResolver } = require('./core/anime-ids');
+    animeIdResolver = createAnimeIdResolver({
+      fetchJson: (url) => getJson(url),
+      anilistQuery: (query, variables) =>
+        getJson('https://graphql.anilist.co', JSON.stringify({ query, variables })),
+    });
+  }
+  return animeIdResolver;
+}
+
 // --- API Routes ---------------------------------------------------------------
 
 // TMDB catalog routes live in routes/catalog.js (no session state).
@@ -128,6 +178,19 @@ const sessionRegistry = createSessionRegistry({
 let sessionCounter = 0;
 const STREAM_CLEANUP_DELAY_MS = 15000;
 const LEGACY_STREAM_FIELDS = ['subtitlePath', 'playerMode', 'noSubtitles'];
+
+// --- Account + cloud sync routes ----------------------------------------------
+// Registered here rather than beside the other route modules because it needs
+// sessionRegistry: switching account swaps the history file out from under a running
+// stream, and that stream's next progress write would land in the wrong person's library.
+require('./routes/account').register(app, {
+  getServices,
+  resetServices,
+  hasLiveStreams: () => sessionRegistry.activeStreamSessions().length > 0,
+  onSyncEvent: (event, payload) => {
+    if (event === 'sync_failed') console.warn('[uplayer] sync failed:', payload.error);
+  },
+});
 
 function broadcastToSession(sessionId, event, data) {
   const session = streamSessions.get(sessionId);
@@ -908,6 +971,25 @@ app.post('/api/torrents/search', async (req, res) => {
       }
     }
 
+    // Resolve AniDB ids for the id-keyed lane. Additive and best-effort: a null changes
+    // nothing about the search below, and is the normal answer for everything that is not
+    // single-entry anime. It needs the profile first — the cour bridge is driven by the
+    // partLengths/partHints that already came out of it.
+    let animeIds = null;
+    if (profile && profile.isAnime) {
+      try {
+        animeIds = await getAnimeIds().resolve({
+          tmdbId,
+          absoluteEpisode: profile.absoluteEpisode,
+          partLengths: profile.partLengths,
+          partHints: profile.partHints,
+          seasonTitles: profile.seasonTitles,
+        });
+      } catch (idErr) {
+        console.warn(`/api/torrents/search: AniDB id lookup failed for tmdbId=${tmdbId}: ${idErr.message}`);
+      }
+    }
+
     const scraper = getServices().createTorrentScraper();
 
     // Stream ranked snapshots as NDJSON: one JSON object per line. Each `partial`
@@ -923,6 +1005,7 @@ app.post('/api/torrents/search', async (req, res) => {
       season: seasonNum,
       episode: episodeNum,
       ...(profile || {}),
+      animeIds,
       onPartial: (snapshot) => {
         if (res.writableEnded) return;
         try {
@@ -1076,8 +1159,10 @@ app.post('/api/subtitles/download', async (req, res) => {
     const tmpDir = path.join(os.tmpdir(), 'uplayer-subs');
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    const ext = subtitle.source === 'SubsPlease' || subtitle.source === 'Addic7ed' ? '.srt' : '.srt';
-    const filename = `sub_${Date.now()}${ext}`;
+    // Every provider's download lands as .srt — YIFY's zips are unwrapped and Gestdown
+    // serves SubRip directly. (This was a per-source ternary whose branches were both
+    // '.srt', left over from two providers that no longer exist.)
+    const filename = `sub_${Date.now()}.srt`;
     const outputPath = path.join(tmpDir, filename);
 
     const manager = getServices().createSubtitleManager();
@@ -1622,7 +1707,7 @@ app.get('/api/config', (req, res) => {
     needsSetup: !status.TMDB_API_KEY, // TMDB is required for browsing/search
     fields: [
       { key: 'TMDB_API_KEY', label: 'TMDB API Key', required: true, help: 'Free at themoviedb.org → Settings → API. Powers all movie/TV browsing & search.' },
-      { key: 'OPENSUBTITLES_API_KEY', label: 'OpenSubtitles API Key', required: false, help: 'Optional. Subtitles work without it (YIFY/Gestdown/Addic7ed/SubsPlease scrapers); an opensubtitles.com key just adds one more source.' },
+      { key: 'OPENSUBTITLES_API_KEY', label: 'OpenSubtitles API Key', required: false, help: 'Optional. Subtitles work without it (YIFY for movies, Gestdown for TV); an opensubtitles.com key just adds one more source.' },
       { key: 'OPENSUBTITLES_USERNAME', label: 'OpenSubtitles Username', required: false },
       { key: 'OPENSUBTITLES_PASSWORD', label: 'OpenSubtitles Password', required: false, secret: true },
     ],
@@ -1686,6 +1771,19 @@ function startServer(port = getPort()) {
   server.once('listening', () => {
     const resolvedUrl = getServerUrl(server);
     console.log(`\n  Uplayer Web GUI running at ${resolvedUrl}\n`);
+    // Bring the sync loop up for whoever is already signed in. Best-effort on purpose: a
+    // device that is offline, or a build with no database credentials, must still serve the
+    // app normally — sync is an addition to Uplayer, never a condition of it starting.
+    try {
+      require('./routes/account').startSync({
+        getServices,
+        onSyncEvent: (event, payload) => {
+          if (event === 'sync_failed') console.warn('[uplayer] sync failed:', payload.error);
+        },
+      });
+    } catch (e) {
+      console.warn('[uplayer] cloud sync unavailable:', e.message);
+    }
   });
 
   server.once('close', () => {

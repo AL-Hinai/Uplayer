@@ -6341,6 +6341,8 @@ async function openSettingsModal() {
           ${f.help ? `<span style="color:var(--text-muted);font-size:.78rem">${escape(f.help)}</span>` : ''}
         </label>`).join('')}
     </div>
+    <h3 style="margin:1.3rem 0 .25rem;font-size:1rem">Account &amp; sync</h3>
+    <div id="accountSection" style="color:var(--text-muted);font-size:.85rem">Loading…</div>
     <h3 style="margin:1.3rem 0 .25rem;font-size:1rem">Playback preferences</h3>
     <label style="display:flex;flex-direction:column;gap:.3rem">
       <span style="font-weight:600;font-size:.85rem">Preferred quality</span>
@@ -6356,6 +6358,415 @@ async function openSettingsModal() {
     <div id="settingsMsg" style="margin-top:.6rem;font-size:.85rem"></div>`;
   const ov = document.getElementById('settingsOverlay');
   if (ov) { ov.setAttribute('aria-hidden', 'false'); ov.classList.add('open'); }
+  renderAccountSection();
+}
+
+// --- Account & sync -----------------------------------------------------------
+// Signing in is a real sign-in: an email address and a password, checked by Supabase, with Row
+// Level Security in Postgres deciding what the resulting session can touch.
+//
+// There is deliberately NOTHING here for configuring the cloud. The project URL and
+// publishable key are part of the build (core/system-config.js), so a user sees exactly three
+// things — sign in, create account, forgot password — and never a field whose answer they have
+// no way of knowing. That is only safe because the key in question is Supabase's publishable
+// key: it identifies the project and grants nothing on its own, so shipping it in a binary is
+// the intended design rather than a leak.
+//
+// What the UI does still owe the person is the state that would otherwise pass silently: an
+// account awaiting email confirmation is neither signed in nor failed, and saying nothing
+// leaves them pressing Create again.
+
+const ACCOUNT_INPUT_STYLE = 'padding:.6rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-2);color:var(--text);width:100%';
+
+async function renderAccountSection() {
+  const box = document.getElementById('accountSection');
+  if (!box) return;
+  let data;
+  try { data = await (await fetch('/api/account')).json(); } catch (e) { data = { cloudConfigured: false }; }
+
+  // A build with no project configured says so plainly instead of offering a sign-in that can
+  // only fail. Nothing actionable is offered because nothing here is the user's to fix.
+  if (!data.cloudConfigured) {
+    box.innerHTML = '<p style="margin:0">Sync is not available in this build, so your library '
+      + 'is saved on this device only. Everything else works exactly as it does with it.</p>';
+    return;
+  }
+
+  lastAccountData = data;
+  box.innerHTML = '<div id="accountBlock"></div>';
+  renderAccountBlock(data);
+}
+
+// The address a sign-up, or a password reset, is waiting on a code for. Held here rather than
+// read back off the form because confirming re-renders this block, and a value that only
+// existed in an input would be gone by the time it was needed. Cleared the moment the code
+// works, or the person backs out. At most one of the two is ever set.
+let pendingConfirmation = null;
+let pendingReset = null;
+
+// Which of the two things the signed-out form is for. Explicit state rather than two buttons
+// under one form, so the form can say what pressing it will do.
+let authMode = 'signin';
+// The last /api/account payload, kept so switching mode can re-render without another fetch —
+// and without flashing the panel back through its loading state.
+let lastAccountData = null;
+
+function renderAccountBlock(data) {
+  const box = document.getElementById('accountBlock');
+  if (!box) return;
+
+  // Nothing to sign in to without a project. The block above already shows the form that
+  // fixes that, so this says nothing rather than repeating it.
+  if (!data.cloudConfigured) { box.innerHTML = ''; return; }
+
+  // A sign-up that is waiting on its code owns the whole block. Showing the sign-in form
+  // alongside it is what makes people try to sign in with an account that is not usable yet,
+  // read "Invalid login credentials", and conclude the sign-up failed.
+  if (!data.signedIn && pendingConfirmation) {
+    box.innerHTML = `
+      <p style="margin:0 0 .7rem">Almost done. We sent a 6-digit code to <strong>${escape(pendingConfirmation)}</strong> — enter it here to finish.</p>
+      <label style="display:flex;flex-direction:column;gap:.3rem;margin-bottom:.8rem">
+        <span style="font-weight:600;font-size:.85rem;color:var(--text)">Code from your email</span>
+        <input id="accountCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+          placeholder="123456" style="${ACCOUNT_INPUT_STYLE};letter-spacing:.4em;font-family:monospace;font-size:1.1rem"
+          onkeydown="accountCodeKey(event)">
+      </label>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-primary" onclick="accountConfirm(this)">Confirm</button>
+        <button class="btn btn-outline" onclick="accountResendCode(this)">Send a new code</button>
+        <a href="#" onclick="accountCancelConfirm();return false" style="color:var(--text-muted);font-size:.8rem;margin-left:auto">Use a different email</a>
+      </div>
+      <p style="margin:.7rem 0 0;color:var(--text-muted);font-size:.78rem">The code expires after an hour, and a new one can be sent once a minute. No link to click — this works even if you opened the email on your phone.</p>
+      <div id="accountMsg" style="margin-top:.6rem"></div>`;
+    return;
+  }
+
+  // A reset in progress, likewise, owns the block: the code and the new password are set in
+  // one step, so that there is never a moment where the old password has been invalidated and
+  // the new one not yet chosen.
+  if (!data.signedIn && pendingReset) {
+    box.innerHTML = `
+      <p style="margin:0 0 .7rem">We sent a 6-digit code to <strong>${escape(pendingReset)}</strong>. Enter it with the new password you want.</p>
+      <label style="display:flex;flex-direction:column;gap:.3rem;margin-bottom:.6rem">
+        <span style="font-weight:600;font-size:.85rem;color:var(--text)">Code from your email</span>
+        <input id="resetCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+          placeholder="123456" style="${ACCOUNT_INPUT_STYLE};letter-spacing:.4em;font-family:monospace;font-size:1.1rem">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:.3rem;margin-bottom:.8rem">
+        <span style="font-weight:600;font-size:.85rem;color:var(--text)">New password</span>
+        <input id="resetPassword" type="password" autocomplete="new-password" placeholder="••••••••" style="${ACCOUNT_INPUT_STYLE}"
+          onkeydown="resetPasswordKey(event)">
+      </label>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-primary" onclick="accountResetConfirm(this)">Set new password</button>
+        <a href="#" onclick="accountCancelReset();return false" style="color:var(--text-muted);font-size:.8rem;margin-left:auto">Back to sign in</a>
+      </div>
+      <p style="margin:.7rem 0 0;color:var(--text-muted);font-size:.78rem">The code can take a few minutes to arrive, and only a few can be sent each hour — if nothing comes, wait a little before asking again. Your old password keeps working until you finish, so nothing is lost either way. The code expires after an hour.</p>
+      <div id="accountMsg" style="margin-top:.6rem"></div>`;
+    return;
+  }
+
+  if (!data.signedIn) {
+    // One mode at a time, chosen explicitly. The previous version put "Sign in" and "Create
+    // account" side by side under one pair of fields, which left the form unable to say what
+    // it was about to do — and left the person unsure whether typing an address that already
+    // existed would sign them in or fail. A visible mode makes one button the answer.
+    const creating = authMode === 'signup';
+    box.innerHTML = `
+      <p style="margin:0 0 .9rem">Keep your watch history, progress and watchlist the same on every device you use.</p>
+      <div role="tablist" style="display:flex;gap:.25rem;padding:.25rem;background:var(--bg-2);border:1px solid var(--border);border-radius:10px;margin-bottom:.9rem">
+        ${[['signin', 'Sign in'], ['signup', 'Create account']].map(([mode, label]) => `
+          <button role="tab" aria-selected="${creating === (mode === 'signup')}" onclick="setAuthMode('${mode}')"
+            style="flex:1;padding:.45rem .6rem;border:0;border-radius:7px;cursor:pointer;font-size:.85rem;font-weight:600;
+                   background:${creating === (mode === 'signup') ? 'var(--accent)' : 'transparent'};
+                   color:${creating === (mode === 'signup') ? '#fff' : 'var(--text-muted)'}">${label}</button>`).join('')}
+      </div>
+      <label style="display:flex;flex-direction:column;gap:.3rem;margin-bottom:.6rem">
+        <span style="font-weight:600;font-size:.85rem;color:var(--text)">Email</span>
+        <input id="accountEmail" type="email" autocomplete="username" placeholder="you@example.com" style="${ACCOUNT_INPUT_STYLE}">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:.3rem;margin-bottom:.3rem">
+        <span style="font-weight:600;font-size:.85rem;color:var(--text)">Password</span>
+        <input id="accountPassword" type="password" autocomplete="${creating ? 'new-password' : 'current-password'}"
+          placeholder="••••••••" style="${ACCOUNT_INPUT_STYLE}" onkeydown="accountPasswordKey(event)">
+      </label>
+      <p style="margin:0 0 .9rem;min-height:1.1rem;color:var(--text-muted);font-size:.78rem">
+        ${creating
+          ? 'At least 6 characters. Your email is only ever used to sign in and to reset this password.'
+          : '<a href="#" onclick="accountReset(this);return false" style="color:var(--text-muted)">Forgot your password?</a>'}
+      </p>
+      <button class="btn btn-primary" style="width:100%" onclick="accountSubmit(this)">${creating ? 'Create account' : 'Sign in'}</button>
+      <div id="accountMsg" style="margin-top:.7rem"></div>`;
+    return;
+  }
+
+  // Signed in: lead with whether sync is actually working, because that is the only thing
+  // anyone opens this panel to find out. A date alone cannot say "stuck" — these three states
+  // can.
+  const state = data.lastError
+    ? { dot: '#f66', text: 'Sync failed — ' + escape(data.lastError) }
+    : data.pending
+      ? { dot: '#e9b949', text: data.pending + ' change' + (data.pending === 1 ? '' : 's') + ' waiting to upload' }
+      : { dot: 'var(--green)', text: data.lastSyncAt ? 'Everything is synced' : 'Waiting for the first sync' };
+
+  box.innerHTML = `
+    <div style="border:1px solid var(--border);border-radius:10px;padding:.8rem;background:var(--bg-2);margin-bottom:.7rem">
+      <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.35rem">
+        <span style="width:8px;height:8px;border-radius:50%;background:${state.dot};flex:none"></span>
+        <strong style="color:var(--text)">${state.text}</strong>
+      </div>
+      <div style="color:var(--text-muted);font-size:.82rem">
+        ${escape(data.email || '')}${data.lastSyncAt ? ' · last synced ' + escape(relativeTime(data.lastSyncAt)) : ''}
+      </div>
+    </div>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn btn-outline" onclick="accountSync(this)">Sync now</button>
+      <button class="btn btn-outline" onclick="accountLogout(this)">Sign out</button>
+    </div>
+    <div id="accountMsg" style="margin-top:.6rem"></div>`;
+}
+
+// "3 minutes ago" rather than a clock time: the question being asked is "is this current?",
+// and a timestamp makes the reader do that subtraction themselves.
+function relativeTime(ts) {
+  const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + ' minute' + (minutes === 1 ? '' : 's') + ' ago';
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return hours + ' hour' + (hours === 1 ? '' : 's') + ' ago';
+  return new Date(ts).toLocaleDateString();
+}
+
+/** Switch between sign-in and create, keeping whatever has already been typed. */
+function setAuthMode(mode) {
+  const { email, password } = accountCredentials();
+  authMode = mode === 'signup' ? 'signup' : 'signin';
+  renderAccountBlock(lastAccountData || { cloudConfigured: true, signedIn: false });
+  const emailInput = document.getElementById('accountEmail');
+  const passwordInput = document.getElementById('accountPassword');
+  if (emailInput) emailInput.value = email;
+  if (passwordInput) passwordInput.value = password;
+  const focus = email ? passwordInput : emailInput;
+  if (focus) focus.focus();
+}
+
+/** The one button. Which request it makes is the mode, not a second button. */
+function accountSubmit(btn) {
+  return authMode === 'signup' ? accountRegister(btn) : accountLogin(btn);
+}
+
+function accountMsg(text, colour) {
+  const el = document.getElementById('accountMsg');
+  if (el) { el.style.color = colour || 'var(--text-muted)'; el.innerHTML = text; }
+}
+
+// A named handler rather than an inline `if`: tests/inline-handlers.test.js checks that every
+// onclick/onkeydown names a function that will actually resolve at click time, and an inline
+// expression cannot be checked that way.
+function accountPasswordKey(event) {
+  if (event && event.key === 'Enter') accountSubmit(null);
+}
+
+function accountCredentials() {
+  const email = (document.getElementById('accountEmail') || {}).value || '';
+  const password = (document.getElementById('accountPassword') || {}).value || '';
+  return { email: email.trim(), password };
+}
+
+async function accountRegister(btn) {
+  const { email, password } = accountCredentials();
+  if (!email || !password) { accountMsg('Enter an email address and a password first.', '#f66'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Creating…'; }
+  try {
+    const res = await fetch('/api/account/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Could not create the account');
+
+    if (data.needsConfirmation) {
+      // Hand straight over to the code screen rather than leaving a message on a form that
+      // now cannot do anything useful — signing in before confirming just produces "Invalid
+      // login credentials", which reads as "my sign-up failed".
+      pendingConfirmation = email;
+      // renderAccountBlock checks confirmation before reset, so a stale reset left set here
+      // would be invisible rather than wrong. Clearing both ways keeps that from mattering.
+      pendingReset = null;
+      await renderAccountSection();
+      accountMsg('Account created. The code is in your inbox.', 'var(--green)');
+      const code = document.getElementById('accountCode');
+      if (code) code.focus();
+      return;
+    }
+    await renderAccountSection();
+    accountMsg('Signed in as ' + escape(data.email || email) + '. Your library is syncing.', 'var(--green)');
+  } catch (e) {
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+    if (btn) { btn.disabled = false; btn.textContent = 'Create account'; }
+  }
+}
+
+function accountCodeKey(event) {
+  if (event && event.key === 'Enter') accountConfirm(null);
+}
+
+async function accountConfirm(btn) {
+  const input = document.getElementById('accountCode');
+  const code = input ? input.value.trim() : '';
+  if (!pendingConfirmation) { await renderAccountSection(); return; }
+  if (!code) { accountMsg('Enter the 6-digit code from your email.', '#f66'); return; }
+  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; btn.textContent = 'Confirming…'; }
+  try {
+    const res = await fetch('/api/account/confirm', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingConfirmation, code }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'That code did not work');
+
+    // Verifying the code signs you in as well, so there is no second step to prompt for.
+    const email = pendingConfirmation;
+    pendingConfirmation = null;
+    await renderAccountSection();
+    accountMsg('Signed in as ' + escape(data.email || email) + '. Your library is syncing.', 'var(--green)');
+  } catch (e) {
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; btn.textContent = 'Confirm'; }
+  }
+}
+
+async function accountResendCode(btn) {
+  if (!pendingConfirmation) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  try {
+    const res = await fetch('/api/account/resend', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingConfirmation }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Could not send another code');
+    accountMsg('A new code is on its way to ' + escape(pendingConfirmation) + '.', 'var(--green)');
+  } catch (e) {
+    // Most often the 60-second limit. Shown rather than swallowed, so nobody sits pressing a
+    // button that appears to do nothing.
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Send a new code'; }
+  }
+}
+
+async function accountCancelConfirm() {
+  // The account still exists unconfirmed in Supabase. That is fine: signing up again with the
+  // same address re-sends a code rather than failing, so backing out is never a dead end.
+  pendingConfirmation = null;
+  await renderAccountSection();
+}
+
+async function accountLogin(btn) {
+  const { email, password } = accountCredentials();
+  if (!email || !password) { accountMsg('Enter an email address and a password first.', '#f66'); return; }
+  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; btn.textContent = 'Signing in…'; }
+  try {
+    const res = await fetch('/api/account/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Sign in failed');
+    await renderAccountSection();
+    accountMsg('Signed in as ' + escape(data.email || email) + '. Your library is syncing.', 'var(--green)');
+  } catch (e) {
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; btn.textContent = 'Sign in'; }
+  }
+}
+
+async function accountReset(el) {
+  const { email } = accountCredentials();
+  if (!email) { accountMsg('Enter your email address first, then press this again.', '#f66'); return; }
+  try {
+    const res = await fetch('/api/account/reset', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Could not send the reset email');
+
+    // Move to the code screen even though we do not know whether that address has an account.
+    // Supabase answers identically either way, deliberately, and branching here would undo
+    // that — an address that jumped straight to a code screen would be one that exists.
+    pendingReset = email;
+    pendingConfirmation = null;
+    await renderAccountSection();
+    accountMsg('If that address has an account, a code is on its way — it can take a few minutes.', 'var(--text-muted)');
+    const code = document.getElementById('resetCode');
+    if (code) code.focus();
+  } catch (e) {
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+  }
+}
+
+function resetPasswordKey(event) {
+  if (event && event.key === 'Enter') accountResetConfirm(null);
+}
+
+async function accountResetConfirm(btn) {
+  const code = (document.getElementById('resetCode') || {}).value || '';
+  const password = (document.getElementById('resetPassword') || {}).value || '';
+  if (!pendingReset) { await renderAccountSection(); return; }
+  if (!code.trim()) { accountMsg('Enter the 6-digit code from your email.', '#f66'); return; }
+  if (!password) { accountMsg('Enter the new password you want.', '#f66'); return; }
+  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; btn.textContent = 'Setting…'; }
+  try {
+    const res = await fetch('/api/account/reset/confirm', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingReset, code: code.trim(), password }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'That code did not work');
+
+    // The recovery code produced a session and the new password has been written to it, so
+    // there is nothing left to sign in with — the person is already in.
+    const email = pendingReset;
+    pendingReset = null;
+    await renderAccountSection();
+    accountMsg('Password changed. Signed in as ' + escape(data.email || email) + '.', 'var(--green)');
+  } catch (e) {
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; btn.textContent = 'Set new password'; }
+  }
+}
+
+async function accountCancelReset() {
+  pendingReset = null;
+  await renderAccountSection();
+}
+
+async function accountSync(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  try {
+    const res = await fetch('/api/account/sync', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    await renderAccountSection();
+    accountMsg(data.unchanged ? 'Already up to date.' : 'Synced.', 'var(--green)');
+  } catch (e) {
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Sync now'; }
+  }
+}
+
+async function accountLogout(btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch('/api/account/logout', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Sign out failed');
+    await renderAccountSection();
+  } catch (e) {
+    accountMsg('Error: ' + escape(e.message || String(e)), '#f66');
+    if (btn) btn.disabled = false;
+  }
 }
 
 function closeSettingsModal() {
@@ -6386,6 +6797,24 @@ async function saveSettings(btn) {
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 window.saveSettings = saveSettings;
+// Inline onclick= handlers depend on these being window properties. The implicit-global rule
+// is not relied on here — see the block at the top of this section in CLAUDE.md.
+window.renderAccountSection = renderAccountSection;
+window.accountRegister = accountRegister;
+window.accountLogin = accountLogin;
+window.accountReset = accountReset;
+window.accountPasswordKey = accountPasswordKey;
+window.setAuthMode = setAuthMode;
+window.accountSubmit = accountSubmit;
+window.accountCodeKey = accountCodeKey;
+window.accountConfirm = accountConfirm;
+window.accountResendCode = accountResendCode;
+window.accountCancelConfirm = accountCancelConfirm;
+window.resetPasswordKey = resetPasswordKey;
+window.accountResetConfirm = accountResetConfirm;
+window.accountCancelReset = accountCancelReset;
+window.accountSync = accountSync;
+window.accountLogout = accountLogout;
 document.getElementById('settingsOverlay')?.addEventListener('click', (e) => { if (e.target === e.currentTarget) closeSettingsModal(); });
 
 // --- Init ---------------------------------------------------------------------

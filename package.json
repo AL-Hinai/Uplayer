@@ -35,6 +35,7 @@
     "test:playback-strategy": "node tests/playback-strategy.test.js",
     "test:cast-diagnose": "node tests/cast-diagnose.test.js",
     "cast-diagnose": "node tools/cast-diagnose.js",
+    "subtitle-diagnose": "node tools/subtitle-diagnose.js",
     "bench:stream-speed": "node bench/stream-speed.js",
     "build": "pkg . --out-path dist",
     "build:all": "pkg . --targets node18-linux-x64,node18-win-x64,node18-macos-x64 --out-path dist",
@@ -49,7 +50,8 @@
     "setup:subtitle-tools": "node scripts/setup-subtitle-tools.js",
     "setup:android-libs": "node scripts/setup-android-libs.js restore",
     "setup:android-libs:save": "node scripts/setup-android-libs.js save",
-    "setup:android-libs:check": "node scripts/setup-android-libs.js check"
+    "setup:android-libs:check": "node scripts/setup-android-libs.js check",
+    "check:supabase": "node scripts/check-supabase.js"
   },
   "keywords": [
     "torrserver",

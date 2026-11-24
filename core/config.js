@@ -75,15 +75,33 @@ function readConfigStore() {
   try { store = JSON.parse(fs.readFileSync(configStorePath(), 'utf8')) || {}; } catch (e) { store = {}; }
   return store;
 }
+/**
+ * Returns whether the values actually reached DISK, not just the in-memory cache.
+ *
+ * That distinction used to be swallowed, and for most keys it genuinely does not matter — a
+ * TMDB key that fails to save is re-typed. For the auth session it matters a great deal:
+ * Supabase hands out a new refresh token every time one is used and invalidates the old, so a
+ * write that silently fails leaves disk holding a token that is one rotation further behind
+ * with every refresh. Far enough behind and Supabase treats it as a stolen-token replay and
+ * terminates the whole session. The caller has to be able to see that coming.
+ */
 function setConfigValues(values = {}) {
   const s = readConfigStore();
   for (const [k, v] of Object.entries(values)) {
     if (v == null || String(v).trim() === '') delete s[k];
     else s[k] = String(v).trim();
   }
-  try { fs.writeFileSync(configStorePath(), JSON.stringify(s, null, 2)); } catch (e) { /* read-only fs */ }
+  let written = false;
+  try {
+    fs.writeFileSync(configStorePath(), JSON.stringify(s, null, 2));
+    written = true;
+  } catch (e) {
+    // Read-only filesystem, no permission, disk full. Reported, never thrown: a failure to
+    // save a setting must not take down whatever the caller was doing.
+    written = false;
+  }
   store = s;
-  return s;
+  return written;
 }
 
 function getEnv(name, fallback = '') {
@@ -101,6 +119,30 @@ function getEnv(name, fallback = '') {
   if (value != null && String(value).trim()) return String(value).trim();
 
   return fallback;
+}
+
+// WHERE a value came from, which getEnv deliberately flattens away. One caller needs the
+// distinction: cloud sync has to tell the person whether the database it syncs to arrived
+// with the app — shared with every other install, and therefore not private — or was
+// configured here and is theirs. Answering that wrong is worse than not answering it.
+//
+//   'user'  — typed into the Settings popup on this device (highest priority)
+//   'build' — core/system-config.js, i.e. compiled into the binary and identical everywhere
+//   'env'   — a real env var or .env file, so configured on this machine but outside the app
+//   null    — not set anywhere
+//
+// Fully injectable because the alternative is a test that reads the developer's own
+// ~/.uplayer-config.json and passes or fails depending on what is in it.
+function describeEnvSource(name, deps = {}) {
+  const set = (value) => value != null && String(value).trim() !== '';
+  const store = deps.store || readConfigStore();
+  const system = deps.systemConfig || systemConfig;
+  const env = deps.env || process.env;
+
+  if (set(store[name])) return 'user';
+  if (set(system[name])) return 'build';
+  if (set(env[name])) return 'env';
+  return null;
 }
 
 // Which keys are configured (booleans only — never leak the secret values).
@@ -166,4 +208,5 @@ module.exports = {
   setConfigValues,
   getConfigStatus,
   configStorePath,
+  describeEnvSource,
 };

@@ -183,14 +183,35 @@ async function testDownloadDispatchRoutesBySource() {
   const calls = [];
   m.downloadYify = async () => { calls.push('yify'); return true; };
   m.downloadGestdown = async () => { calls.push('gestdown'); return true; };
-  m.downloadAddic7ed = async () => { calls.push('addic7ed'); return true; };
   m.downloadOpenSubtitles = async () => { calls.push('opensubtitles'); return true; };
 
   await m.downloadSubtitle('id', '/x', 'YIFY', 'https://yifysubtitles.ch/subtitle/a.zip');
   await m.downloadSubtitle('id', '/x', 'Gestdown', 'https://api.gestdown.info/subtitles/download/s');
-  await m.downloadSubtitle('id', '/x', 'Addic7ed', 'https://www.addic7ed.com/original/1/0');
   await m.downloadSubtitle('id', '/x', 'OpenSubtitles', null);
-  assert.deepStrictEqual(calls, ['yify', 'gestdown', 'addic7ed', 'opensubtitles']);
+  assert.deepStrictEqual(calls, ['yify', 'gestdown', 'opensubtitles']);
+}
+
+// The Addic7ed scraper and the SubsPlease "subtitle" provider were removed after both
+// were measured returning zero results in every case (see the subtitle-manager header).
+// A stale row persisted in history or a bookmark can still name them, so the dispatch
+// must not throw — it falls through to the OpenSubtitles branch, which returns false
+// without credentials rather than crashing the download route.
+async function testRemovedProvidersFallThroughInsteadOfThrowing() {
+  const m = new SubtitleManager({});
+  assert.strictEqual(typeof m.searchAddic7ed, 'undefined', 'Addic7ed scraper must stay removed');
+  assert.strictEqual(typeof m.searchSubsPlease, 'undefined', 'SubsPlease subtitle search must stay removed');
+
+  const calls = [];
+  m.downloadOpenSubtitles = async () => { calls.push('opensubtitles'); return false; };
+  for (const [source, url] of [
+    ['Addic7ed', 'https://www.addic7ed.com/original/1/0'],
+    ['SubsPlease', 'https://subsplease.org/subtitle/x.srt'],
+  ]) {
+    const ok = await m.downloadSubtitle('id', '/x', source, url);
+    assert.strictEqual(ok, false, `${source} must fail softly, not throw`);
+  }
+  assert.deepStrictEqual(calls, ['opensubtitles', 'opensubtitles'],
+    'both removed sources fall through to the OpenSubtitles branch');
 }
 
 async function main() {
@@ -199,6 +220,7 @@ async function main() {
   await testGestdownSearchAndDownload();
   testOpenSubtitlesIsOptionalNotRequired();
   await testDownloadDispatchRoutesBySource();
+  await testRemovedProvidersFallThroughInsteadOfThrowing();
   console.log('subtitle-scrapers.test.js passed');
 }
 

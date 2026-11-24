@@ -14,6 +14,7 @@ const chalk = require('chalk');
 const path = require('path');
 const { getEnv } = require('./config');
 const { parseName, classify, verdictIsMatch, qualityTier, qualityLabel } = require('./torrent-name-patterns');
+const { createToshoClient } = require('./tosho-client');
 const {
   dedupeTorrentResults, filterByPreferredQuality, parseSizeToBytes, parseUploadDate,
   x1337QueryPlan, x1337Normalize, X1337_MIRRORS, YTS_MIRRORS,
@@ -24,12 +25,21 @@ const {
 // slow enough to need it — a healthy search finishes in a few seconds and never reaches it.
 const QUERY_BUDGET_MS = 20000;
 
+// Score added to a row AnimeTosho returned under an AniDB episode id. Above the 2000 that
+// an alias S/E tag earns, because an id is stronger evidence than a numbering alias parsed
+// out of a filename — and unlike every other signal here it cannot be wrong about WHICH
+// episode the file is. It does not bypass the quality boost or the seeder ordering.
+const ID_MATCH_BOOST = 2500;
+
 // Scraper class for finding torrent links
 class TorrentScraper {
-  constructor() {
+  constructor(options = {}) {
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
     // Per-site memory of the mirror that last answered, keyed by site name.
     this.mirrors = {};
+    // The id-keyed source. Injectable so tests can point it at a local fake; it only
+    // ever runs when the caller passes resolved AniDB ids.
+    this.tosho = options.toshoClient || createToshoClient();
   }
 
   // Fetch `path` from the first mirror in `hosts` that answers, remembering it
@@ -123,6 +133,7 @@ class TorrentScraper {
     let seAliases = [];
     let partLengths = null;
     let ownShowSeasonCount = null;
+    let animeIds = null;
 
     if (rest.length === 1 && rest[0] && typeof rest[0] === 'object' && !Array.isArray(rest[0])) {
       const opts = rest[0];
@@ -141,6 +152,10 @@ class TorrentScraper {
       if (Array.isArray(opts.seAliases)) seAliases = opts.seAliases;
       if (Array.isArray(opts.partLengths)) partLengths = opts.partLengths;
       if (opts.ownShowSeasonCount != null) ownShowSeasonCount = Number(opts.ownShowSeasonCount);
+      // AniDB ids from core/anime-ids.js, when they resolved. Absent for every non-anime
+      // title and for splits the resolver refused to guess at, which is the normal case —
+      // the lane is additive and its absence changes nothing below.
+      if (opts.animeIds && opts.animeIds.anidbId) animeIds = opts.animeIds;
     } else {
       // legacy: (query, year, season, episode)
       season = rest[1] != null ? Number(rest[1]) : null;
@@ -193,6 +208,13 @@ class TorrentScraper {
       'PirateBay': seTag ? [`${showName} ${seTag}`, showName] : [showName],
       'Nyaa': [],
       'SubsPlease': [],
+      // Not a text query: the "query" is the id pair itself. Two of them, because the
+      // eid-filtered one is exact but cannot see batches — see core/tosho-client.js.
+      'Tosho': animeIds
+        ? (animeIds.anidbEid
+          ? [{ aids: animeIds.anidbId, eids: animeIds.anidbEid }, { aids: animeIds.anidbId }]
+          : [{ aids: animeIds.anidbId }])
+        : [],
     };
 
     // Nyaa throttles same-IP bursts hard (measured: of 14 parallel queries, 5 answer and the
@@ -270,6 +292,7 @@ class TorrentScraper {
       { name: 'PirateBay', fn: (q) => this.searchPirateBay(q) },
       { name: 'Nyaa', fn: (q) => this.searchNyaa(q) },
       { name: 'SubsPlease', fn: (q) => this.searchSubsPlease(q) },
+      { name: 'Tosho', fn: (q) => this.tosho.search(q) },
     ];
 
     const totalQueries = Object.values(queriesPerSource).reduce((s, arr) => s + arr.length, 0);
@@ -314,6 +337,24 @@ class TorrentScraper {
 
       // ---- Classify and score using the shared rule set --------------------
       const scored = uniqueResults.map((result) => {
+        // An AniDB episode id IS the episode, so there is nothing a parsed name can add
+        // and plenty it can take away: a release this classifier cannot read would be
+        // dropped by the verdictIsMatch filter below despite being provably correct.
+        // Scored above aliasSEMatch (2000) because an id is stronger evidence than an
+        // alias read out of a filename.
+        if (result.idMatched) {
+          let idScore = (result.seeders || 0) + ID_MATCH_BOOST;
+          if (preferredTier > 0 && qualityTier(result.name) === preferredTier) idScore += QUALITY_BOOST;
+          return {
+            ...result,
+            score: idScore,
+            exactMatch: true,
+            hasSeason: true,
+            hasEpisode: true,
+            verdict: { idMatch: true },
+          };
+        }
+
         const parsed = parseName(result.name);
         const verdict = classify(parsed, expected);
 
@@ -364,7 +405,9 @@ class TorrentScraper {
       // ---- Filter: only keep real matches; drop wrong-season hard ----------
       // Same decision as isMatch — verdictIsMatch IS the rule set, applied to the
       // verdict we already computed for scoring.
-      const filtered = scored.filter((r) => verdictIsMatch(r.verdict));
+      // id-matched rows bypass the rule set — see the short-circuit above. Everything
+      // else, including Tosho's broad-query rows, is judged on its name as usual.
+      const filtered = scored.filter((r) => r.idMatched || verdictIsMatch(r.verdict));
 
       filtered.sort((a, b) => {
         // Pin SubsPlease to the top for anime searches (no seeders to rank on).
