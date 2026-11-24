@@ -73,7 +73,7 @@ Notes:
 npm run web            # web flow on :3000
 npm test               # whole suite — globs tests/*.test.js, no registration step
 npm run test:core      # or any single test:<slug>
-npm run bench:stream-speed   # benchmarks live in bench/, not tests/
+npm run bench:stream-speed   # benchmarks live in bench/ — untracked, local only
 ```
 
 ## Documentation
@@ -84,7 +84,11 @@ npm run bench:stream-speed   # benchmarks live in bench/, not tests/
 | `docs/ARCHITECTURE.md` | Module map, the two design planes, known landmines, migration roadmap |
 | `CLAUDE.md` | Conventions to follow when writing code here |
 | `android-app/BUILD.md` | Building the Android APK |
-| `bench/COMPARISON.md` | Engine/subtitle/concurrency/DLNA benchmark results |
+
+Benchmarks are **not** part of the repo. `bench/` is untracked in full — harnesses and
+reports alike — because a benchmark measures one machine on one network on one evening, and
+a committed report goes stale without any code changing. A checkout only has what whoever
+is sitting at it wrote, so the `bench:*` scripts will not run on a fresh clone.
 
 `README.md` and `CLAUDE.md` stay at the repo root by convention (GitHub's entry point, and
 Claude Code auto-loads `CLAUDE.md`); every other prose doc lives with what it documents.

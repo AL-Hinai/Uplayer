@@ -134,7 +134,9 @@ npm run test:lifecycle
 ```
 
 `npm test` runs `tests/run-all.js`, which globs `tests/*.test.js` — a new test file needs no
-registration. Benchmarks are separate and live in `bench/`:
+registration. Benchmarks are separate and live in `bench/`, which is **untracked** — the
+directory is gitignored in full, so a fresh clone has no benchmark harnesses and the
+`bench:*` scripts will not run until someone writes them locally:
 
 ```bash
 npm run bench:stream-speed

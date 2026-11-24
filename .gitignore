@@ -10,12 +10,19 @@ logs/
 *.torrent
 dist/
 
-# Engine benchmark (Phase 2 spike) — keep the harness + results, ignore the
-# large prebuilt binary, torrent caches, and logs (all regenerable).
-bench/*.exe
-bench/ts-data/
-bench/wt-cache/
-bench/ts.log
+# Benchmarks are LOCAL ONLY — the whole directory is untracked, harnesses and reports
+# included. It held 23 tracked files up to V1.34; they were removed from the index (the
+# files stay on disk) and nothing under bench/ goes into a commit again.
+#
+# Why: a benchmark is a measurement of one machine, one network and one evening. Its
+# numbers go stale without any code changing, the reports are long and get rewritten
+# wholesale on every run, and a stale committed report read with confidence is worse than
+# no report — the same reasoning docs/ARCHITECTURE.md gives for re-verifying its own line
+# citations. Conclusions worth keeping belong in the docs that outlive a run.
+#
+# Consequence to be aware of: the `bench:*` scripts in package.json reference files that a
+# fresh clone will not have, so they only work in a checkout where someone has written them.
+bench/
 
 # Root-level vendored prebuilt binaries (TorrServer, alass, whisper + models) — large,
 # regenerable via scripts/setup-torrserver.js and scripts/setup-subtitle-tools.js.
@@ -56,9 +63,6 @@ scripts/data/test-results.json
 
 truso.env
 
-# Generated benchmark output. Every run rewrites these wholesale with a fresh `runAt`
-# timestamp, so tracking them makes each commit look enormous and `git log -p` unreadable.
-# The conclusions worth keeping live in bench/*.md, which stay tracked — as do the files
-# named *-archive.*, which were kept on purpose.
-bench/results.json
-bench/*-results.json
+# (Generated benchmark JSON used to be listed here, alongside a note that bench/*.md and
+# the *-archive.* files stayed tracked. The whole of bench/ is ignored now — see the rule
+# near the top of this file — so those entries were redundant and the note was wrong.)
